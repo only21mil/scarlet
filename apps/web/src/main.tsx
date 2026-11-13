@@ -27,7 +27,9 @@ async function launch() {
   });
   try {
     const [native, view] = await Promise.all([desktop.info(), opening]);
-    const { platform, localUpdates, customOpenaiModels, customClaudeModels } = native;
+    const { localUpdates, customOpenaiModels, customClaudeModels } = native;
+    // Linux takes the non-macOS path (Ctrl shortcuts, scaled drop points) until it has its own.
+    const platform = native.platform === "linux" ? "windows" : native.platform;
     if (platform !== "macos" && platform !== "windows") {
       view.render(desktopOnly);
       return;
