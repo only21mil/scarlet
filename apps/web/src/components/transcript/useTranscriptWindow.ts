@@ -15,7 +15,8 @@ export function transcriptChunks(source: MediaAsset | undefined, assets: MediaAs
   const add = (asset: MediaAsset | undefined, start: number, stop: number) => {
     if (!asset?.transcriptId || stop <= start) return;
     for (let i = Math.floor(start / SECONDS); i < Math.ceil(stop / SECONDS); i++) {
-      const key = JSON.stringify([asset.id, asset.transcriptId, i]);
+      // The first transcript is readable before its word alignment finishes under the same ID.
+      const key = JSON.stringify([asset.id, asset.transcriptId, asset.lastTranscription?.completedAt, i]);
       chunks.set(key, { key, mediaId: asset.id, from: i * SECONDS, to: (i + 1) * SECONDS });
     }
   };

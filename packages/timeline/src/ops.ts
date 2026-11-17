@@ -167,6 +167,14 @@ export function applyOp(input: Timeline, op: TimelineOp): Timeline {
   return applyToDraft(structuredClone(input), op);
 }
 
+/**
+ * Apply `op` to a timeline the caller owns, changing it in place. The op is copied first: a later op changes the
+ * timeline in place too, and would otherwise change the data it shares with this one.
+ */
+export function applyOpInPlace(draft: Timeline, op: TimelineOp): Timeline {
+  return applyToDraft(draft, structuredClone(op));
+}
+
 function applyToDraft(tl: Timeline, op: TimelineOp): Timeline {
   switch (op.op) {
     case "addClip": {

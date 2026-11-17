@@ -348,10 +348,13 @@ const retiredGuideRevisions = new Set([
 ]);
 
 // Workflows Scarlet no longer ships. An unedited copy leaves the library; one the editor changed stays theirs.
-const RETIRED_WORKFLOWS = ["render-verify", "screen-recording", "clean-dialogue", "edit-interview", "smooth-audio-cuts", "visual-pass"];
+const RETIRED_WORKFLOWS = ["render-verify", "screen-recording", "clean-dialogue", "edit-interview", "smooth-audio-cuts", "visual-pass", "cold-open"];
 
 // A seed directory can also supply personal workflows under these names. Only retire texts Scarlet shipped.
 const retiredWorkflowRevisions = new Set([
+  // cold-open
+  "ccd698f427e25c0a1687659f88f27e151957dea7abf039ba6d226f633757b2a1",
+  "c0361e706086cdd42cf18e8d29a45500757ede34f56c95af1961382a8d5a17aa",
   // render-verify
   "8b9a9f13923420a900d766cc030b1502aa0ef387e1f363a0b59ed5dde5a5beea",
   "cf10bf2800acf4483e230aa24c3245f4b344de387c9de0a8698dd914e6dd63d2",
@@ -571,13 +574,17 @@ export function seedSkillList(ctx: Ctx, list: Array<{ folder: string; content: s
 
 // Pinned skills guide the prompt. The agent can look up any enabled skill.
 export function assistantSkills(skills: Skill[], selected: string[] | undefined, forPrompt: boolean) {
-  // A chosen skill that builds on another brings it along, first: the editor's own style is read on top of the guide.
+  // A chosen skill that builds on others brings them along, first and in the order it names them, each with the
+  // guides it builds on in turn: the editor's own style is read on top of the guides.
   if (forPrompt && selected?.length) {
-    const bases = selected.flatMap(id => {
-      const base = skillExtends(skills.find(s => s.id === id) ?? { content: "" });
-      const found = base && skills.find(s => s.name === base && s.enabled);
-      return found && !selected.includes(found.id) ? [found] : [];
+    const seen = new Set(selected);
+    const under = (skill: Skill | undefined): Skill[] => !skill ? [] : skillExtends(skill).flatMap(base => {
+      const found = skills.find(s => s.name === base && s.enabled);
+      if (!found || seen.has(found.id)) return [];
+      seen.add(found.id);
+      return [...under(found), found];
     });
+    const bases = selected.flatMap(id => under(skills.find(s => s.id === id)));
     const chosen = skills.filter(s => selected.includes(s.id));
     return [...new Map([...bases, ...chosen].map(s => [s.id, s])).values()].filter(skill => skill.enabled);
   }

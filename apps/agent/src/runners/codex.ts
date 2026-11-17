@@ -1,27 +1,17 @@
 /**
  * Codex CLI runner.
  *
- *   codex exec --json --skip-git-repo-check --cd <cwd>
- *         -c 'mcp_servers.scarlet.command="node"'
- *         -c 'mcp_servers.scarlet.args=["<path>/cli.js"]'
- *         -c 'mcp_servers.scarlet.env_vars=["SCARLET_SERVER","SCARLET_TOKEN",...]'
- *         --output-last-message <cwd>/.scarlet/last-message.md
- *         [--model m] [-c model_reasoning_effort="e"] [-c service_tier="fast"]
- *         -  (instruction on stdin)
- *
- * Runs are ephemeral: Codex sessions show up in the user's Codex app thread list.
- * After a question, the answer reaches a fresh run through the replayed Q&A.
- *
- * Codex has no system-prompt flag; the system prompt is written to AGENTS.md in
- * the task workspace (Codex reads it from cwd) and the instruction is the prompt.
- * Events are JSONL on stdout (thread.started, turn.started, item.started,
- * item.updated, item.completed, turn.completed, turn.failed, error).
+ * The private App Server reports cumulative usage during an ephemeral turn.
+ * Keep `exec --json` for CLI versions and authentication modes that cannot use
+ * the isolated server. Answers reach a fresh run through the replayed Q&A.
  */
-import { mkdir, readFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink } from "node:fs/promises";
 import { realpathSync } from "node:fs";
-import { join } from "node:path";
-import { writePrivateFile } from "../private-files.js";
-import { briefInput, DEFAULT_STALL_MS, isQuestionTool, planEvent, type RunAgentOptions, type RunAgentResult, type RunnerEvent } from "./types.js";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { apiKeyVars, stripVars } from "../detect.js";
+import { privateDirectory, writePrivateFile } from "../private-files.js";
+import { briefInput, DEFAULT_STALL_MS, isQuestionTool, planEvent, type CodexFallbackReason, type RunAgentOptions, type RunAgentResult, type RunnerEvent } from "./types.js";
 import { earlyResult, jsonLine, resolveCli, spawnLines, tailSummary } from "./spawn.js";
 import { addUsage, codexUsage, usageWithModel } from "./usage.js";
 import type { AgentUsage, PlanStep } from "@scarlet/shared";
@@ -85,7 +75,15 @@ interface CodexItem {
 export function parseCodexLine(line: string, st: CodexParseState): RunnerEvent[] {
   // Anything that isn't one JSON object (a warning, null, a number, a list) is noise: surface it as a log line.
   const msg = jsonLine(line);
-  if (!msg) return [{ type: "log", text: line }];
+  return msg ? parseCodexEvent(msg, st) : [{ type: "log", text: line }];
+}
+
+const object = (value: unknown): Record<string, unknown> | undefined =>
+  value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+const string = (value: unknown) => typeof value === "string" ? value : undefined;
+const SERVER_STOP_GRACE_MS = 2000;
+
+function parseCodexEvent(msg: Record<string, unknown>, st: CodexParseState): RunnerEvent[] {
   const events: RunnerEvent[] = [];
   const type = msg.type as string | undefined;
   const item = (msg.item as CodexItem | undefined) ?? undefined;
@@ -220,25 +218,32 @@ export function buildCodexCommand(
   bin: string,
   tmpDir: string,
 ): CodexCommand {
+  const executable = codexExecutable(bin);
+  const lastMessagePath = join(tmpDir, "last-message.md");
+  return {
+    file: executable ?? bin,
+    args: ["exec", "--json", "--skip-git-repo-check", "--cd", opts.cwd, "--strict-config", "--ignore-user-config", "--ignore-rules", "--ephemeral",
+      ...codexConfig(opts, executable), "--output-last-message", lastMessagePath, ...(opts.model ? ["--model", opts.model] : []), ...codexModelConfig(opts), "-"],
+    stdin: opts.instruction,
+    files: { [join(opts.cwd, "AGENTS.md")]: opts.systemPrompt },
+    lastMessagePath,
+  };
+}
+
+function codexExecutable(bin: string): string | undefined {
   // Seatbelt must be able to re-execute Codex while loading AGENTS.md. Launch the
   // real file: granting its target alone does not permit a Homebrew symlink.
   let executable: string | undefined;
   if (process.platform === "darwin") {
     try { executable = realpathSync(bin); } catch { /* Keep normal missing-CLI reporting. */ }
   }
-  const lastMessagePath = join(tmpDir, "last-message.md");
+  return executable;
+}
+
+function codexConfig(opts: Pick<RunAgentOptions, "mcp" | "plan">, executable: string | undefined): string[] {
   // Forward slashes keep the TOML readable and work for node on Windows.
   const toToml = (p: string) => p.replace(/\\/g, "/");
-  const args = [
-    "exec",
-    "--json",
-    "--skip-git-repo-check",
-    "--cd",
-    opts.cwd,
-    "--strict-config",
-    "--ignore-user-config",
-    "--ignore-rules",
-    "--ephemeral",
+  return [
     // The legacy Windows sandboxes cannot enforce this profile's denied root reads.
     ...(process.platform === "win32" ? ["-c", 'windows.sandbox="mxc"'] : []),
     ...["shell_tool", "view_image", "computer_use", "multi_agent", "plugins", "apps", "hooks"].flatMap((feature) => ["--disable", feature]),
@@ -255,6 +260,8 @@ export function buildCodexCommand(
     "-c", 'mcp_servers.scarlet.default_tools_approval_mode="approve"',
     "-c", "mcp_servers.scarlet.required=true",
     "-c", "mcp_servers.scarlet.startup_timeout_sec=60",
+    // Scarlet's tools wait up to `toolWaitSeconds` (capabilities.ts) for evidence still being measured.
+    "-c", "mcp_servers.scarlet.tool_timeout_sec=300",
     "-c",
     `mcp_servers.scarlet.command=${tomlString(toToml(opts.mcp.command))}`,
     "-c",
@@ -263,29 +270,269 @@ export function buildCodexCommand(
     `mcp_servers.scarlet.env_vars=[${Object.keys(opts.mcp.env).sort().map(tomlString).join(",")}]`,
     "-c",
     'shell_environment_policy.exclude=["SCARLET_*"]',
-    "--output-last-message",
-    lastMessagePath,
-    ...(opts.model ? ["--model", opts.model] : []),
+  ];
+}
+
+function codexModelConfig(opts: Pick<RunAgentOptions, "effort" | "serviceTier" | "fast">): string[] {
+  return [
     ...(opts.effort ? ["-c", `model_reasoning_effort=${tomlString(opts.effort)}`] : []),
     ...(opts.serviceTier || opts.fast ? ["-c", `service_tier=${tomlString(opts.serviceTier ?? "fast")}`] : []),
-    "-",
   ];
+}
+
+async function isolatedCodexHome(cwd: string, env: NodeJS.ProcessEnv): Promise<{ home: string } | { reason: CodexFallbackReason }> {
+  // App Server cannot skip the user's config, rules or MCP servers. Share only
+  // file-backed login, with a symlink so Codex can still refresh that login.
+  const keyNames = apiKeyVars("codex");
+  if (Object.entries(env).some(([name, value]) => value && keyNames.includes(name.toUpperCase()))) return { reason: "api_key" };
+  const projectConfig = await lstat(join(cwd, ".codex")).catch((err: NodeJS.ErrnoException) => {
+    if (err.code !== "ENOENT") throw err;
+  });
+  if (projectConfig) return { reason: "project_config" };
+  const configuredHome = Object.entries(env).find(([name]) => name.toUpperCase() === "CODEX_HOME")?.[1];
+  const originalHome = await realpath(resolve(cwd, configuredHome || join(homedir(), ".codex"))).catch(() => undefined);
+  if (!originalHome) return { reason: "home_unavailable" };
+  const authFile = join(originalHome, "auth.json");
+  const auth = await stat(authFile).catch(() => undefined);
+  if (!auth?.isFile() || !auth.size) return { reason: "auth_unavailable" };
+  const home = await mkdtemp(join(tmpdir(), "scarlet-codex-"));
+  try {
+    await privateDirectory(home);
+    await symlink(authFile, join(home, "auth.json"), "file");
+    // The store locks around refresh commits. Use the same lock as the ordinary CLI.
+    await symlink(join(originalHome, "auth.lock"), join(home, "auth.lock"), "file");
+    return { home };
+  } catch {
+    await rm(home, { recursive: true, force: true });
+    return { reason: "isolation_unavailable" };
+  }
+}
+
+const serverItemTypes: Record<string, string> = {
+  agentMessage: "agent_message", reasoning: "reasoning", commandExecution: "command_execution",
+  mcpToolCall: "mcp_tool_call", fileChange: "file_change", webSearch: "web_search",
+};
+
+function serverItem(item: Record<string, unknown>): CodexItem {
   return {
-    file: executable ?? bin,
-    args,
-    stdin: opts.instruction,
-    files: { [join(opts.cwd, "AGENTS.md")]: opts.systemPrompt },
-    lastMessagePath,
+    ...item,
+    type: serverItemTypes[string(item.type) ?? ""],
+    text: string(item.text) ?? (Array.isArray(item.summary) ? item.summary.filter(part => typeof part === "string").join("\n") : undefined),
+    aggregated_output: string(item.aggregatedOutput),
+    exit_code: typeof item.exitCode === "number" ? item.exitCode : undefined,
   };
+}
+
+function serverUsage(value: unknown, model?: string): AgentUsage | undefined {
+  const total = object(object(value)?.total);
+  return total && codexUsage({ input_tokens: total.inputTokens, cached_input_tokens: total.cachedInputTokens,
+    cache_write_input_tokens: total.cacheWriteInputTokens, output_tokens: total.outputTokens, reasoning_output_tokens: total.reasoningOutputTokens }, model);
+}
+
+function serverPlan(value: unknown): PlanStep[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.flatMap((entry): PlanStep[] => {
+    const step = object(entry);
+    const text = string(step?.step)?.trim();
+    const status = step?.status;
+    if (!text) return [];
+    return [{ text, state: status === "completed" ? "done" : status === "inProgress" ? "in_progress" : "pending" }];
+  });
+}
+
+function serverError(value: unknown) {
+  const error = object(value);
+  const message = string(error?.message);
+  const detail = string(error?.additionalDetails);
+  return message && detail ? `${message} (${detail})` : message;
+}
+
+async function runCodexServer(opts: RunAgentOptions, env: NodeJS.ProcessEnv, bin: string, home: string): Promise<RunAgentResult | undefined> {
+  const executable = codexExecutable(bin);
+  const args = ["app-server", "--strict-config", ...codexConfig({ mcp: opts.mcp }, executable),
+    "-c", "project_root_markers=[]", "-c", 'cli_auth_credentials_store="file"',
+    "-c", `tools.update_plan.enabled=${!!opts.plan}`, "-c", "tools.experimental_request_user_input.enabled=false", "--disable", "goals",
+    ...codexModelConfig({ effort: opts.effort })];
+  const state = newCodexState();
+  const serviceTier = opts.serviceTier ?? (opts.fast ? "fast" : undefined);
+  let threadId: string | undefined;
+  let turnId: string | undefined;
+  let turnRequested = false;
+  let startupFailure: CodexFallbackReason | undefined;
+  let interrupted = false;
+  let completed = false;
+  let model = opts.model;
+  let finalMessage: string | undefined;
+  let planText: string | undefined;
+  let stopTimer: NodeJS.Timeout | undefined;
+  const pendingEvents: [string, Record<string, unknown>][] = [];
+  const send = (message: Record<string, unknown>) => handle.child.stdin?.write(`${JSON.stringify(message)}\n`);
+  const complete = () => {
+    completed = true;
+    handle.child.stdin?.end();
+    stopTimer ??= setTimeout(handle.kill, SERVER_STOP_GRACE_MS).unref();
+  };
+  const interrupt = () => {
+    if (completed || interrupted) return true;
+    if (!threadId || !turnId) return false;
+    interrupted = true;
+    send({ id: 4, method: "turn/interrupt", params: { threadId, turnId } });
+    return true;
+  };
+  const emit = (event: Record<string, unknown>) => {
+    for (const e of parseCodexEvent(event, state)) opts.onEvent(e);
+  };
+
+  const notify = (method: string, params: Record<string, unknown>) => {
+    const eventTurn = string(params.turnId) ?? string(object(params.turn)?.id);
+    if (completed || !eventTurn || eventTurn !== turnId) return;
+    switch (method) {
+      case "thread/tokenUsage/updated": {
+        const usage = serverUsage(params.tokenUsage, model);
+        if (!usage || JSON.stringify(usage) === JSON.stringify(state.usage)) break;
+        state.usage = usage;
+        opts.onUsage?.(usage);
+        break;
+      }
+      case "item/started":
+      case "item/completed": {
+        const item = object(params.item);
+        if (!item) break;
+        if (method === "item/completed") {
+          const text = string(item.text)?.trim();
+          if (item.type === "agentMessage" && item.phase === "final_answer" && text) finalMessage = text;
+          if (item.type === "plan" && text) planText = text;
+        }
+        emit({ type: method.replace("/", "."), item: serverItem(item) });
+        if (state.shouldStop) {
+          state.shouldStop = false;
+          // Codex can publish a final count while finishing the interrupted turn.
+          interrupt();
+          stopTimer ??= setTimeout(handle.kill, SERVER_STOP_GRACE_MS).unref();
+        }
+        break;
+      }
+      case "turn/plan/updated": {
+        const steps = serverPlan(params.plan);
+        const plan = JSON.stringify(steps);
+        if (opts.plan && steps && plan !== state.plan) {
+          state.plan = plan;
+          opts.onEvent(planEvent(steps));
+        }
+        break;
+      }
+      case "error": {
+        const text = serverError(params.error) ?? "Codex reported an error";
+        if (params.willRetry === true) {
+          state.retryNotice = text;
+          opts.onEvent({ type: "log", text, data: { kind: "connection" } });
+        } else emit({ type: "error", message: text });
+        break;
+      }
+      case "turn/completed": {
+        const turn = object(params.turn);
+        if (!turn || turnId !== turn.id) break;
+        if (turn.status === "completed") {
+          state.lastMessage = finalMessage ?? state.lastMessage ?? planText;
+          emit({ type: "turn.completed" });
+        } else if (!state.question) {
+          emit({ type: "turn.failed", error: { message: serverError(turn.error) ?? state.failed ?? `Codex turn ${turn.status ?? "failed"}` } });
+        }
+        complete();
+        break;
+      }
+    }
+  };
+
+  let pending = 1;
+  const handle = spawnLines(executable ?? bin, args, {
+    cwd: opts.cwd, env: { ...stripVars(env, ["CODEX_HOME", "CODEX_SQLITE_HOME"]), CODEX_HOME: home }, interactive: true, signal: opts.signal,
+    timeoutMs: opts.timeoutMs, stallMs: opts.stallMs ?? DEFAULT_STALL_MS, interrupt,
+    onLine(line) {
+      if (completed) return;
+      const message = jsonLine(line);
+      if (!message) return;
+      const id = message.id;
+      const method = string(message.method);
+      if (method) {
+        if (id !== undefined) {
+          // This client never authorizes Codex's built-in approval or input requests.
+          send({ id, error: { code: -32601, message: "This request is unavailable in Scarlet" } });
+          return;
+        }
+        const params = object(message.params);
+        if (!turnRequested || !params || params.threadId !== threadId) return;
+        // A notification can be queued before the turn/start response confirms which turn is ours.
+        if (pending === 3) pendingEvents.push([method, params]);
+        else notify(method, params);
+        return;
+      }
+      if (id !== pending) return;
+      const result = object(message.result);
+      if (id === 1) {
+        if (!result) {
+          startupFailure = "initialize_failed";
+          return complete();
+        }
+        send({ method: "initialized" });
+        pending = 2;
+        send({ id: 2, method: "thread/start", params: { ephemeral: true, model, serviceTier } });
+      } else if (id === 2) {
+        const thread = object(result?.thread);
+        threadId = string(thread?.id);
+        const profile = result?.activePermissionProfile;
+        const approval = result?.approvalPolicy;
+        if (!threadId || thread?.ephemeral !== true || object(profile)?.id !== "scarlet" || approval !== "never") {
+          startupFailure = threadId ? "thread_policy_mismatch" : "thread_start_failed";
+          return complete();
+        }
+        model = string(result?.model) ?? model;
+        emit({ type: "thread.started", thread_id: threadId });
+        turnRequested = true;
+        pending = 3;
+        send({ id: 3, method: "turn/start", params: { threadId, input: [{ type: "text", text: opts.instruction, text_elements: [] }] } });
+      } else if (id === 3) {
+        turnId = string(object(result?.turn)?.id);
+        if (!turnId) {
+          emit({ type: "error", message: serverError(message.error) ?? "Codex could not start the turn" });
+          return complete();
+        }
+        pending = 0;
+        for (const [method, params] of pendingEvents.splice(0)) notify(method, params);
+      }
+    },
+  });
+  send({ id: 1, method: "initialize", params: { clientInfo: { name: "scarlet", title: "Scarlet", version: "0.1.0" },
+    capabilities: { experimentalApi: true, requestAttestation: false } } });
+  const outcome = await handle.done;
+  clearTimeout(stopTimer);
+  // Startup can fail on older CLIs. Never retry a turn that may already have edited the project.
+  if (!turnRequested && !outcome.aborted && !outcome.timedOut) {
+    opts.onCodexFallback?.(startupFailure ?? "app_server_unavailable");
+    return undefined;
+  }
+  return codexResult(state, outcome, state.lastMessage, model, state.turnCompleted);
 }
 
 export async function runCodex(opts: RunAgentOptions): Promise<RunAgentResult> {
   const env = { ...(opts.env ?? process.env), ...opts.mcp.env };
   const bin = await resolveCli("codex", opts.bin, env);
+  await writePrivateFile(join(opts.cwd, "AGENTS.md"), opts.systemPrompt);
+  const isolation = await isolatedCodexHome(opts.cwd, env).catch(() => ({ reason: "isolation_unavailable" as const }));
+  if ("home" in isolation) {
+    try {
+      const result = await runCodexServer(opts, env, bin, isolation.home);
+      if (result) return result;
+    } finally {
+      await rm(isolation.home, { recursive: true, force: true });
+    }
+  } else {
+    opts.onCodexFallback?.(isolation.reason);
+  }
+
   const tmpDir = join(opts.cwd, ".scarlet");
   await mkdir(tmpDir, { recursive: true });
   const cmd = buildCodexCommand(opts, bin, tmpDir);
-  for (const [p, content] of Object.entries(cmd.files)) await writePrivateFile(p, content);
 
   const st = newCodexState();
   const handle = spawnLines(cmd.file, cmd.args, {
@@ -312,11 +559,15 @@ export async function runCodex(opts: RunAgentOptions): Promise<RunAgentResult> {
   } catch {
     /* not written */
   }
-  const usage = usageWithModel(st.usage, opts.model);
+  return codexResult(st, outcome, last, opts.model, outcome.code === 0 || st.turnCompleted);
+}
+
+function codexResult(st: CodexParseState, outcome: Awaited<ReturnType<typeof spawnLines>["done"]>, last: string | undefined, model: string | undefined, completed: boolean): RunAgentResult {
+  const usage = usageWithModel(st.usage, model);
   const early = earlyResult(st, outcome, { usage });
   if (early) return early;
   // A failure line fails the run whatever it says, an empty reason included.
-  const ok = st.failed === undefined && (outcome.code === 0 || st.turnCompleted);
+  const ok = st.failed === undefined && completed;
   return {
     ok,
     summary: last ?? tailSummary(st.texts),

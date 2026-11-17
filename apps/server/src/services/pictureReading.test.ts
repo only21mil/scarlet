@@ -45,7 +45,9 @@ describe("reading a video's picture a window at a time", () => {
     expect(first.ready.map(w => w.value)).toEqual([{ start: 60, end: 120 }]);
     // The rest of the video is read in the background, in order.
     await expect.poll(() => reads).toEqual([1, 0, 2]);
-    expect(JSON.parse(readFileSync(join(root, "waveforms", "med_1.test-reading.json"), "utf8")).chunks[2]).toEqual({ start: 120, end: 150 });
+    // Reading the final window and publishing its checkpoint are separate asynchronous steps.
+    await expect.poll(() => JSON.parse(readFileSync(join(root, "waveforms", "med_1.test-reading.json"), "utf8")).chunks[2])
+      .toEqual({ start: 120, end: 150 });
     const whole = await reader.read(ctx(), video(), {});
     expect(whole.all.map(w => [w.index, w.start, w.end])).toEqual([[0, 0, 60], [1, 60, 120], [2, 120, 150]]);
     expect(reads).toEqual([1, 0, 2]);

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { contentHash, emptyTimeline, stableStringify, Id, WritableTimeline, type Author, type Project, type Timeline } from "@scarlet/timeline";
+import { contentHash, emptyTimeline, sameContent, stableStringify, Id, WritableTimeline, type Author, type Project, type Timeline } from "@scarlet/timeline";
 import type { Ctx } from "../context.js";
 import { now } from "../db.js";
 import { badRequest, notFound } from "../errors.js";
@@ -23,8 +23,10 @@ export function storeVersion(ctx: Ctx, projectId: string, input: Timeline, meta:
 /** The proposal path has already applied WritableTimeline validation. Hash its result once. */
 export function storeValidatedVersion(ctx: Ctx, normalized: Timeline, meta: VersionMeta, differentFrom?: Timeline): Timeline {
   const { projectId } = normalized;
+  if (differentFrom && normalized.name === differentFrom.name && normalized.markers.length === differentFrom.markers.length &&
+      sameContent(normalized, differentFrom))
+    throw badRequest("no_change", "the proposed timeline is identical to fromVersion");
   const content = versionIdFor(normalized);
-  if (differentFrom && content === versionIdFor(differentFrom)) throw badRequest("no_change", "the proposed timeline is identical to fromVersion");
   // Identical footage can be reached by different edits on different branches.
   const version = meta.changeId
     ? contentHash({ content, parent: meta.parent, changeId: meta.changeId }).slice(0, 16)
@@ -41,7 +43,7 @@ export function storeValidatedVersion(ctx: Ctx, normalized: Timeline, meta: Vers
     changeId: meta.changeId ?? null,
     description: meta.description,
     createdAt: tl.createdAt!,
-  }).timeline;
+  }, true).timeline;
 }
 
 /** Resolve "head" / a version id / undefined to a timeline. No head → emptyTimeline. */
@@ -56,22 +58,25 @@ export function resolveTimeline(ctx: Ctx, project: Pick<Project, "id" | "head">,
   return row.timeline;
 }
 
-/** Make sure the project has a concrete head version (stores the empty timeline on first use). */
-export function ensureHead(ctx: Ctx, projectId: string): { project: Project; head: string; timeline: Timeline } {
-  const project = ctx.repos.projects.get(projectId);
+/** A note, branch switch or proposal needs the current version id even on a new project. */
+export function ensureProjectHead(ctx: Ctx, projectId: string): Omit<Project, "media"> & { head: string } {
+  const project = ctx.repos.projects.header(projectId);
   if (!project) throw notFound("project");
-  if (project.head) {
-    const row = ctx.repos.versions.get(projectId, project.head);
-    if (row) return { project, head: project.head, timeline: row.timeline };
-  }
+  if (project.head && ctx.repos.versions.exists(projectId, project.head)) return { ...project, head: project.head };
+
   const empty = storeVersion(ctx, projectId, emptyTimeline(projectId), {
     parent: null,
     author: { type: "scarlet", name: "Scarlet" },
     description: "Empty timeline",
   });
   ctx.repos.projects.initializeHead(projectId, project.head, empty.version);
-  const current = ctx.repos.projects.get(projectId);
-  if (!current?.head) throw notFound("project head");
-  const timeline = current.head === empty.version ? empty : resolveTimeline(ctx, current);
-  return { project: current, head: current.head, timeline };
+  const current = ctx.repos.projects.header(projectId);
+  if (!current?.head || !ctx.repos.versions.exists(projectId, current.head)) throw notFound("project head");
+  return { ...current, head: current.head };
+}
+
+export function ensureHead(ctx: Ctx, projectId: string): { project: Project; head: string; timeline: Timeline } {
+  const header = ensureProjectHead(ctx, projectId);
+  const project = ctx.repos.projects.withMedia(header);
+  return { project, head: header.head, timeline: resolveTimeline(ctx, header) };
 }

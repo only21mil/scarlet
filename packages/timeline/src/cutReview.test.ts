@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   appliedCutReview, appliedReviewChange, applyOps, canStartCutReview, Change, cutPlaybackWindow, cutSummary, describeDialogueRemovals, dialogueReceipt, dialogueRemovals,
-  emptyTimeline, isolatedReviewCut, makeMediaClip, planCutReview, reviewedTimeline, reviewReasons, timelineDuration, timelineFromKeepRanges, type MediaAsset,
+  emptyTimeline, isolatedReviewCut, makeMediaClip, planCutReview, reviewedTimeline, reviewCutSummaries, reviewReasons, timelineDuration, timelineFromKeepRanges, type MediaAsset,
 } from "./index.js";
 
 const media: MediaAsset[] = [{ id: "camera", name: "Interview", path: "interview.mp4", kind: "video", duration: 12 },
@@ -118,6 +118,7 @@ describe("an applied cut review", () => {
     // Putting the first second back moves the second join from 3 s to 4 s and makes the cut a second longer.
     expect(appliedCutReview(review, [0])).toEqual({ originalVersion: "v_original", originalDuration: 12, duration: 10,
       joins: [{ at: 4, removed: { start: 4, end: 6 } }] });
+    expect(appliedCutReview(review, [0], true).joins).toEqual([{ at: 4, proposedAt: 3, removed: { start: 4, end: 6 } }]);
     expect(appliedCutReview(review, [0, 1])).toMatchObject({ joins: [], duration: 12 });
     // The record agrees with the timeline the same choices build.
     expect(timelineDuration(reviewedTimeline(review, [0]))).toBe(10);
@@ -219,6 +220,17 @@ describe("the reasons for each cut in a review", () => {
     const cutReasons = [{ start: 1, end: 2, reason: "False start" }, { start: 2, end: 3, reason: "Long pause" }, { start: 2.5, end: 3, reason: "False start" },
       { start: 3.999995, end: 6, reason: "Retake" }, { start: 6, end: 7, reason: "Past the end" }, { start: 8, end: 9, reason: "" }];
     expect(reviewReasons({ cutReasons, description: "Cuts" }, cuts)).toEqual([["False start", "Long pause"], ["Retake"], []]);
+  });
+
+  it("reads each cut's quick summaries from its original range after it moves", () => {
+    const cutReasons = [
+      { start: 1, end: 2, summary: "Trim the restart", reason: "The first take trails off" },
+      { start: 2, end: 3, summary: "Trim the restart", reason: "The second answer starts cleanly" },
+      { start: 4, end: 5, summary: "Use the second take", reason: "The first take clips the score" },
+      { start: 5, end: 6, summary: "Trim the pause", reason: "Keep up the pace" },
+    ];
+    expect(reviewCutSummaries({ cutReasons }, cuts)).toEqual(["Trim the restart", "Use the second take · Trim the pause", undefined]);
+    expect(reviewCutSummaries({ cutReasons }, [{ removed: { start: 6, end: 8 }, reviewIndex: 0 }])).toEqual(["Trim the restart"]);
   });
 
   it("are the change's description for every cut when no reasons were saved", () => {

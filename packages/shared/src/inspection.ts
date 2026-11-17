@@ -1,5 +1,6 @@
 import { z } from "zod/v3";
 import type { TimeRange, TranscriptSegment } from "@scarlet/timeline";
+import type { FragmentEvidence } from "./joinFragments.js";
 
 type HeardWord = TimeRange & { text: string };
 export interface RepeatOccurrence {
@@ -21,7 +22,19 @@ export interface RepeatEvidence {
   followingStart?: number;
   protected?: "first" | "second";
   occurrences: Partial<Record<"first" | "second", RepeatOccurrence>>;
+  /**
+   * The phrase comes back after other words: `first` is the whole first attempt, the phrase and what followed it
+   * (`between`), up to where the phrase starts again; `second` is the phrase as said again.
+   */
+  restart?: true;
+  between?: string;
 }
+/** A stretch the edit plays with no word in it, on any dialogue recording. Timeline seconds. */
+export interface SilenceLeft { id: string; start: number; end: number; seconds: number; mediaId: string;
+  /** Where it starts in the recording. */
+  source: number; after: string; before: string; atJoin: boolean }
+/** A wordless stretch this long that a pass leaves playing is accounted for: cut, or kept for what the viewer sees or hears in it. */
+export const SILENCE_LEFT_SECONDS = 2;
 /** A join whose sound, read letter by letter, doesn't match the words the transcript says it plays. */
 export interface JoinHearing { at: number; mediaId: string; side: "out" | "in"; issue: "clipped" | "fragment"; heard: string;
   /** A clipped word: the transcript's word the cut goes through. */
@@ -29,6 +42,12 @@ export interface JoinHearing { at: number; mediaId: string; side: "out" | "in"; 
   /** A fragment: the kept word beside it, which plays whole, and where it starts (in) or ends (out) in the recording. */
   keptWord?: string; keptWordAt?: number;
   source: number }
+/**
+ * A join that took words out of a sentence, with what the edit plays either side of it (`FragmentEvidence`). `at` is the
+ * join in timeline seconds, `out` and `in` where the removed stretch starts and ends in the recording, and `lastWord`
+ * and `firstWord` the transcript's indices of the last word played before it and the first after it.
+ */
+export interface JoinFragment extends FragmentEvidence { id: string; at: number; mediaId: string; out: number; in: number }
 /** How many played joins have a side in a recording whose language can't be read letter by letter, and the timeline seconds they span. */
 export interface UnheardJoins { mediaId: string; reason: string; joins: number; from: number; to: number }
 export interface RepeatAuditResult {
@@ -38,6 +57,13 @@ export interface RepeatAuditResult {
   heard: number;
   remaining: number;
   repeats: RepeatEvidence[];
+  /** Wordless stretches still playing that the pass has neither cut nor kept. They count in `remaining`. */
+  silences?: SilenceLeft[];
+  /**
+   * Joins that divide a sentence and that the pass has neither repaired nor kept, 25 from `offset`: a stray word, a
+   * sentence cut off, or a join that reads whole. They count in `remaining`.
+   */
+  fragments?: JoinFragment[];
   staged: number;
   nextOffset?: number;
   unavailable?: { mediaId: string; reason: string }[];
@@ -68,6 +94,13 @@ export const SheetRequest = z.object({
   .refine(v => v.to > v.from && v.to - v.from <= 120 + WINDOW_SLACK, "Choose a positive window up to 120 seconds")
   .refine(v => v.mode !== "activity" || v.to <= v.from + 12 + WINDOW_SLACK, "Check screen activity in windows up to twelve seconds")
   .refine(v => v.focus === undefined || (v.focus >= v.from && v.focus < v.to), "Focus must be within the window");
+/** Moments of an edit as the viewer would see them: a saved version, or that version with `ops` applied and not saved. */
+export const TimelinePicturesRequest = z.object({
+  version: z.string().min(1),
+  ops: z.array(z.record(z.unknown())).max(2000).optional(),
+  times: z.array(z.number().finite().nonnegative()).min(1).max(12),
+  width: z.number().int().min(320).max(1280).default(960),
+});
 /** Up to 24 source windows whose frame-to-frame change is measured without drawing a sheet. */
 export const PictureActivityRequest = z.object({
   windows: z.array(z.object({ mediaId: z.string().min(1), from: z.number().finite().nonnegative(), to: z.number().finite().positive() })

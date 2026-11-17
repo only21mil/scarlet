@@ -1,6 +1,7 @@
+import { hashFile } from "@scarlet/render";
 import type { LocalModelStatus } from "@scarlet/shared";
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, createWriteStream, readFileSync, statSync, type WriteStream } from "node:fs";
+import { createWriteStream, readFileSync, statSync, type WriteStream } from "node:fs";
 import { mkdir, rename, rm, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { pipeline } from "node:stream/promises";
@@ -105,9 +106,7 @@ export class LocalWhisperModel {
     if (existing?.isFile() && existing.size === this.model.size) {
       const stamp = `${existing.ino}/${existing.ctimeMs}/${existing.mtimeMs}`;
       if (stamp === this.verifiedStamp) return "ready";
-      const hash = createHash("sha256");
-      for await (const chunk of createReadStream(file, { signal })) hash.update(chunk);
-      if (hash.digest("hex") === this.model.sha256) {
+      if (await hashFile(file, undefined, signal) === this.model.sha256) {
         this.verifiedStamp = stamp;
         return "ready";
       }

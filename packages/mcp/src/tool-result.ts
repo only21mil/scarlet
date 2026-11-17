@@ -73,7 +73,19 @@ function errorCause(err: Error): string {
  * stdout is the protocol's. Media still being prepared is expected, and the tool that waits for it says so itself.
  */
 export function unavailable(what: string, err: unknown) {
-  if (!(err instanceof MediaPreparing)) console.error(`[scarlet-mcp] ${what}: ${describeError(err)}`);
+  if (err instanceof MediaPreparing) return;
+  noteEvidenceMiss(what);
+  console.error(`[scarlet-mcp] ${what}: ${describeError(err)}`);
+}
+
+/** Report in-band waits and missing evidence separately from the result payload. */
+export const toolDiagnostics = new AsyncLocalStorage<{ misses: Set<string>; preparing: boolean }>();
+export function noteEvidenceMiss(what: string) {
+  toolDiagnostics.getStore()?.misses.add(what);
+}
+export function notePreparing() {
+  const diagnostic = toolDiagnostics.getStore();
+  if (diagnostic) diagnostic.preparing = true;
 }
 
 /** What each tool call answered without, keyed by what failed, so concurrent calls never see each other's. */

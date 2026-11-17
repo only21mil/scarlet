@@ -4,6 +4,33 @@ What changed in Scarlet, newest first, in the words an editor would use. Scarlet
 
 Add one line under today's date for each change an editor would notice. Leave out changes to tests, builds and tooling.
 
+## November 16, 2026
+
+- Click − or + in the player or press those keys to change playback speed in 0.25× steps. Use [ and ] to zoom the timeline.
+- Before a dialogue pass finishes, Scarlet rereads the cuts it made outside its dialogue cut tool that took words out of a sentence, and fixes a stray word or a sentence left without its start or its end.
+- A photo or a title card that doesn’t move is ready in seconds, where Scarlet used to draw every frame of it.
+- Scarlet zooms a screen recording to fill the video around what you’re showing, eases from one thing to the next across your cuts, and keeps your camera off the lines you read, moving it to another corner when it has to. A zoom no longer leaves empty bars at the sides.
+- An edit's card no longer has an Undo edit button. To put an edit back, open it and ask in the message box.
+- When Scarlet wants you to check part of an edit, its card has an amber Check tag that plays just that part, the timeline marks that part in amber, and an edit that changed nothing there no longer says Added.
+- Scarlet checks that your camera, screen and mic recordings stay in sync through its edit, and tells you when one doesn't.
+- Scarlet hears when you keep an edit it flagged, so a request still working doesn't ask you about it again.
+- Scarlet stays connected when you pause media processing while it’s caching a video.
+- The message box shows an edit’s time on its own and widens its tag to show the × on hover. Open +1 to see and clear an additional marked range.
+- An edit you kept stays kept when Scarlet, still working, lists it again in other words, instead of asking you about it a second time.
+- Pause above the message box pauses all editing in the project and Continue picks the paused work up first, where it left off. A paused request says Paused in the chat, questions can still be answered, and Stop this edit in a request’s menu ends just that one.
+- About puts the installed version and update check at the top, shows the latest release notes, and folds earlier changes and usage report details into sections you can open.
+- Pause and resume background caching and transcription from the Projects menu, the Media panel, or by hovering over Media.
+- Make shorts works on recordings in a library you moved or restored from a backup, instead of asking you to reimport them.
+- When Scarlet opens, a recording that was ready to transcribe starts at once, without waiting for another import to finish preparing.
+- The message box shows the time of the cut or marked range beside your draft. Click the time to see and clear the targets.
+- When Scarlet flags a spot inside a long edit, opening it takes you to the passage it wants you to review.
+- A spot Scarlet marked for footage it doesn't have opens as a to-do: its card leads with what to add, has Done instead of Keep and nothing to compare or undo, and the timeline no longer shows it as a cut.
+- What a request made counts the spots Scarlet marked for you on their own.
+- A to-do Scarlet marked keeps saying what to add after you ask for a revision, and still waits for you to mark it done. An edit that changed the video and also left a marker keeps its Undo edit and Before/After.
+- When you click the message box for an open edit, the cut icon shimmers in place of the popup.
+- Numbered markers appear on the timeline as Scarlet applies edits during a dialogue pass.
+- The token count in an edit’s heading updates as Codex works.
+
 ## November 15, 2026
 
 - Applying an edit that moved or re-added a clip after you cut inside it no longer leaves two clips playing over each other.

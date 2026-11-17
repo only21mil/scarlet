@@ -5,7 +5,7 @@
  * lines around it, a bug report becomes "pressed this, then that happened".
  * Caught on the document, so nothing needs wiring into a component and new controls are covered as they're added.
  */
-import { appLog, logPath, withoutAddresses } from "./appLog";
+import { appLog, flushAppLog, logPath, withoutAddresses } from "./appLog";
 
 const clip = (text: string, max = 70) => {
   const flat = text.replace(/\s+/g, " ").trim();
@@ -22,25 +22,39 @@ const tagOf = (el: Element) => {
 
 /** Where a control's own words are the editor's (a queued request): everything inside is named by its kind instead. */
 const PRIVATE = "[data-log-private]";
+const SAFE_ROLES = new Set(["button", "menuitem", "menuitemradio", "tab", "option", "switch", "checkbox", "radio"]);
 
 /** A control by the name the editor reads on it. A field is named by its label, never by what was typed in it. */
 function nameOf(el: Element) {
   if (el.closest(PRIVATE)) return "";
+  const logLabel = el.getAttribute("data-log-label");
+  if (logLabel) return clip(logLabel);
   if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) {
     return clip(el.getAttribute("aria-label") || el.getAttribute("placeholder") || el.getAttribute("name") || el.id || "field");
   }
   return clip(el.getAttribute("aria-label") || el.getAttribute("title") || (el as HTMLElement).innerText || el.textContent || "");
 }
 
+function placeName(el: Element) {
+  return clip(el.getAttribute("data-log-label") || el.getAttribute("aria-label") || tagOf(el), 40);
+}
+
+function controlOf(el: Element) {
+  const named = el.getAttribute("data-log-control");
+  if (named && /^[a-z][a-z0-9-]{0,39}$/.test(named)) return named;
+  const role = el.getAttribute("role");
+  return role && SAFE_ROLES.has(role) ? role : el.tagName.toLowerCase();
+}
+
 function describe(target: Element) {
   const control = target.closest(CONTROL);
   const el = control ?? target;
   const place = el.parentElement?.closest(PLACE);
-  const where = place ? clip(place.getAttribute("aria-label") || tagOf(place), 40) : undefined;
+  const where = place ? placeName(place) : undefined;
   if (!control) return { on: tagOf(el), in: where };
   const kind = control.getAttribute("role") ?? (control instanceof HTMLInputElement ? `input:${control.type}` : control.tagName.toLowerCase());
   return {
-    on: nameOf(control) || tagOf(control), kind: kind === "button" ? undefined : kind, in: where,
+    on: nameOf(control) || tagOf(control), control: controlOf(control), kind: kind === "button" ? undefined : kind, in: where,
     pressed: control.getAttribute("aria-pressed") ?? undefined, expanded: control.getAttribute("aria-expanded") ?? undefined,
     checked: control instanceof HTMLInputElement && (control.type === "checkbox" || control.type === "radio") ? control.checked : undefined,
     disabled: (control as HTMLButtonElement).disabled || control.getAttribute("aria-disabled") === "true" || undefined,
@@ -134,7 +148,7 @@ function onAlerts(records: MutationRecord[]) {
     if (said.get(el) === message) continue;
     said.set(el, message);
     const place = el.parentElement?.closest(PLACE);
-    if (message) appLog("error", "alert", { message, in: place ? clip(place.getAttribute("aria-label") || tagOf(place), 40) : undefined }, { level: "warn" });
+    if (message) appLog("error", "alert", { message, in: place ? placeName(place) : undefined }, { level: "warn" });
   }
 }
 
@@ -166,7 +180,11 @@ export function startUiLog() {
   on(window, "resize", () => appLog("window", "resize", { width: innerWidth, height: innerHeight }, { key: "resize" }), false);
   on(window, "popstate", () => onNav("back-forward"), false);
   on(window, "hashchange", () => onNav("hash"), false);
-  on(window, "pagehide", () => appLog("window", "closing"), false);
+  on(window, "pagehide", () => {
+    appLog("window", "closing");
+    flushAppLog();
+  }, false);
+  on(document, "visibilitychange", () => { if (document.hidden) flushAppLog(); }, false);
 
   const alerts = new MutationObserver(onAlerts);
   alerts.observe(document, { subtree: true, childList: true, characterData: true });

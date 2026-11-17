@@ -32,6 +32,15 @@ impl ApiError {
     }
 }
 
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletionAck {
+    pub state: Option<String>,
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub change_ids: Vec<String>,
+}
+
 #[derive(Clone)]
 pub struct Api {
     http: reqwest::Client,
@@ -185,11 +194,10 @@ impl Api {
         Ok(())
     }
 
-    /// The engine answers with the task and the changes it holds for it. An answer without them still means the
-    /// completion landed.
-    pub async fn complete_task(&self, task_id: &str, body: &CompleteTaskRequest) -> Result<Vec<String>, ApiError> {
+    /// A response without the task confirms delivery but does not identify the resulting state.
+    pub async fn complete_task(&self, task_id: &str, body: &CompleteTaskRequest) -> Result<CompletionAck, ApiError> {
         let answer: Value = self.post(&format!("/tasks/{task_id}/complete"), serde_json::to_value(body).unwrap()).await?;
-        Ok(answer["task"]["changeIds"].as_array().map(|ids| ids.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default())
+        Ok(serde_json::from_value(answer["task"].clone()).unwrap_or_default())
     }
 }
 

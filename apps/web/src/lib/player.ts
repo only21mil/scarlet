@@ -6,7 +6,7 @@
 import type { TimeRange } from "@scarlet/timeline";
 import { usePlayerStore } from "../stores/player";
 import type { JoinClock } from "./joinClock";
-import { calledBy, logId, playbackLog } from "./playbackLog";
+import { calledBy, logId, logPlayRefusal, playbackLog } from "./playbackLog";
 
 let video: HTMLVideoElement | null = null;
 interface StreamControls {
@@ -373,8 +373,7 @@ export const player = {
     // A pause or a new source before playback began ends the attempt, which is ordinary. Anything else is a refusal.
     const el = video;
     if (!el) return;
-    const refused = (error: unknown) => playbackLog(error instanceof DOMException && error.name === "AbortError"
-      ? "transport play-interrupted" : "transport play-failed", { error: String(error) });
+    const refused = (error: unknown) => logPlayRefusal(el, "transport", error);
     const at = usePlayerStore.getState().time;
     if (clock && audition && stream?.bufferThrough && el.paused && at >= audition.start && at < audition.end) {
       const controller = new AbortController();

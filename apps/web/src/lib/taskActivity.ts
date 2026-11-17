@@ -32,6 +32,7 @@ const toolActivity: Record<string, string> = {
   faces: "Finding where the faces are",
   timeline_propose: "Proposing edit",
   timeline_crossfade_audio: "Smoothing dialogue",
+  timeline_framing: "Framing the picture",
   timeline_first_cut: "Building first edit",
   captions_generate: "Generating captions",
   change_get: "Reviewing change",
@@ -74,9 +75,15 @@ function progressLabel(text: string): string | undefined {
   return label.charAt(0).toUpperCase() + label.slice(1);
 }
 
+const toolNames = new WeakMap<TaskEvent, string>();
+
 export function toolName(event: TaskEvent): string {
+  const known = toolNames.get(event);
+  if (known !== undefined) return known;
   const name = typeof event.data?.tool === "string" ? event.data.tool : event.text.trim().split(/\s+/, 1)[0] ?? "";
-  return name.replace(/^(?:mcp__scarlet__|mcp_scarlet_|scarlet(?:__|[./]))/i, "").replaceAll(".", "_").toLowerCase();
+  const tool = name.replace(/^(?:mcp__scarlet__|mcp_scarlet_|scarlet(?:__|[./]))/i, "").replaceAll(".", "_").toLowerCase();
+  toolNames.set(event, tool);
+  return tool;
 }
 
 export const waitLabels: Record<string, string> = { transcript: "the transcript", sound: "the sound analysis", dialogue: "dialogue analysis" };
@@ -100,14 +107,22 @@ export function pendingMediaWaits(events: readonly TaskEvent[] = []): Set<string
   return waits;
 }
 
+/** The recordings a call reads: its mediaId, or the mediaIds of a read of the same range on several. */
+export function inputMediaIds(input: unknown): string[] {
+  if (!input || typeof input !== "object") return [];
+  const { mediaId, mediaIds } = input as { mediaId?: unknown; mediaIds?: unknown };
+  const ids = Array.isArray(mediaIds) ? mediaIds : [mediaId];
+  return ids.filter((id): id is string => typeof id === "string");
+}
+
 /** The media work this tool call is collecting, when that work is still being prepared. */
 export function waitingFor(event: TaskEvent, waits: ReadonlySet<string>): string | undefined {
   if (event.type !== "tool" || !waits.size) return;
   const wait = waitTools[toolName(event)];
-  const input = event.data?.input;
-  const mediaId = input && typeof input === "object" && "mediaId" in input ? input.mediaId : undefined;
-  const key = waitKey(wait, mediaId);
-  return key && waits.has(key) ? wait : undefined;
+  return inputMediaIds(event.data?.input).some(mediaId => {
+    const key = waitKey(wait, mediaId);
+    return key && waits.has(key);
+  }) ? wait : undefined;
 }
 
 function toolLabel(name: string, event: TaskEvent): string | undefined {

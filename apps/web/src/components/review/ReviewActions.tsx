@@ -11,8 +11,8 @@ export function ReviewActions({ approve, revise, disabled, approvalDisabled, app
     if (action) { event.preventDefault(); action(); }
   });
   return <div className="review-actions">
-    <button type="button" className="btn-ghost" data-key="R" aria-keyshortcuts="R" title="Revise (R)" disabled={disabled} onClick={revise}>Revise</button>
-    {approve && <button type="button" className="btn-primary" data-key={approveKey} aria-keyshortcuts={approveKey} title={`${approveLabel} (${approveKey})`}
+    <button type="button" className="btn-ghost" data-key="R" data-log-control="revise-edit" aria-keyshortcuts="R" title="Revise (R)" disabled={disabled} onClick={revise}>Revise</button>
+    {approve && <button type="button" className="btn-primary" data-key={approveKey} data-log-control={approveKey === "K" ? "keep-edit" : approveKey === "D" ? "mark-done" : "apply-edit"} aria-keyshortcuts={approveKey} title={`${approveLabel} (${approveKey})`}
       disabled={disabled || approvalDisabled} onClick={e => {
         // The button stays for the next edit. Clicked, it lets go of the focus (WebView2 leaves it there), or Space
         // would press it again while the video is paused. Pressed by keyboard, it keeps it.

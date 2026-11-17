@@ -14,8 +14,17 @@ import { clipRange, intervalCandidates, timelineDuration, type Change, type Clip
 export type EditKind = "cut" | "restore" | "audio" | "zoom" | "reframe" | "text" | "overlay" | "graphic" | "speed" | "transition" | "other";
 
 type Op = Record<string, unknown>;
-/** `picture`: footage placed on the main picture track, which builds the cut rather than laying anything over it. */
-type Facet = EditKind | "framing" | "picture" | "neutral";
+/**
+ * `picture`: footage placed on the main picture track, which builds the cut rather than laying anything over it.
+ * `marker`: a marker left on the timeline, which changes nothing the editor sees or hears.
+ */
+type Facet = EditKind | "framing" | "picture" | "marker" | "neutral";
+/**
+ * `ask`: what a to-do marker asks of the editor, in its own words. `restated`: this step wrote those words, as against
+ * a move of a marker that only still says them.
+ */
+type Placed = { facet: Facet; range?: TimeRange; ask?: string; restated?: boolean };
+type MarkerFields = { time?: unknown; text?: unknown; kind?: unknown; resolved?: unknown };
 
 const AUDIO_KEYS = new Set(["volume", "audioFadeIn", "audioFadeOut"]);
 const FRAMING_KEYS = new Set(["transform", "keyframes"]);
@@ -75,7 +84,7 @@ function settled(time: number, later: Op[]): number {
 }
 
 /** Each op's facet, and where it lands on the finished cut when that can be told. */
-function opFacets(change: Change, { before, after, media }: Clocks): { facet: Facet; range?: TimeRange }[] {
+function opFacets(change: Change, { before, after, media }: Clocks): Placed[] {
   const isGraphic = graphicFiles(media);
   const ops = (change.ops ?? []) as Op[];
   const beforeClip = clipFinder(before, ops.length > 1);
@@ -102,7 +111,9 @@ function opFacets(change: Change, { before, after, media }: Clocks): { facet: Fa
     if (!clip) return;
     try { return clipRange(clip); } catch { return; }
   };
-  return ops.flatMap((op, index): { facet: Facet; range?: TimeRange }[] => {
+  const markerNow = (id: unknown) => typeof id !== "string" ? undefined
+    : after?.markers?.find(m => m.id === id) ?? before?.markers?.find(m => m.id === id);
+  return ops.flatMap((op, index): Placed[] => {
     const now = (time: number) => settled(time, ops.slice(index + 1));
     switch (op.op) {
       case "rippleDelete": {
@@ -147,16 +158,43 @@ function opFacets(change: Change, { before, after, media }: Clocks): { facet: Fa
       }
       case "addTrack": case "splitClip": case "moveClip": case "removeTrack":
         return [{ facet: "neutral" }];
-      case "addMarker": case "removeMarker": case "updateMarker":
-        return [];
+      case "addMarker": case "updateMarker": {
+        // A marker added or changed is left on the timeline, at its point. One marked resolved asks nothing more.
+        const patch = op.op === "addMarker" ? op.marker as MarkerFields | undefined
+          : op.patch && typeof op.patch === "object" ? op.patch as MarkerFields : undefined;
+        if (patch?.resolved === true) return [{ facet: "neutral" }];
+        const saved = op.op === "updateMarker" ? markerNow(op.markerId) : undefined;
+        const time = typeof patch?.time === "number" ? patch.time : saved?.time;
+        const text = typeof patch?.text === "string" ? patch.text : saved?.text;
+        const kind = patch?.kind ?? saved?.kind;
+        const at = time !== undefined ? now(time) : undefined;
+        return [{ facet: "marker", range: at !== undefined ? { start: at, end: at } : undefined,
+          ...(kind === "todo" && text?.trim() && { ask: text.trim(), restated: typeof patch?.text === "string" }) }];
+      }
+      case "removeMarker":
+        return [{ facet: "neutral" }];
       default:
         return [{ facet: "other" as const }];
     }
   });
 }
 
-function decide(facets: Facet[], framing: "zoom" | "reframe", { before, after }: Clocks): EditKind {
+/** What an edit did, or `marker` when all it did was leave markers for the editor. */
+type Verdict = EditKind | "marker";
+
+/** `whole`: the facets are all the change's, so how much longer or shorter it left the cut is this edit's doing. */
+function decide(facets: Facet[], framing: "zoom" | "reframe", { before, after }: Clocks, whole = false): Verdict {
   const set = new Set(facets.filter(f => f !== "neutral"));
+  const lengths = () => before && after ? timelineDuration(after) - timelineDuration(before) : 0;
+  // A marker beside anything that changed the video is a note on that edit, which is what the edit is.
+  if (set.has("marker")) {
+    if (set.size > 1) set.delete("marker");
+    else {
+      // Markers alone take nothing out, so a change that left the cut shorter did it with steps that say nothing.
+      const moved = whole ? lengths() : 0;
+      return moved < -SAME_LENGTH ? "cut" : moved > SAME_LENGTH ? "restore" : "marker";
+    }
+  }
   // A cut can carry the trims and room tone that smooth its join; it is still a cut.
   if (set.has("cut") && !set.has("restore")) return "cut";
   if (set.has("restore") && !set.has("cut")) return "restore";
@@ -165,8 +203,8 @@ function decide(facets: Facet[], framing: "zoom" | "reframe", { before, after }:
   if ((set.has("overlay") || set.has("graphic")) && [...set].every(f => f === "overlay" || f === "graphic" || f === "audio")) return "overlay";
   if (set.size === 0) {
     // Only neutral steps: a removed or re-timed clip. Whether the cut got shorter or longer says which it was.
-    const lengths = before && after ? timelineDuration(after) - timelineDuration(before) : 0;
-    return lengths < -SAME_LENGTH ? "cut" : lengths > SAME_LENGTH ? "restore" : "other";
+    const moved = lengths();
+    return moved < -SAME_LENGTH ? "cut" : moved > SAME_LENGTH ? "restore" : "other";
   }
   if (set.size > 1) return "other";
   const only = [...set][0]!;
@@ -190,21 +228,59 @@ function zooms(change: Change): boolean {
  * ops that land on it. One that none lands on takes the kind of the ops that couldn't be placed, which may be its own.
  * When every op that says something was placed on another edit, this one did nothing a word names: a cut made
  * elsewhere in the change doesn't make it a cut. `rippleJoins` are a change's joins when they are already known, each a
- * cut unless it says it put footage back: they are read in place of the ops.
+ * cut unless it says it put footage back: they are read in place of the ops, beside any markers the ops left.
  */
 export function editKinds(change: Change, ranges: TimeRange[], clocks: Clocks = {},
   rippleJoins?: readonly { range: TimeRange; facet?: "restore" }[]): EditKind[] {
-  const facets = rippleJoins ? rippleJoins.map(({ range, facet }) => ({ facet: facet ?? "cut" as const, range }))
-    : opFacets(change, clocks).filter(f => f.facet !== "neutral");
+  return classifyEdits(change, ranges, clocks, rippleJoins).kinds;
+}
+
+/**
+ * `editKinds`, and for each edit whether all it did was leave markers for the editor, such as a spot for footage the
+ * project doesn't have. Nothing the editor sees or hears changed there: such an edit's kind is `other`, and `asks`
+ * holds what its to-do markers ask of the editor, in their own words, when they say. `restated` says whether this change
+ * wrote those words, rather than only moving a marker that already said them.
+ */
+export function classifyEdits(change: Change, ranges: TimeRange[], clocks: Clocks = {},
+  rippleJoins?: readonly { range: TimeRange; facet?: "restore" }[]): {
+  kinds: EditKind[]; markers: boolean[]; asks: (string | undefined)[]; restated: boolean[];
+} {
+  // Known joins stand for the steps, so only the markers are read from them, and only when there are any.
+  const marks = rippleJoins && ((change.ops ?? []) as Op[]).some(op => op.op === "addMarker" || op.op === "updateMarker");
+  const steps = !rippleJoins || marks ? opFacets(change, clocks).filter(f => f.facet !== "neutral") : [];
+  const facets: Placed[] = rippleJoins ? [...rippleJoins.map(({ range, facet }) => ({ facet: facet ?? "cut" as const, range })),
+    ...steps.filter(f => f.facet === "marker")] : steps;
   const framing = facets.some(f => f.facet === "framing") && zooms(change) ? "zoom" : "reframe";
-  const whole = decide(facets.map(f => f.facet), framing, clocks);
-  if (ranges.length <= 1 || !facets.length) return ranges.map(() => whole);
-  const anywhere = facets.filter(f => !f.range);
-  const unplaced = anywhere.length ? decide(anywhere.map(f => f.facet), framing, clocks) : "other";
-  const placed = facets.filter((f): f is { facet: Facet; range: TimeRange } => !!f.range);
-  const candidates = intervalCandidates(placed, f => f.range.start, f => f.range.end + 0.5);
-  return ranges.map(range => {
-    const here = candidates(range.start, range.end + 0.5);
-    return here.length ? decide(here.map(f => f.facet), framing, clocks) : unplaced;
-  });
+  const verdict = (here: Placed[], all = false) => ({ verdict: decide(here.map(f => f.facet), framing, clocks, all), here });
+  let found: { verdict: Verdict; here: Placed[] }[];
+  if (ranges.length <= 1 || !facets.length) {
+    const whole = verdict(facets, true);
+    // A save of the whole video has no steps to place, so what it did is read from how much longer or shorter it left
+    // the cut. That is the doing of the edits where the video changed, not of every edit it names: on Matt's pass a
+    // save that lengthened one pickup at 9:05 also named "Pricing and model names", a passage it left as it was, and
+    // the card called that passage "Added" (2026-11-16). Where the change says nothing looks or sounds different, an
+    // edit it names changed nothing a word names.
+    const changed = !facets.length && ranges.length > 1 && change.ranges?.length ? change.ranges : undefined;
+    const still = { verdict: "other" as const, here: [] as Placed[] };
+    found = ranges.map(range => !changed || changed.some(c => c.start <= range.end + 0.5 && c.end >= range.start - 0.5) ? whole : still);
+  } else {
+    const anywhere = facets.filter(f => !f.range);
+    const unplaced = anywhere.length ? verdict(anywhere) : { verdict: "other" as const, here: [] };
+    const placed = facets.filter((f): f is Placed & { range: TimeRange } => !!f.range);
+    const candidates = intervalCandidates(placed, f => f.range.start, f => f.range.end + 0.5);
+    found = ranges.map(range => {
+      const here = candidates(range.start, range.end + 0.5);
+      return here.length ? verdict(here) : unplaced;
+    });
+  }
+  return {
+    kinds: found.map(({ verdict }) => verdict === "marker" ? "other" : verdict),
+    markers: found.map(({ verdict }) => verdict === "marker"),
+    asks: found.map(({ verdict, here }) => {
+      if (verdict !== "marker") return;
+      const asked = [...new Set(here.flatMap(f => f.ask ? [f.ask] : []))];
+      return asked.length ? asked.join(" ") : undefined;
+    }),
+    restated: found.map(({ verdict, here }) => verdict === "marker" && here.some(f => f.ask && f.restated)),
+  };
 }

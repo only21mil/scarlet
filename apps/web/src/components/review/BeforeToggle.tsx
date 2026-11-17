@@ -20,6 +20,7 @@ export function BeforeToggle({ on, toggle, shortcutActive, disabled, flash }: Be
       ref={button}
       type="button"
       className={flash ? "edit-card-icon edit-card-before is-flash" : "edit-card-icon edit-card-before"}
+      data-log-control="toggle-before"
       aria-label="Before"
       aria-pressed={on}
       aria-keyshortcuts={COMPARE_KEY}

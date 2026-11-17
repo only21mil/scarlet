@@ -41,7 +41,7 @@ const WordParagraph = memo(function WordParagraph({ words, from, to }: {
   return <p className="reading-passage">{words.map((w, i) => {
     const key = wordKey(w);
     return <Fragment key={key}>{i > 0 && " "}<span data-w={w.index} data-word-key={key} role="button" tabIndex={-1}
-      aria-label={w.cut ? `${w.word.text} (unused in edit)` : w.word.text}
+      data-log-label="Transcript word" data-log-control="transcript-word" aria-label={w.cut ? `${w.word.text} (unused in edit)` : w.word.text}
       className={`rounded px-[2px] py-0.5 -mx-px cursor-pointer hover:bg-raised data-[current]:bg-hi data-[current]:text-bg data-[current]:hover:bg-hi ${w.cut ? "line-through text-dim decoration-dim/70" : "text-fg"} ${w.index >= from && w.index <= to ? "bg-hi-dim" : ""}`}
       title={w.cut ? `Unused in edit · source ${clock(w.word.start)}` : `${clock(w.placements[0]!.start)}${w.word.speaker ? ` · ${w.word.speaker}` : ""}`}>
       {w.word.text}

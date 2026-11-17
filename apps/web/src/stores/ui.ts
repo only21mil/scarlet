@@ -1,14 +1,7 @@
 import { create } from "zustand";
 import { clipsAt, type Timeline } from "@scarlet/timeline";
-import type { AgentEffort, AgentId, EditRef } from "@scarlet/shared";
-
-export interface AgentPick {
-  agent: AgentId;
-  model?: string;
-  /** Unset = the CLI's own default. */
-  effort?: AgentEffort;
-  serviceTier?: string;
-}
+import { AgentId, type EditRef } from "@scarlet/shared";
+import { desktop, isDesktop, type AgentPick } from "../lib/desktop";
 
 /** Playhead context the agent panel attaches to the next instruction. */
 export interface AgentContext {
@@ -84,17 +77,37 @@ function saveFirstEditHint(firstEditHint: string) {
   return { firstEditHint };
 }
 
-export function loadAgent(defaultAgent: AgentId = "claude"): AgentPick {
+function readSavedAgent(): AgentPick | undefined {
   try {
     const raw = localStorage.getItem(AGENT_KEY);
     if (raw) {
       const parsed = JSON.parse(raw) as Partial<AgentPick> & { fast?: boolean };
-      if (parsed.agent) return { agent: parsed.agent, model: parsed.model, effort: parsed.effort, serviceTier: parsed.serviceTier ?? (parsed.fast ? "fast" : undefined) };
+      const agent = AgentId.safeParse(parsed?.agent);
+      if (agent.success) return {
+        agent: agent.data,
+        model: typeof parsed.model === "string" ? parsed.model : undefined,
+        effort: typeof parsed.effort === "string" ? parsed.effort : undefined,
+        serviceTier: typeof parsed.serviceTier === "string" ? parsed.serviceTier : parsed.fast === true ? "fast" : undefined,
+      };
     }
-  } catch {
-    /* ignore */
+  } catch { /* The native preference can still be loaded. */ }
+}
+
+let editorModelWrite = Promise.resolve();
+function saveAgent(agent: AgentPick) {
+  try { localStorage.setItem(AGENT_KEY, JSON.stringify(agent)); } catch { /* The native write can still succeed. */ }
+  if (isDesktop()) {
+    // An earlier click must finish saving before the next one can replace it.
+    editorModelWrite = editorModelWrite.then(() => desktop.saveEditorModel(agent)).catch(() => undefined);
   }
-  return { agent: defaultAgent };
+}
+
+export function restoreAgentSelection(native: AgentPick | null | undefined) {
+  if (native) useUiStore.setState({ agent: native, agentSelected: true });
+  else {
+    const previous = readSavedAgent();
+    if (previous) useUiStore.getState().setAgent(previous);
+  }
 }
 
 interface ComposerDraft {
@@ -130,7 +143,9 @@ interface UiState {
   setAgentSetupOpen(v: boolean | "models"): void;
 
   agent: AgentPick;
+  agentSelected: boolean;
   setAgent(p: AgentPick): void;
+  setDefaultAgent(agent: AgentId): void;
 
   /** Show each agent run's token count in edit threads. Off unless turned on in Settings → Usage. */
   showRunTokens: boolean;
@@ -234,10 +249,14 @@ export const useUiStore = create<UiState>((set, get) => ({
   agentSetupOpen: false,
   setAgentSetupOpen: (agentSetupOpen) => set({ agentSetupOpen }),
 
-  agent: loadAgent(),
+  agent: { agent: "claude" },
+  agentSelected: false,
   setAgent: (agent) => {
-    try { localStorage.setItem(AGENT_KEY, JSON.stringify(agent)); } catch { /* Keep the pick for this session. */ }
-    set({ agent });
+    set({ agent, agentSelected: true });
+    saveAgent(agent);
+  },
+  setDefaultAgent: (agent) => {
+    if (!get().agentSelected && get().agent.agent !== agent) set({ agent: { agent } });
   },
 
   showRunTokens: (() => { try { return localStorage.getItem(RUN_TOKENS_KEY) !== "hidden"; } catch { return true; } })(),

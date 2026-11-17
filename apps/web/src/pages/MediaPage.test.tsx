@@ -9,6 +9,7 @@ import * as client from "../lib/client";
 import { desktop } from "../lib/desktop";
 import { PhysicalPosition } from "@tauri-apps/api/dpi";
 import { listenForFileDrops } from "../lib/dropTargets";
+import { pendingImports } from "../lib/pendingImports";
 import { dispatchWsEvent } from "../lib/realtime";
 import { MediaDrawer } from "../components/media/MediaDrawer";
 import { Dropzone, useUploader } from "../components/media/UploadDropzone";
@@ -169,7 +170,7 @@ it("tracks the native selection from the first pending import through media prep
   }
 });
 
-it("adds a link like any file: its dialog closes at once, Media says it is downloading, and a link that failed is a row that says why", async () => {
+it("queues links as downloads and reports a failed, finished or cancelled transfer in Media", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   const previous = useProjectStore.getState();
   const db = buildDb();
@@ -185,7 +186,9 @@ it("adds a link like any file: its dialog closes at once, Media says it is downl
   const imports = vi.spyOn(api, "importMedia")
     .mockImplementationOnce(() => new Promise((_, reject) => { fail = () => reject(new Error("Couldn’t download that URL: 404")); }))
     .mockImplementationOnce(() => new Promise(resolve => { finish = () => resolve({ media: arrived }); }))
-    .mockImplementationOnce(() => new Promise(() => {}));
+    .mockImplementationOnce((_id, _body, signal) => new Promise((_resolve, reject) => {
+      signal!.addEventListener("abort", () => reject(signal!.reason), { once: true });
+    }));
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
@@ -209,7 +212,7 @@ it("adds a link like any file: its dialog closes at once, Media says it is downl
     await add(drive);
     // The dialog is gone while the link still downloads. A Drive link has no file name in it, so it goes by the link.
     expect(container.querySelector("dialog")).toBeNull();
-    expect(imports).toHaveBeenCalledExactlyOnceWith(PRJ, { url: drive, importId: expect.any(String) });
+    expect(imports).toHaveBeenCalledExactlyOnceWith(PRJ, { url: drive, importId: expect.any(String) }, expect.any(AbortSignal));
     expect(adding()).toEqual([drive, "File 1 of 1", "Downloading…", false]);
     // Nothing waits for it. Files can still be chosen, and another link joins the queue behind it. Until its turn
     // the card counts it, as it counts the files of one drop.
@@ -223,7 +226,7 @@ it("adds a link like any file: its dialog closes at once, Media says it is downl
     const failed = [...container.querySelectorAll("ul.mb-3 > li")].find(row => row.textContent?.includes(drive))!;
     expect([failed.querySelector(".truncate")?.textContent, failed.querySelector("span.text-bad")?.textContent, failed.querySelector("div.text-bad")?.textContent, failed.querySelector("button")?.getAttribute("aria-label")])
       .toEqual([drive, "Failed", "Couldn’t download that URL: 404", "Dismiss"]);
-    expect(imports.mock.calls[1]).toEqual([PRJ, { url: "https://example.com/clips/interview.mp4?token=abc", importId: expect.any(String) }]);
+    expect(imports.mock.calls[1]).toEqual([PRJ, { url: "https://example.com/clips/interview.mp4?token=abc", importId: expect.any(String) }, expect.any(AbortSignal)]);
     expect(adding()).toEqual(["interview.mp4", "File 2 of 2", "Downloading…", false]);
     // Downloaded, it is a file in the list like any other, being prepared.
     await act(async () => finish());
@@ -232,6 +235,17 @@ it("adds a link like any file: its dialog closes at once, Media says it is downl
     // The queue emptied, so the next link added is counted from one again. Its name reads without the address's escapes.
     await add("https://example.com/clips/B%20roll%20caf%C3%A9%2emov");
     expect(adding()).toEqual(["B roll café.mov", "File 1 of 1", "Downloading…", false]);
+    // Cancel is attached to the live download. A link queued behind it still gets its turn.
+    const following = "https://example.com/after-cancel.png";
+    imports.mockResolvedValueOnce({ media: { ...arrived, id: "med_after_cancel", name: "after-cancel.png" } });
+    await add(following);
+    expect(imports).toHaveBeenCalledTimes(3);
+    await act(async () => button("Cancel download").click());
+    expect(imports.mock.calls[2]![2]?.aborted).toBe(true);
+    expect(imports).toHaveBeenLastCalledWith(PRJ, { url: following, importId: expect.any(String) }, expect.any(AbortSignal));
+    expect(pendingImports(PRJ)).toEqual([]);
+    expect(container.textContent).not.toContain("B roll café.mov");
+    expect(container.textContent).toContain("after-cancel.png");
   } finally {
     await act(() => root.unmount());
     container.remove();
@@ -438,6 +452,25 @@ const fixtureVideo = (extra: Partial<MediaAsset>): MediaAsset => ({ ...buildDb()
 const jobs = (row: Element) => ({
   lines: [...row.querySelectorAll('.media-status [role="status"]')].map(line => [line.textContent, line.className]),
   actions: [...row.querySelectorAll(".media-jobs button, .media-jobs a")].map(action => action.textContent),
+});
+
+it("pauses and resumes media processing from the library toolbar", async () => {
+  const media = [fixtureVideo({ id: "camera", name: "camera.mov" })];
+  await showMedia({ media, caches: [{ mediaId: "camera", state: "caching", progress: 0.42 }] }, async container => {
+    const update = vi.spyOn(api, "updateProject").mockImplementation(async (_id, body) => ({
+      project: { ...useProjectStore.getState().current!.project, mediaPaused: body.mediaPaused === true },
+    }));
+    const button = () => container.querySelector<HTMLButtonElement>('button[title$=" media processing"]')!;
+    expect(button().textContent).toBe("Pause");
+    await act(async () => button().click());
+    expect(update).toHaveBeenNthCalledWith(1, PRJ, { mediaPaused: true });
+    expect(button().textContent).toBe("Resume");
+    expect(jobs(container.querySelector(".media-row")!).lines[0]).toEqual(["Caching paused", "media-cache is-idle"]);
+    expect(container.querySelector('progress[aria-label="Caching camera.mov"]')).toBeNull();
+    await act(async () => button().click());
+    expect(update).toHaveBeenNthCalledWith(2, PRJ, { mediaPaused: false });
+    expect(button().textContent).toBe("Pause");
+  });
 });
 
 it("confirms a saved recording's replacement, shows its progress, and lets a failed job be retried", async () => {

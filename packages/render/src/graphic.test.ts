@@ -87,6 +87,8 @@ describe.skipIf(!hasChrome())("drawing a graphic", () => {
     const output = path.join(dir, "bar.mov");
     const result = await renderGraphic({ htmlFile: html, width: 320, height: 180, fps: 10, duration: 1, output });
     expect(result.frames).toBe(10);
+    // A page with an animation is drawn at every frame.
+    expect(result.drawn).toBe(10);
     expect(result.missingFonts).toEqual([{ family: "Scarlet Test Missing Face", sample: "Hi" }]);
     const probe = await probeMedia(output);
     expect(probe).toMatchObject({ hasAlpha: true, width: 320, height: 180, fps: 10 });
@@ -121,6 +123,28 @@ describe.skipIf(!hasChrome())("drawing a graphic", () => {
     const [r2, , b2] = await pixel(frame, 250, 30);
     expect(b2).toBeGreaterThan(200);
     expect(r2).toBeLessThan(60);
+  });
+
+  it("draws a page that doesn't change twice and holds it for its length, and draws one a script changes in full", async () => {
+    const card = `<!doctype html><html><head><style>html,body{margin:0;background:transparent}
+      .card{position:absolute;left:10%;top:20%;width:40%;height:60%;background:rgb(255,0,0)}</style></head><body><div class="card"></div></body></html>`;
+    const html = path.join(dir, "card.html");
+    await fs.writeFile(html, card);
+    const output = path.join(dir, "card.mov");
+    const result = await renderGraphic({ htmlFile: html, width: 320, height: 180, fps: 10, duration: 3, output });
+    expect(result).toMatchObject({ frames: 30, drawn: 2 });
+    const probe = await probeMedia(output);
+    expect(probe).toMatchObject({ hasAlpha: true, width: 320, height: 180, fps: 10 });
+    expect(probe.duration).toBeCloseTo(3, 1);
+    const [start, end] = await graphicCoverage(output, [0, 2.9], { width: 320, height: 180 });
+    expect(start!.box).toMatchObject({ left: expect.closeTo(0.1, 1), right: expect.closeTo(0.5, 1), top: expect.closeTo(0.2, 1), bottom: expect.closeTo(0.8, 1) });
+    expect(end!.box).toEqual(start!.box);
+
+    // The same card moved by the page's own clock is not a still, though it has no CSS animation.
+    const moved = path.join(dir, "moved.html");
+    await fs.writeFile(moved, card.replace("</body>", `<script>window.scarletSeek = s => { document.querySelector(".card").style.left = (10 + s * 10) + "%"; };</script></body>`));
+    const all = await renderGraphic({ htmlFile: moved, width: 320, height: 180, fps: 10, duration: 1, output: path.join(dir, "moved.mov") });
+    expect(all).toMatchObject({ frames: 10, drawn: 10 });
   });
 
   it("draws one moment as a transparent PNG at the size asked", async () => {

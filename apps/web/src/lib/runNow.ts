@@ -140,6 +140,7 @@ function toolWords(name: string, raw: unknown, callNumber?: CallNumber): string 
     case "timeline_get": case "timeline_summary": case "timeline_at": return "Looking at the timeline";
     case "timeline_transcript": return "Reading the video’s words";
     case "timeline_propose": return "Making the edit";
+    case "timeline_framing": return field(input, "preview") === true ? "Trying a framing" : "Framing the picture";
     case "captions_generate": return "Making captions";
     case "render_request": return "Rendering a preview";
     case "render_status": return "Waiting for the preview";

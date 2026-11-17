@@ -262,6 +262,26 @@ export function planPlaybackSegments(project: Pick<Project, "settings">, timelin
   return planSegments(project, timeline, 4, duration, sourceClockAnchors(timeline, 4));
 }
 
+/**
+ * `range` widened to the whole playback sections it touches, with the sections' own endpoints, so a file of it can be
+ * assembled from the cached sections the full preview and the cut player share. Undefined outside the plan.
+ */
+export function spanningSections(sections: readonly TimeRange[], range: TimeRange): TimeRange | undefined {
+  const eps = 1e-6;
+  let lo = 0, hi = sections.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (sections[mid]!.end > range.start + eps) hi = mid;
+    else lo = mid + 1;
+  }
+  const first = sections[lo];
+  if (!first || first.start > range.start + eps) return;
+  let last = lo;
+  while (sections[last]!.end < range.end - eps && last + 1 < sections.length) last++;
+  if (sections[last]!.end < range.end - eps) return;
+  return { start: first.start, end: sections[last]!.end };
+}
+
 /** Bound simultaneous decoders when sampling distant frames in a cached preview. */
 export const FILMSTRIP_SEEK_BATCH = 4;
 export function sparseFilmstrip(frames: number[], fps: number) {

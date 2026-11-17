@@ -20,6 +20,7 @@ export interface ProxyOptions {
   /** Hardware acceleration policy. Default "none" (libx264). */
   hwaccel?: HwAccel;
   onProgress?: (fraction: number) => void;
+  onFallback?: (stage: "decode" | "encode") => void;
   signal?: AbortSignal;
   ffmpegPath?: string;
   ffprobePath?: string;
@@ -116,10 +117,12 @@ async function encodeProxy(input: string, output: string, opts: ProxyOptions, ha
     // The decoder or scale filter can reject this stream even though the encoder works. Completed
     // checkpoints have the same codec and clock, so this retry picks up at the failed part.
     if (video?.input.includes("-hwaccel")) {
+      opts.onFallback?.("decode");
       const result = await encodeProxy(input, output, opts, false);
       if (result.encoder === encoder) warnings.push(`The accelerated input failed (${failureReason(error)}); decoded on the CPU and encoded with ${encoder}.`);
       return { ...result, warnings: [...warnings, ...result.warnings] };
     }
+    opts.onFallback?.("encode");
     const result = await encodeProxy(input, output, { ...opts, hwaccel: "none" }, false);
     return { ...result, warnings: [...warnings, `${encoder} could not make this preview copy (${failureReason(error)}); used libx264.`, ...result.warnings] };
   }
@@ -151,8 +154,10 @@ async function encodeProxy(input: string, output: string, opts: ProxyOptions, ha
           });
           await rename(temp, path);
         } catch (error) {
+          // A cancelled encode can reject immediately on retry. Clean up before creating that promise.
+          await rm(temp, { force: true });
           return retry(error);
-        } finally { await rm(temp, { force: true }); }
+        }
       }
       // A VFR screen capture may hold a picture for this entire part. An empty MP4 stops concat at that point.
       if (probe.previewClock || (await probeMedia(path, { ffprobePath: opts.ffprobePath, signal: opts.signal })).hasVideo) {

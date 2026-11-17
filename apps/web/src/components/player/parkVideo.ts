@@ -1,3 +1,4 @@
+import { logPlayRefusal } from "../../lib/playbackLog";
 import { CUT_DECODER_PREROLL_SECONDS } from "@scarlet/timeline";
 
 export const decoderLeadIn = (target: number) => Math.max(0, target - CUT_DECODER_PREROLL_SECONDS);
@@ -24,8 +25,11 @@ export function parkVideo(video: HTMLVideoElement, target: number, fps: number, 
     if (stopped || video.seeking || video.readyState < 1) return;
     video.removeEventListener("seeked", decode);
     if (target - start < 1 / fps || video.currentTime >= target - 0.5 / fps) return;
-    void video.play().then(() => { if (!stopped) check(); }).catch(() => {
-      if (!stopped) seek(target);
+    void video.play().then(() => { if (!stopped) check(); }).catch(error => {
+      if (!stopped) {
+        logPlayRefusal(video, "park", error);
+        seek(target);
+      }
     });
   }
   function position() {

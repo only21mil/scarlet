@@ -8,6 +8,7 @@ import { now } from "../db.js";
 import { waitFor } from "../events.js";
 import { notFound } from "../errors.js";
 import { claimTask } from "../services/tasks.js";
+import { prefetchDialoguePass } from "../services/dialoguePrefetch.js";
 import { jsonBody } from "./util.js";
 
 const ONLINE_WINDOW_MS = 90_000;
@@ -79,6 +80,11 @@ export function hostRoutes(ctx: Ctx) {
       const fired = await waitFor(ctx.bus, "task.queued", Math.min(remaining, 25_000), undefined, signal);
       if (!fired || signal.aborted) break;
       task = claimTask(ctx, fresh, undefined, body.agents, desktopPid);
+    }
+    // A dialogue pass reads its recordings first. Start on them while the host starts the agent.
+    // What it can't start, the pass's own calls start or report.
+    if (task) {
+      try { prefetchDialoguePass(ctx, task); } catch (err) { ctx.log(`[dialogue-scan] ${task.id}: couldn’t read ahead of the pass: ${(err as Error).message}`); }
     }
     return c.json({ task });
   });

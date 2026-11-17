@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { cachedShare } from "@scarlet/shared";
 import { plural } from "../../lib/format";
 import { mediaProblems, mediaWarningLabel } from "../../lib/transcriptionProgress";
@@ -6,7 +6,8 @@ import { useProjectStore } from "../../stores/project";
 import { MenuItem } from "../shell/WorkspaceNavigation";
 import { Icon } from "../ui/primitives";
 import { ProgressLine } from "../ui/ProgressLine";
-import { cachePercent, useSourceCaches } from "./sourceCaches";
+import { cacheLabel, cachePercent, useSourceCaches } from "./sourceCaches";
+import { useMediaProcessing } from "./useMediaProcessing";
 
 /**
  * What's wrong with the project's media, in a few words, or nothing. A file Scarlet couldn't read or a transcription
@@ -25,7 +26,7 @@ export function useMediaWarning(importFailed = false): string | undefined {
 /**
  * What the project's videos are doing with their playback caches: caching and how far, or waiting their turn, and
  * whether the project is paused. It is about the videos only: the edit's own playback cache isn't counted. The header's
- * Media button reads it for its line and its hover, and the menu's caching row for Pause and Resume.
+ * Media button reads it for its line and hover, and the menu uses it to show when there is work to pause.
  * How far is counted across the videos being cached by their length, so the figure only goes up as one video
  * finishes and the next starts.
  */
@@ -33,7 +34,7 @@ export function useVideoCaching() {
   const media = useProjectStore(s => s.current?.media) ?? [];
   const paused = useProjectStore(s => !!s.current?.project.mediaPaused);
   const { caches } = useSourceCaches();
-  const listed = media.filter(m => m.kind === "video" && caches.has(m.id)).map(m => ({ seconds: m.duration ?? 0, cache: caches.get(m.id)! }));
+  const listed = media.filter(m => m.kind === "video" && caches.has(m.id)).map(m => ({ media: m, seconds: m.duration ?? 0, cache: caches.get(m.id)! }));
   const videos = listed.map(v => v.cache);
   const caching = videos.filter(c => c.state === "caching");
   const waiting = videos.filter(c => c.queued);
@@ -45,10 +46,10 @@ export function useVideoCaching() {
   // It reads as a video's own row in Media does, so it says 100% only once every video is cached.
   const percent = progress != null ? cachePercent({ progress }) : undefined;
   return {
-    paused, active, progress, canPause: !paused && (active || waiting.length > 0),
+    listed, paused, active, progress, canPause: !paused && (active || waiting.length > 0),
     /** In a word or two while videos cache: "Caching 30%", or "Caching" until the engine has a figure. */
     label: !active ? undefined : percent ? `Caching ${percent}` : "Caching",
-    headline: paused ? "Caching is paused"
+    headline: paused ? "Media processing is paused"
       : !videos.length ? undefined
       : active && videos.length === 1 ? "Caching for playback"
       : ready === videos.length ? (videos.length === 1 ? "Video cached for playback" : `All ${videos.length} videos cached for playback`)
@@ -56,46 +57,75 @@ export function useVideoCaching() {
   };
 }
 
-/**
- * The header's Media button. While videos cache, a line under its word fills as far as they've got, as Export's does
- * while it exports. It carries the amber mark when a file needs the editor, and hover names the problem ahead of what
- * the videos are doing (adding, caching and how far, paused). Each video's cache is in Media itself.
- */
+/** The header's Media button opens the library. Its hover card shows jobs and offers Pause or Resume. */
 export function MediaButton({ importing, importFailed, onOpen }: { importing: number; importFailed?: boolean; onOpen(): void }) {
   const warning = useMediaWarning(importFailed);
-  const { active, progress, label, headline } = useVideoCaching();
-  const doing = importing > 0 ? `Adding ${plural(importing, "file")}` : label ?? headline;
-  const description = [warning, doing].filter(Boolean).join(". ") || undefined;
-  return <button type="button" className={`btn-quiet simple-media${warning ? " needs-you" : ""}`} aria-haspopup="dialog" title={description}
-    aria-description={description} onClick={onOpen}>
-    Media{warning && <span className="menu-dot" role="img" aria-label={warning} />}
-    {active && <ProgressLine progress={progress} />}
-  </button>;
+  const { listed, paused, active, progress, label, headline } = useVideoCaching();
+  const transcribing = useTranscriptionActive();
+  const processing = useMediaProcessing();
+  const button = useRef<HTMLButtonElement>(null);
+  const [dismissed, setDismissed] = useState(false);
+  const [focused, setFocused] = useState(false);
+  const adding = importing > 0 ? `Adding ${plural(importing, "file")}` : undefined;
+  const transcription = transcribing ? "Transcription in progress" : undefined;
+  const description = [warning, adding ?? label ?? headline, transcription].filter(Boolean).join(". ") || undefined;
+
+  return <div className="media-hover" data-dismissed={dismissed || undefined} data-escape-owner={(focused && !dismissed) || undefined}
+    onPointerEnter={() => setDismissed(false)} onFocus={() => { setFocused(true); setDismissed(false); }}
+    onBlur={event => {
+      if (!event.currentTarget.contains(event.relatedTarget)) setFocused(false);
+    }}
+    onKeyDown={event => {
+      if (event.key !== "Escape" || dismissed) return;
+      event.stopPropagation();
+      button.current?.focus();
+      setDismissed(true);
+    }}>
+    <button ref={button} type="button" className={`btn-quiet simple-media${warning ? " needs-you" : ""}`} aria-haspopup="dialog"
+      aria-description={description} onClick={() => { setDismissed(true); onOpen(); }}>
+      Media{warning && <span className="menu-dot" role="img" aria-label={warning} />}
+      {active && <ProgressLine progress={progress} />}
+    </button>
+    <div className="media-hover-card">
+      <div className="card" role="group" aria-label="Media processing">
+        {warning && <span className="text-warn">{warning}</span>}
+        {adding && <span role="status">{adding}</span>}
+        {headline && <strong role="status">{headline}</strong>}
+        {transcription && <span role="status">{transcription}</span>}
+        {listed.slice(0, 5).map(({ media, cache }) => {
+          const status = cacheLabel(cache, paused);
+          return <div key={media.id} className="media-hover-row">
+            <span className="truncate text-muted" title={media.name}>{media.name}</span>
+            <span className="text-muted">{status?.text}</span>
+            {!paused && cache.state === "caching" && <progress className="activity-progress" aria-label={`Caching ${media.name}`} max={1} value={cache.progress} />}
+          </div>;
+        })}
+        {listed.length > 5 && <span className="text-muted">{listed.length - 5} more in Media</span>}
+        <button type="button" className="simple-link aria-disabled:opacity-60" aria-disabled={processing.busy}
+          title={processing.description} onClick={() => void processing.toggle()}>
+          <Icon name={processing.icon} size={12} />{processing.label}
+        </button>
+        {processing.error && <span className="simple-error" role="alert">{processing.error}</span>}
+      </div>
+    </div>
+  </div>;
 }
 
-/**
- * Caching's row in the simple view's menu. While videos cache or wait to, it pauses the project's media processing,
- * which keeps finished parts. For as long as it is paused it resumes it, whatever the videos are doing: it is the
- * only way to resume, and nothing else in the header or the chat says the project is paused. Media's own rows say
- * which of a file's jobs the pause holds.
- */
+function useTranscriptionActive(): boolean {
+  return useProjectStore(s => !!s.current?.tasks.some(t => t.kind === "transcribe" &&
+    (t.state === "queued" || t.state === "claimed" || t.state === "running")));
+}
+
+/** Keep the same action in the workspace's More menu while there is work to pause, or while it is paused. */
 export function CachingMenuItem({ close }: { close(): void }) {
   const { paused, canPause } = useVideoCaching();
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
+  const transcribing = useTranscriptionActive();
+  const processing = useMediaProcessing();
 
-  async function toggle() {
-    setBusy(true);
-    setError("");
-    try {
-      await useProjectStore.getState().updateProject({ mediaPaused: !paused });
-      close();
-    } catch { setError(paused ? "Couldn’t resume. Try again." : "Couldn’t pause. Try again."); }
-    finally { setBusy(false); }
-  }
-
-  if (!canPause && !paused) return null;
-  return <MenuItem disabled={busy} onClick={() => void toggle()}>
-    <Icon name={paused ? "play" : "pause"} />{error || (paused ? "Resume caching" : "Pause caching")}
+  if (!canPause && !transcribing && !paused) return null;
+  return <MenuItem disabled={processing.busy} title={processing.description} onClick={async () => {
+    if (await processing.toggle()) close();
+  }}>
+    <Icon name={processing.icon} />{processing.error || processing.label}
   </MenuItem>;
 }

@@ -106,6 +106,7 @@ export const PLATFORM_KEY = "Mod";
 export const SHORTCUTS: Array<{ keys: string[]; what: string; where: string }> = [
   { keys: [PLATFORM_KEY, ","], what: "Open Settings", where: "Everywhere" },
   { keys: [PLATFORM_KEY, "A"], what: "Select all projects", where: "Projects" },
+  { keys: [PLATFORM_KEY, "F"], what: "Find in skill", where: "Skill Editor" },
   { keys: ["Esc"], what: "Clear the selection", where: "Projects" },
   { keys: ["/"], what: "Choose an editing skill", where: "Start of an edit message" },
   { keys: ["V"], what: "Hold to talk", where: "In a project" },
@@ -119,7 +120,8 @@ export const SHORTCUTS: Array<{ keys: string[]; what: string; where: string }> =
   { keys: ["Space"], what: "Play / pause", where: "Preview" },
   { keys: ["↑", "↓"], what: "Previous / next edit or call", where: "Edit or call card" },
   { keys: ["←", "→"], what: "Back / forward 5 seconds (1 second with Shift)", where: "Preview" },
-  { keys: ["+", "−"], what: "Zoom in / out (0 to fit)", where: "Timeline" },
+  { keys: ["−", "+"], what: "Decrease / increase playback speed", where: "Preview" },
+  { keys: ["[", "]"], what: "Zoom out / in (0 to fit)", where: "Timeline" },
   { keys: ["N"], what: "Type a message at the playhead", where: "In a project" },
   { keys: ["Esc"], what: "Close what is on screen", where: "Edit, call or suggestion" },
   { keys: ["Esc"], what: "Close a popover or leave Settings", where: "Everywhere" },

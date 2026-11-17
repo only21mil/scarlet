@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { matchAudio, syncRate } from "./audio-sync.js";
+import { fitSync, matchAudio, syncPoints, syncRate } from "./audio-sync.js";
 
 function envelope(seed: number, length = 1500) {
   return Array.from({ length }, () => {
@@ -46,5 +46,42 @@ describe("shared audio sync", () => {
     expect(matchAudio(camera, screenTrack(camera.length, [1100, 14500, 26600], 12))).toBeNull();
     const screen = screenTrack(camera.length, [1100, 14500, 26600]);
     expect(matchAudio([...camera, ...camera], screen)).toBeNull();
+  });
+});
+
+describe("sync across the whole recording", () => {
+  const reference = envelope(91, 36_000); // 12 minutes
+  it("reports a constant offset", () => {
+    const secondary = reference.slice(83).map(n => n * 0.5);
+    const fit = fitSync(syncPoints(reference, secondary));
+    expect(fit).toEqual({ kind: "constant", offset: 83 / syncRate });
+  });
+
+  it("reports a steady drift with the speed that cancels it", () => {
+    // 30 ms per minute: after ten minutes the secondary is 0.3 s behind.
+    const rate = 1 + 0.0005;
+    const secondary = Array.from({ length: 30_000 }, (_, i) => reference[Math.round(i * rate) + 83]! * 0.7);
+    const fit = fitSync(syncPoints(reference, secondary));
+    expect(fit.kind).toBe("drift");
+    if (fit.kind !== "drift") return;
+    expect(fit.offsetAtStart).toBeCloseTo(83 / syncRate, 1);
+    expect(fit.msPerMinute).toBeGreaterThan(25);
+    expect(fit.msPerMinute).toBeLessThan(35);
+    expect(fit.secondarySpeed).toBeCloseTo(1 / rate, 4);
+  });
+
+  it("reports a jump where one recording lost a moment", () => {
+    // The secondary dropped 0.8 s at its sixth minute: the offset steps from 1.66 s to 2.46 s.
+    const secondary = [...reference.slice(83, 83 + 18_000), ...reference.slice(83 + 18_000 + 40, 83 + 33_000)];
+    const fit = fitSync(syncPoints(reference, secondary));
+    expect(fit.kind).toBe("steps");
+    if (fit.kind !== "steps") return;
+    expect(fit.parts.map(p => p.offset)).toEqual([83 / syncRate, 123 / syncRate]);
+    expect(fit.parts[0]!.to).toBeLessThan(360);
+    expect(fit.parts[1]!.from).toBeGreaterThanOrEqual(360);
+  });
+
+  it("says so when nothing matches", () => {
+    expect(fitSync(syncPoints(reference, envelope(7, 30_000))).kind).toBe("unclear");
   });
 });

@@ -1,5 +1,5 @@
 import {
-  activityFilter, buildFilterGraph, contactSheet, fileInDirectory, packSheet, renderTimelineFrame,
+  activityFilter, buildFilterGraph, contactSheet, fileInDirectory, packSheet, timelinePreviewDecoder, renderTimelineFrame,
   resolveFfmpeg, runCapture, sampleTimes, sheetScale, snapRange, type GraphOptions,
 } from "@scarlet/render";
 import type { InspectionWindow } from "@scarlet/shared";
@@ -97,7 +97,8 @@ export function inspectionPictures(ctx: Ctx) {
 
       const activity = mode === "activity";
       if (activity && (end - first) * frameBytes > 64 * 1024 * 1024) throw new Error("Use the rendered preview for this frame rate.");
-      const inputs: Inputs = { pictureSource: previewPictures(mediaRoot), decoder: await pictureDecoder(ctx.settings().render.hwaccel) };
+      const accel = ctx.settings().render.hwaccel;
+      const inputs: Inputs = { pictureSource: previewPictures(mediaRoot), decoder: await pictureDecoder(accel) };
       // Each decode takes its turn in the engine's picture lane, on the GPU when there is one.
       const lane = pictureLane(ctx);
       async function read<T>(demand: AbortSignal, fn: (inputs: Inputs, signal: AbortSignal) => Promise<T>) {
@@ -132,7 +133,7 @@ export function inspectionPictures(ctx: Ctx) {
         for (let at = Math.floor(first / stride) * stride; at < end; at += stride) {
           const stop = Math.min(last, at + stride);
           collect(await blocks.get(JSON.stringify([identity, at, stop]), demand =>
-            ctx.track(read(demand, (options, active) => readBlock(project, timeline, mediaRoot, at, stop, true, height, options, active))), { signal }));
+            ctx.track(read(demand, (options, active) => readBlock(project, timeline, mediaRoot, at, stop, true, height, options, active)), project.id), { signal }));
         }
       } else if (mode === "scene") {
         const uniform = indicesFor([]);
@@ -141,7 +142,7 @@ export function inspectionPictures(ctx: Ctx) {
           const samples = uniform.filter(i => i >= w.first && i < w.end);
           const sceneHeight = Math.min(height, 180, 320 * project.settings.height / project.settings.width);
           collect(await scenes.get(id, demand => ctx.track(read(demand, (options, active) =>
-            readBlock(project, timeline, mediaRoot, w.first, w.end, false, sceneHeight, options, active, samples))), { signal }));
+            readBlock(project, timeline, mediaRoot, w.first, w.end, false, sceneHeight, options, active, samples)), project.id), { signal }));
         }
       }
       const indices = indicesFor([...changes].sort((a, b) => a - b));
@@ -150,11 +151,12 @@ export function inspectionPictures(ctx: Ctx) {
       for (const i of indices) {
         if (raw) frames.push(tiles.get(i)!);
         else frames.push(await stills.get(JSON.stringify([identity, i]), demand => ctx.track(read(demand, (options, active) =>
-          renderTimelineFrame(project, timeline, { start: i / fps, end: (i + 1) / fps }, mediaRoot, active, 320, options))), { signal }));
+          renderTimelineFrame(project, timeline, { start: i / fps, end: (i + 1) / fps }, mediaRoot, active, 320,
+            { ...options, decoder: timelinePreviewDecoder(accel, options.decoder) })), project.id), { signal }));
       }
       const sheet = await packSheet(frames, indices.map(i => i / fps), raw, signal);
       return { ...sheet, changedFrames: activity ? changes.size : undefined };
-    })()), { signal: subscriber });
+    })(), project.id), { signal: subscriber });
     if (identity !== ctx.renders.inspectionKey(project, timeline.version)) throw new Error("Timeline inputs changed during inspection.");
     return { label: "Composite", clock: "timeline", id: timeline.version, range, focus, ...analysis };
   };

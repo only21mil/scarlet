@@ -197,7 +197,7 @@ it("shows the desktop build version and telemetry disclosure under About", async
   if (__SCARLET_REVISION__) expect(about.textContent).toContain(__SCARLET_REVISION__.slice(0, 7));
   const telemetry = about.querySelector('section[aria-labelledby="telemetry-heading"]')!;
   expect(telemetry.textContent).toContain("PostHog in the US");
-  for (const text of ["keep an applied edit", "send a revision", "request Undo edit", "installation-specific code", "revision text", "change.approve", "media.import"])
+  for (const text of ["keep an applied edit", "send a revision", "installation-specific code", "revision text", "change.approve", "media.import"])
     expect(telemetry.textContent).toContain(text);
   expect(telemetry.querySelector("code")?.textContent).toBe("SCARLET_TELEMETRY_ENABLED=false");
   const check = about.querySelector("button")!;

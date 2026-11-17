@@ -32,7 +32,7 @@ export async function readPassRepeats(ctx: Ctx, task: Task, request: z.output<ty
   const project = ctx.repos.projects.get(projectId);
   if (!project) throw notFound("project");
   const tl = resolveTimeline(ctx, project, request.version);
-  const check = await ctx.track(auditDialogueAudio(ctx, project, tl, task, AbortSignal.any([signal, ctx.projectSignal(projectId)])));
+  const check = await ctx.track(auditDialogueAudio(ctx, project, tl, task, AbortSignal.any([signal, ctx.projectSignal(projectId)])), projectId);
   return ctx.db.transaction(() => {
     const owner = current();
     const root = runRoot(owner);
@@ -77,7 +77,8 @@ export async function readPassRepeats(ctx: Ctx, task: Task, request: z.output<ty
         if (review) mapRanges(review.original.version, change.restoredCuts.flatMap(i => review.cuts[i]?.removed ?? []), protectedRanges);
       }
     }
-    if (request.keep.some(k => !check.repeats.some(r => r.id === k.id))) throw badRequest("unknown_repeat", "A kept id must match a repeat heard on this version.");
+    if (request.keep.some(k => !check.repeats.some(r => r.id === k.id) && !check.silences.some(s => s.id === k.id) && !check.fragments.some(f => f.id === k.id)))
+      throw badRequest("unknown_repeat", "A kept id must match a repeat, a silence or a divided sentence found on this version.");
     if (request.keep.length) {
       const fresh = request.keep.filter(k => !kept.has(k.id));
       if (fresh.length) appendTaskEvent(ctx, owner, { type: "log", text: "", data: { kind: "repeat_kept", version: tl.version,
@@ -97,21 +98,33 @@ export async function readPassRepeats(ctx: Ctx, task: Task, request: z.output<ty
       return [{ ...r, occurrences: { first: first ? undefined : r.occurrences.first, second: second ? undefined : r.occurrences.second },
         ...(first || second ? { protected: first ? "first" : "second" } : {}) }];
     });
+    // A wordless stretch the pass kept on purpose, or one a cut staged for review takes out, is settled.
+    const within = (s: TimeRange, ranges: TimeRange[]) => ranges.some(p => p.start <= s.start + frame && p.end >= s.end - frame);
+    const silences = check.silences.filter(s => !kept.has(s.id) && !within(s, protectedRanges) &&
+      !stagedRanges.some(p => p.start < s.end - frame && p.end > s.start + frame));
     // A count and a range per recording, however long the pass: timeline_join_audit reads the range a page at a time.
     // One inside a range staged for review isn't played yet, as below.
     const unheardJoins = check.unheardJoins.flatMap(({ at, ...u }) => {
       const times = [...at].filter(t => !stagedRanges.some(r => r.start - frame <= t && t <= r.end + frame));
       return times.length ? [{ ...u, joins: times.length, from: Math.min(...times), to: Math.max(...times) }] : [];
     });
+    // A join that divides a sentence is settled once the pass has read it and kept it with its reason. One a cut
+    // staged for review makes isn't played yet.
+    const fragments = check.fragments.filter(f => !kept.has(f.id) && !stagedRanges.some(r => r.start - frame <= f.at && f.at <= r.end + frame));
     const unavailable = check.unavailable.map(u => `Couldn’t check ${u.mediaId}: ${u.reason}`);
     const last = owner.repeatAudit;
-    const returns = last?.version === tl.version && (last.remaining === undefined || repeats.length >= last.remaining) ? last.returns : 0;
+    const remaining = repeats.length + silences.length + fragments.length;
+    const returns = last?.version === tl.version && (last.remaining === undefined || remaining >= last.remaining) ? last.returns : 0;
     // A join inside a range staged for review isn't played yet; the review reads it.
     const joins = check.joins.filter(j => !stagedRanges.some(r => r.start - frame <= j.at && j.at <= r.end + frame));
-    const noFindings = !check.repeats.length && !joins.length && !unheardJoins.length && !unavailable.length;
-    saveTask(ctx, { ...owner, state: "running", repeatAudit: { version: tl.version, remaining: repeats.length, unavailable, returns, noFindings } });
-    return { version: tl.version, ...(named !== tl.version && { readInsteadOf: named }), heard: check.repeats.length, staged: staged.length, remaining: repeats.length,
-      repeats: repeats.slice(request.offset, request.offset + 25), ...(request.offset + 25 < repeats.length && { nextOffset: request.offset + 25 }),
+    const noFindings = !check.repeats.length && !check.silences.length && !check.fragments.length && !joins.length && !unheardJoins.length && !unavailable.length;
+    saveTask(ctx, { ...owner, state: "running", repeatAudit: { version: tl.version, remaining, unavailable, returns, noFindings } });
+    return { version: tl.version, ...(named !== tl.version && { readInsteadOf: named }), heard: check.repeats.length, staged: staged.length, remaining,
+      // One offset pages the repeats and the divided sentences together: a pass asked for the next pages of both at once.
+      repeats: repeats.slice(request.offset, request.offset + 25),
+      ...(request.offset + 25 < Math.max(repeats.length, fragments.length) && { nextOffset: request.offset + 25 }),
+      ...(silences.length && { silences: silences.slice(0, 25) }),
+      ...(fragments.length && { fragments: fragments.slice(request.offset, request.offset + 25) }),
       ...(check.unavailable.length && { unavailable: check.unavailable }),
       ...(check.joins.length && { joins }), ...(unheardJoins.length && { unheardJoins }) };
   }, "immediate")();

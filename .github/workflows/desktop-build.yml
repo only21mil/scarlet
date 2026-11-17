@@ -19,6 +19,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  VULKAN_SDK_VERSION: 1.4.363.1
 
 jobs:
   build:
@@ -112,9 +113,20 @@ jobs:
         if: runner.os == 'Windows'
         uses: jakoch/install-vulkan-sdk-action@7fe84289ddbf750f7eff9f8e4588e600e1dd06c8 # v1.8.1
         with:
-          vulkan_version: 1.4.363.1
+          vulkan_version: ${{ env.VULKAN_SDK_VERSION }}
           install_runtime: true
           cache: true
+
+      # Both runtimes are built from pinned sources, and each script keeps a build only if its receipt names the
+      # script's current recipe. So a build restored here is used as is, and a changed recipe builds again.
+      - name: Restore whisper-cli and the GPU speaker runtime built by this recipe
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            apps/desktop/src-tauri/binaries/whisper-cli-${{ matrix.triple }}*
+            apps/desktop/src-tauri/binaries/whisper-gpu
+            apps/desktop/src-tauri/binaries/speaker-gpu
+          key: native-runtimes-${{ matrix.triple }}-vulkan-${{ env.VULKAN_SDK_VERSION }}-${{ hashFiles('apps/desktop/scripts/build-whisper.mjs', 'apps/desktop/scripts/build-speaker-gpu.mjs') }}
 
       - name: Build bundled whisper.cpp runtime
         run: node apps/desktop/scripts/build-whisper.mjs

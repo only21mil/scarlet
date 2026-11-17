@@ -62,7 +62,7 @@ export interface ReplayResult {
   /** A disputed quote or repeated join goes back to the model before anything is saved. */
   outcome: "ready" | "preserved" | "needsRevision" | "rejected";
   error?: string;
-  disputedEdges?: Array<Range & { reason: string }>;
+  disputedEdges?: Array<Partial<Range> & { reason: string }>;
   /** Share of submitted ranges whose replayed tier and edges (±1 ms) match the run, per scan-window set tried. */
   agreement: Record<string, number>;
   /** Planner changes, as "asked→outcome" per submitted range, plus how many moved an edge. */
@@ -335,7 +335,7 @@ function replayMarkdown(r: ReplayResult, diff?: ReturnType<typeof compareReplays
   ];
   if (r.disputedEdges?.length) {
     lines.push("", "## Disputed edges", "");
-    for (const d of r.disputedEdges.slice(0, 30)) lines.push(`- ${d.start.toFixed(2)}–${d.end.toFixed(2)}: ${d.reason}`);
+    for (const d of r.disputedEdges.slice(0, 30)) lines.push(d.start === undefined || d.end === undefined ? `- ${d.reason}` : `- ${d.start.toFixed(2)}–${d.end.toFixed(2)}: ${d.reason}`);
   }
   if (diff) {
     lines.push("", `## Against ${baseline}`, "", diff.length ? `${diff.length} submitted ranges changed:` : "No submitted range changed.");

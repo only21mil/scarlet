@@ -15,8 +15,14 @@ import type { ProbeResult } from "./probe.js";
 import { hardwareEncoderFailure, withRenderEncoder, type VideoEncoder, type HwAccel, type RenderQuality } from "./encoder.js";
 export { bestEncoder, encoderArgs, resolveVideoEncoder, type HwAccel, type RenderQuality } from "./encoder.js";
 
+/** High-core Apple silicon decodes AVC previews and single-frame seeks faster in software. */
+export function timelinePreviewDecoder(accel: HwAccel | undefined, decoder: GraphOptions["decoder"]): GraphOptions["decoder"] {
+  return (accel ?? "auto") === "auto" && decoder === "videotoolbox" && threadedAvcPreview ? "videotoolbox-hevc" : decoder;
+}
+
 export interface RenderOptions extends FontOptions {
   pictureSource?: GraphOptions["pictureSource"];
+  transitions?: GraphOptions["transitions"];
   pictureOnly?: boolean;
   /** Absolute directory that relative media paths resolve against. */
   mediaRoot: string;
@@ -123,18 +129,18 @@ export async function renderRange(
   const exporting = quality === "delivery" || opts.exportHeight !== undefined;
   // On a high-core Apple Silicon Mac, threaded AVC decoding also wins on verified
   // full-size delivery. Both routes feed the same hardware encoder.
-  const threadedAvc = encoder === "h264_videotoolbox" && (opts.hwaccel ?? "auto") === "auto" && threadedAvcPreview;
+  const appleDecoder = encoder === "h264_videotoolbox" ? timelinePreviewDecoder(opts.hwaccel, "videotoolbox") : undefined;
+  const threadedAvc = appleDecoder === "videotoolbox-hevc";
   const device = exporting && opts.pictureOnly && !opts.softwareDecode && !threadedAvc && !opts.splits?.length && !opts.extraArgs?.length
     ? directDevice(encoder) : undefined;
   let decoder: GraphOptions["decoder"];
   // Keep delivery effects and resizing on the reference compositor. An unchanged
   // full-size shot can pass the GPU surfaces straight through, including on NVIDIA.
   if (encoder === "h264_nvenc" && !exporting) decoder = "cuda";
-  if (encoder === "h264_videotoolbox") {
-    decoder = threadedAvc ? "videotoolbox-hevc" : "videotoolbox";
-  }
+  if (appleDecoder) decoder = appleDecoder;
   const graph = await buildFilterGraph(project, timeline, snapped, {
     directPicture: !!device,
+    transitions: opts.transitions,
     indexedInputs: opts.indexedInputs ?? true,
     signal: opts.signal,
     pictureOnly: opts.pictureOnly,

@@ -28,8 +28,8 @@ it("names a few edits that aren't cuts, and counts many by kind", () => {
 
 it("says what Scarlet said about the one edit a request made", () => {
   expect(say([{ label: "Camera full-frame for the intro", summary: "Made the host camera fill the frame for the intro lines." }])).toBe("Made the host camera fill the frame for the intro lines.");
-  // An edit saved before Scarlet wrote summaries reads as its title, then its reason to look.
-  expect(say([{ label: "Trim the pause", check: "The join lands on a breath" }])).toBe("Trim the pause. The join lands on a breath.");
+  const flagged = { label: "Trim the pause", check: "The join lands on a breath", reason: "The gap interrupts the answer." };
+  expect(say([flagged])).toBe("Trim the pause.");
   expect(say([cut(0, 4.2)])).toBe("A stumble.");
 });
 
@@ -58,4 +58,21 @@ it("counts transitions beside the other edits a request made", () => {
   const zoom = (n: number) => ({ label: `Zoom ${n}`, kind: "zoom" as const });
   const swipe = (n: number) => ({ label: `Swipe ${n}`, kind: "transition" as const });
   expect(say([zoom(1), zoom(2), zoom(3), zoom(4), swipe(1), swipe(2), swipe(3), swipe(4)])).toBe("Made 4 zooms and 4 transitions.");
+});
+
+it("counts the spots Scarlet marked for the editor on their own, since they changed nothing in the video", () => {
+  const spot = (label: string) => ({ label, kind: "other" as const, marker: true as const });
+  expect(say([cut(0, 60), cut(100, 171), { label: "Punch in", kind: "zoom" }, spot("Fall Guys comparison footage"), spot("Boat comparison footage")]))
+    .toBe("Took out 2:11 in 2 cuts, and made 1 zoom, and marked 2 spots for you.");
+  expect(say([spot("Fall Guys comparison footage"), spot("Boat comparison footage")])).toBe("Marked 2 spots for you.");
+  expect(say([{ label: "Punch in", kind: "zoom" }, spot("Boat comparison footage")])).toBe("Made 1 edit: Punch in, and marked 1 spot for you.");
+  expect(say([{ ...spot("Boat comparison footage"), summary: "Marked where the boat comparison belongs." }])).toBe("Marked where the boat comparison belongs.");
+});
+
+it("counts a marker listed in several places as the one edit it is", () => {
+  const spot = (label: string) => ({ label, kind: "other" as const, marker: true as const });
+  const boat = spot("Boat comparison footage");
+  expect(say([cut(0, 60), boat, boat])).toBe("Took out 1:00 in 1 cut, and marked 1 spot for you.");
+  expect(say([boat, boat])).toBe("Boat comparison footage, in 2 places.");
+  expect(say([boat, boat, spot("Fall Guys comparison footage")])).toBe("Marked 2 spots for you.");
 });

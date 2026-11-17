@@ -10,7 +10,7 @@ import { statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { clipRange, mergeRanges, sha256, planPlaybackSegments, planSegments, snapToFrame, SOURCE_PREVIEW_SECONDS, stableStringify, timelineDuration } from "@scarlet/timeline";
-import type { Clip, MediaAsset, Project, Timeline, TimeRange, Track } from "@scarlet/timeline";
+import type { Clip, MediaAsset, Project, Timeline, TimeRange, Track, TransitionPlan } from "@scarlet/timeline";
 import { buildFilterGraph, clipPlacement, fillsFrames, holdsFrame, holdsSample, proxyHeightForClip, videoClockStart } from "./graph.js";
 import { isImagePath } from "./probe.js";
 import { motionsIn, planTransitions, type TransitionMotion } from "./transitions.js";
@@ -50,6 +50,7 @@ function segmentTimelines(timeline: Timeline, ranges: TimeRange[]): Timeline[] {
 export const RENDER_REVISION = 5;
 export const PROXY_CLOCK_REVISION = 3;
 export const DELIVERY_AUDIO_REVISION = 4;
+export const TRANSITION_RENDER_REVISION = 1;
 
 /** Old cache entries did not record whether the graph selected a proxy. Only
  * version windows where it could have selected one with a different origin. */
@@ -118,7 +119,7 @@ function segmentClip(clip: Clip, range: TimeRange, media: Map<string, MediaAsset
   const placement = { start: fnum(p.pos), end: fnum(p.pos + p.vis), duration: fnum(p.vis) };
   if (rest.kind !== "media") {
     const { timelineOut: _out, ...visual } = rest;
-    return { ...visual, placement };
+    return { ...visual, placement, motion };
   }
   // The transition into a clip is drawn from `motion`, where it shows; elsewhere it changes nothing.
   delete (rest as Partial<typeof rest> & { transitionIn?: unknown }).transitionIn;
@@ -150,19 +151,26 @@ export function segmentKey(
   range: TimeRange,
   quality: RenderQuality | SegmentKeyOptions,
   media = new Map(project.media.map(asset => [asset.id, asset])),
+  legacyTransitions = false,
 ): string {
-  const o: SegmentKeyOptions = typeof quality === "string" ? { quality } : quality;
   // As the graph draws it: transitions add layers around their joins and move the clips either side.
   const transitions = planTransitions(timeline, media, project.settings.fps);
-  const tracks = transitions.timeline.tracks
+  return plannedSegmentKey(project, transitions.timeline, range, typeof quality === "string" ? { quality } : quality, media, transitions, legacyTransitions);
+}
+
+function plannedSegmentKey(project: Project, timeline: Timeline, range: TimeRange, o: SegmentKeyOptions,
+  media: Map<string, MediaAsset>, transitions: TransitionPlan, legacyTransitions = false): string {
+  const tracks = timeline.tracks
     .map((t) => {
       const clips = t.clips.filter(c => c.enabled !== false)
-        .map(c => segmentClip(c, range, media, project.settings, t, o, transitions.motions.get(c.id))).filter(c => c !== undefined);
+        .map(c => segmentClip(c, range, media, project.settings, t, o,
+          legacyTransitions && c.kind !== "media" ? undefined : transitions.motions.get(c.id))).filter(c => c !== undefined);
       return { kind: t.kind, muted: t.muted, hidden: t.hidden, captionStyle: t.captionStyle, clips };
     })
     .filter((t) => t.clips.length > 0);
   return createHash("sha256").update(stableStringify({
     v: RENDER_REVISION,
+    transitions: !legacyTransitions && tracks.some(track => track.clips.some(clip => clip.motion)) ? TRANSITION_RENDER_REVISION : undefined,
     proxyClock: o.allowProxy && o.quality === "preview" && !o.pictureOnly && usesRevisedProxyClock(project, timeline, range, o.height, media) ? PROXY_CLOCK_REVISION : undefined,
     pictureOnly: o.pictureOnly || undefined,
     allowProxy: o.allowProxy || undefined,
@@ -301,8 +309,9 @@ export function lutFileStamps(timeline: Timeline, mediaRoot: string) {
   });
 }
 
-function segmentInfo(project: Project, timeline: Timeline, range: TimeRange, cacheDir: string, format: SegmentKeyOptions, mediaRoot: string, media?: Map<string, MediaAsset>): SegmentInfo {
-  let key = segmentKey(project, timeline, range, format, media);
+function segmentInfo(project: Project, timeline: Timeline, range: TimeRange, cacheDir: string, format: SegmentKeyOptions,
+  mediaRoot: string, media: Map<string, MediaAsset>, transitions: TransitionPlan): SegmentInfo {
+  let key = plannedSegmentKey(project, timeline, range, format, media, transitions);
   const luts = lutFileStamps(timeline, mediaRoot);
   if (luts.length) key = sha256(stableStringify([key, luts]));
   const file = path.join(cacheDir, `${key}.mp4`);
@@ -559,10 +568,12 @@ export async function renderPlaybackSegment(project: Project, timeline: Timeline
   const videoEncoder = opts.videoEncoder;
   const encoder = videoEncoder.cacheKey;
   await fs.mkdir(cacheDir, { recursive: true });
-  const [part] = segmentTimelines(timeline, [range]);
-  const seg = segmentInfo(project, part!, range, cacheDir, { quality, height: size.height, encoder, allowProxy: !!opts.pictureSource }, opts.mediaRoot);
+  const media = new Map(project.media.map(asset => [asset.id, asset]));
+  const transitions = planTransitions(timeline, media, project.settings.fps);
+  const [part] = segmentTimelines(transitions.timeline, [range]);
+  const seg = segmentInfo(project, part!, range, cacheDir, { quality, height: size.height, encoder, allowProxy: !!opts.pictureSource }, opts.mediaRoot, media, transitions);
   seg.cached = await fileHasContent(seg.file);
-  warnings.push(...await fillSegment(project, part!, seg, { ...opts, videoEncoder, quality, pictureOnly: false }));
+  warnings.push(...await fillSegment(project, part!, seg, { ...opts, transitions, videoEncoder, quality, pictureOnly: false }));
   // Decode AAC with its MP4 priming edit intact. FLAC has no encoder delay, so
   // appending the next fragment neither drops nor repeats audio at the join.
   const rate = project.settings.sampleRate;
@@ -600,10 +611,11 @@ export async function renderFullCached(
   const encoder = opts.videoEncoder.name;
   await fs.mkdir(cacheDir, { recursive: true });
 
-  const parts = segmentTimelines(picture, ranges);
   const format = { quality, height: size.height, encoder: opts.videoEncoder.cacheKey, pictureOnly, allowProxy: !pictureOnly && !!opts.pictureSource };
   const media = new Map(project.media.map(asset => [asset.id, asset]));
-  const segments = ranges.map((range, i) => segmentInfo(project, parts[i]!, range, cacheDir, format, opts.mediaRoot, media));
+  const transitions = planTransitions(picture, media, project.settings.fps);
+  const parts = segmentTimelines(transitions.timeline, ranges);
+  const segments = ranges.map((range, i) => segmentInfo(project, parts[i]!, range, cacheDir, format, opts.mediaRoot, media, transitions));
   for (let i = 0; i < segments.length; i += 32) {
     await Promise.all(segments.slice(i, i + 32).map(async seg => { seg.cached = await fileHasContent(seg.file); }));
   }
@@ -661,9 +673,9 @@ export async function renderFullCached(
   };
   const encodePictures = (signal: AbortSignal) => renderBatch(runs.length, concurrency, signal, async (index, workerSignal) => {
     const run = runs[index]!;
-    const partOpts = { ...opts, signal: workerSignal, probes, quality, pictureOnly };
+    const partOpts = { ...opts, transitions, signal: workerSignal, probes, quality, pictureOnly };
     if (run.length > 1) {
-      const messages = await writeRun(project, picture, run.map(([seg]) => seg), partOpts).catch((error: unknown) => {
+      const messages = await writeRun(project, transitions.timeline, run.map(([seg]) => seg), partOpts).catch((error: unknown) => {
         // A driver can refuse several encoder sessions in one process. Encode the parts one at a time.
         if (workerSignal.aborted || !(error instanceof FfmpegError)) throw error;
         warn(`${run.length} sections could not be encoded in one pass (${failureReason(error)}); encoded them one at a time.`);

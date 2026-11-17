@@ -48,6 +48,61 @@ it("allows permanently deleting a trashed project with an unclaimed edit", async
   expect((await api("POST", "/storage/cleanup", { kind: "trash", projects: [{ id, deletedAt: project.deletedAt }] })).status).toBe(200);
   expect(workspace.ctx.repos.tasks.get(task.id)).toBeNull();
 });
+it("waits for work on a trashed project while allowing work on another project to continue", async () => {
+  const ctx = workspace.ctx;
+  const other = ctx.repos.projects.insert(createProject("Still editing")).id;
+  let finishSelected!: () => void;
+  let finishOther!: () => void;
+  const selectedWork = ctx.track(new Promise<void>(resolve => { finishSelected = resolve; }), id);
+  const otherWork = ctx.track(new Promise<void>(resolve => { finishOther = resolve; }), other);
+  try {
+    expect((await api("DELETE", `/projects/${id}`)).status).toBe(200);
+    const { deletedAt } = ctx.repos.projects.listDeleted()[0]!;
+    const emptyTrash = () => api("POST", "/storage/cleanup", { kind: "trash", projects: [{ id, deletedAt }] });
+    const blocked = await emptyTrash();
+    expect(blocked.status).toBe(409);
+    expect(await blocked.json()).toMatchObject({ error: { code: "storage_busy" } });
+    expect(purgeTrash(ctx, Date.parse(deletedAt) + 31 * 86_400_000)).toBe(0);
+    expect(existsSync(ctx.paths.project(id))).toBe(true);
+
+    finishSelected();
+    await selectedWork;
+    const { projects } = await (await api("GET", "/storage")).json();
+    expect(projects).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id, busy: false }),
+      expect.objectContaining({ id: other, busy: true }),
+    ]));
+    expect((await emptyTrash()).status).toBe(200);
+    expect(existsSync(ctx.paths.project(id))).toBe(false);
+    expect(ctx.pending.has(otherWork)).toBe(true);
+  } finally {
+    finishSelected();
+    finishOther();
+  }
+});
+it("preserves the whole Trash selection while a source cache worker is active", async () => {
+  const ctx = workspace.ctx;
+  const other = ctx.repos.projects.insert(createProject("Caching a source")).id;
+  ctx.paths.ensureProject(other);
+  ctx.db.prepare("INSERT INTO media (id,project_id,status,json,created_at) VALUES (?,?,?,?,?)")
+    .run("source", other, "ready", JSON.stringify({ path: "source.mov" }), "now");
+  ctx.db.prepare("INSERT INTO source_cache_requests (media_id, worker_pid) VALUES (?, ?)").run("source", process.pid);
+  for (const projectId of [id, other]) ctx.repos.projects.softDelete(projectId);
+  const trashed = ctx.repos.projects.listDeleted();
+  const projects = [id, other].map(projectId => ({ id: projectId, deletedAt: trashed.find(project => project.id === projectId)!.deletedAt }));
+  const emptyTrash = () => api("POST", "/storage/cleanup", { kind: "trash", projects });
+
+  const blocked = await emptyTrash();
+  expect(blocked.status).toBe(409);
+  expect(await blocked.json()).toMatchObject({ error: { code: "storage_busy" } });
+  expect(ctx.repos.projects.listDeleted()).toEqual(trashed);
+  expect(projects.every(project => existsSync(ctx.paths.project(project.id)))).toBe(true);
+
+  ctx.db.prepare("UPDATE source_cache_requests SET worker_pid = NULL WHERE media_id = ?").run("source");
+  expect((await emptyTrash()).status).toBe(200);
+  expect(ctx.repos.projects.listDeleted()).toEqual([]);
+  expect(projects.some(project => existsSync(ctx.paths.project(project.id)))).toBe(false);
+});
 it("says when a trashed project goes for good on the storage list, as the Trash's own list does", async () => {
   await api("DELETE", `/projects/${id}`);
   const { projects: [listed] } = await (await api("GET", "/trash")).json();

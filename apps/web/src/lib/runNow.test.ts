@@ -14,6 +14,8 @@ it("says the latest call on the project as the work it is, with where in the rec
   expect(said(tool("media_frame", { mediaId: "screen", t: 152.9 }))).toBe("Looking at the picture at 2:32");
   expect(said(tool("frame_contact_sheet_batch", { windows: [{}, {}, {}] }))).toBe("Looking at the picture in 3 passages");
   expect(said(tool("frame_contact_sheet_batch", { batchId: "b", cursor: 2 }))).toBe("Looking at the picture");
+  expect(said(tool("timeline_framing", { mediaId: "screen", framings: [{}] }))).toBe("Framing the picture");
+  expect(said(tool("timeline_framing", { mediaId: "screen", framings: [{}], preview: true }))).toBe("Trying a framing");
   expect(said(tool("waveform_get", { mediaId: "cam", start: 62, end: 70 }))).toBe("Looking at the waveform 1:02–1:10");
   expect(said(tool("dialogue_check_join", { cuts: [{}] }))).toBe("Checking how the join sounds");
   expect(said(tool("dialogue_check_join", { cuts: [{}, {}, {}] }))).toBe("Checking how 3 joins sound");

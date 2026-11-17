@@ -10,7 +10,7 @@ import { basename, dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import WebSocket from "ws";
 import type { AgentAvailability, AgentId, AgentUsage, Task, TaskEvent } from "@scarlet/shared";
-import { ScarletClient } from "@scarlet/shared";
+import { ScarletClient, TaskState } from "@scarlet/shared";
 import { privateDirectory } from "./private-files.js";
 import type { AgentConfig } from "./config.js";
 import { CLI_AGENTS, detect as detectAgents, runnerEnv } from "./detect.js";
@@ -104,8 +104,11 @@ export class AgentHost {
     this.stopped = false;
     // An old folder's Claude sessions go with it, unless Claude Code was told to keep its files somewhere other than the home.
     const home = (this.opts.env ?? process.env).CLAUDE_CONFIG_DIR ? undefined : homedir();
-    await pruneTaskDirs(this.opts.workRoot, undefined, home).catch((err) => this.log(`could not prune old task folders: ${errMsg(err)}`));
-    this.agents = await (this.opts.detect ?? (() => detectAgents({ models: this.config.models, log: this.log })))();
+    const [agents] = await Promise.all([
+      (this.opts.detect ?? (() => detectAgents({ models: this.config.models, log: this.log })))(),
+      pruneTaskDirs(this.opts.workRoot, undefined, home).catch((err) => this.log(`could not prune old task folders: ${errMsg(err)}`)),
+    ]);
+    this.agents = agents;
     await this.register();
     this.heartbeatTimer = setInterval(() => void this.heartbeat(), this.opts.heartbeatMs ?? 30_000);
     if (this.opts.ws !== false) this.connectWs();
@@ -204,7 +207,7 @@ export class AgentHost {
   /** Recover cancellations missed before subscribing or while disconnected. */
   private async checkCancellations(): Promise<void> {
     await Promise.allSettled([...this.running.values()].map(async (run) => {
-      const { task } = await this.client.task(run.task.id);
+      const { task } = await this.client.task(run.task.id, "none");
       if (task.state === "cancelled") run.controller.abort("server-cancelled");
     }));
   }
@@ -294,7 +297,8 @@ export class AgentHost {
 
   async runTask(task: Task, signal: AbortSignal): Promise<void> {
     this.log(`task ${task.id} (${task.kind}, ${task.agent}${task.model ? `/${task.model}` : ""})`);
-    const started = Date.now();
+    const started = performance.now();
+    const identity = `task=${task.id} attempt=${task.startedAt ?? "unknown"}`;
     // One request at a time, so the engine gets the events in the order the CLI wrote them.
     let posting: Promise<void> = Promise.resolve();
     const post = (ev: TaskEvent): Promise<void> => {
@@ -332,22 +336,29 @@ export class AgentHost {
         // the completion of an attempt it has already ended.
         landed = false;
         // The engine answers with the changes it holds for the task, for the line below.
-        let changeIds: string[] = [];
+        let savedState: TaskState | undefined;
+        let superseded = false;
+        let changes = 0;
         for (let attempt = 0; attempt < 3 && !landed; attempt++) {
           // One try while the host stops: stopping doesn't wait on an engine that may already be gone. No further
           // try either once the engine cancels the task or hands it out again: it has ended this attempt itself.
           if (attempt && signal.aborted) break;
           try {
-            changeIds = (await this.client.completeTask(task.id, body))?.task?.changeIds ?? [];
+            const saved = (await this.client.completeTask(task.id, body))?.task;
+            const parsed = TaskState.safeParse(saved?.state);
+            if (parsed.success) savedState = parsed.data;
+            superseded = !!task.startedAt && !!saved?.startedAt && saved.startedAt !== task.startedAt;
+            changes = saved?.changeIds?.length ?? 0;
             landed = true;
           } catch (err) {
             this.log(`complete failed for task ${task.id}: ${errMsg(err)}`);
             if (attempt < 2) await delay(250 * (attempt + 1), undefined, { signal }).catch(() => undefined);
           }
         }
-        const changes = changeIds.length ? ` (${changeIds.length} changes: ${changeIds.join(", ")})` : "";
-        const reason = error ?? (state === "failed" ? "no reason given" : undefined);
-        this.log(`task ${task.id} ${state} after ${humanDuration(Date.now() - started)}${reason ? `: ${reason}` : ""}${changes}`);
+        const outcome = !landed ? "undelivered" : superseded ? "superseded" : !savedState ? "unconfirmed" : savedState === state ? "accepted" : "changed";
+        // A failed run's reason stays in the local log: the engine may never have received it.
+        const reason = state === "failed" ? ` reason=${JSON.stringify((error ?? "no reason given").slice(0, 300))}` : "";
+        this.log(`[host] completion ${identity} requested=${state} state=${savedState ?? "unknown"} outcome=${outcome} elapsedMs=${Math.round(performance.now() - started)} changes=${changes}${reason}`);
       }
       if (cwd) {
         // An attempt the editor stopped can still be winding down when the attempt that resumes it is at work in
@@ -386,8 +397,34 @@ export class AgentHost {
     const runner = this.opts.runner ?? defaultRunAgent;
     const timeoutMs = this.runTimeoutMs;
     const stallMs = this.opts.stallMs ?? (this.config.stallMinutes ?? DEFAULT_STALL_MS / 60_000) * 60_000;
+    // The engine replaces repeated usage reports for the same claim. Serialize writes and wait for the
+    // in-flight report before persisting the final total so slower requests cannot overwrite it.
+    const startedAt = task.startedAt;
+    let usageClosed = false;
+    let pendingUsage: AgentUsage | undefined;
+    let postedUsage: Promise<void> | undefined;
+    let nextUsageAt = 0;
+    let usageTimer: NodeJS.Timeout | undefined;
+    const flushUsage = () => {
+      clearTimeout(usageTimer);
+      if (usageClosed || signal.aborted || !pendingUsage || postedUsage) return;
+      const wait = nextUsageAt - Date.now();
+      if (wait > 0) {
+        usageTimer = setTimeout(flushUsage, wait).unref();
+        return;
+      }
+      const body = { ...pendingUsage, startedAt };
+      pendingUsage = undefined;
+      postedUsage = this.client.withResource("tasks", task.id, path => this.client.request<void>(
+        "POST", path + "/usage", body, { signal: AbortSignal.timeout(5000) },
+      )).catch(err => this.log(`task ${task.id}: live usage report failed: ${errMsg(err)}`)).finally(() => {
+        postedUsage = undefined;
+        nextUsageAt = Date.now() + 2000;
+        flushUsage();
+      });
+    };
     let questionSeen: string | undefined;
-    const run = (p: Prepared) => runner({
+    const run = (p: Prepared, priorUsage?: AgentUsage) => runner({
       agent: task.agent,
       model: task.model ?? this.config.models?.[task.agent],
       effort: task.effort,
@@ -403,6 +440,12 @@ export class AgentHost {
       timeoutMs,
       stallMs,
       env: runnerEnv(task.agent, this.agents, this.opts.env ?? process.env),
+      onUsage: snapshot => {
+        if (!startedAt || usageClosed) return;
+        pendingUsage = addUsage(priorUsage, snapshot);
+        flushUsage();
+      },
+      onCodexFallback: reason => this.log(`[host] codex-fallback ${identity} reason=${reason}`),
       onEvent: (ev: RunnerEvent) => {
         if (ev.type === "question") {
           questionSeen = ev.text;
@@ -415,6 +458,9 @@ export class AgentHost {
 
     // Record tokens for every outcome, including a cancel or a pause for a question.
     const recordUsage = async (usage: AgentUsage | undefined) => {
+      usageClosed = true;
+      clearTimeout(usageTimer);
+      await postedUsage;
       if (usage) await this.client.recordTaskUsage(task.id, { ...usage, startedAt: task.startedAt }).catch(err => this.log(`usage report failed: ${errMsg(err)}`));
     };
     let result = await run(prepared);
@@ -424,7 +470,7 @@ export class AgentHost {
       // The CLI no longer has the session. Start over with the answers in the prompt.
       this.log(`task ${task.id}: could not resume the CLI session (${result.error ?? "unknown"}); starting a fresh run`);
       try {
-        result = await run(await this.prepare(task, true));
+        result = await run(await this.prepare(task, true), usage);
       } catch (err) {
         await flushEvents();
         await recordUsage(usage);
@@ -443,13 +489,15 @@ export class AgentHost {
       // The CLI can stop before MCP posts, or lose the reply after the engine commits.
       for (let attempt = 0; attempt < 3 && !signal.aborted; attempt++) {
         try {
-          await this.client.postTaskQuestion(task.id, task.startedAt, question, signal, { sessionId: result.sessionId ?? null });
+          const { waiting } = await this.client.postTaskQuestion(task.id, task.startedAt, question, signal, { sessionId: result.sessionId ?? null });
+          this.log(`[host] question ${identity} outcome=${waiting ? "waiting" : "not_waiting"}`);
           return;
         } catch (err) {
           if (signal.aborted) break;
           if (attempt === 2) {
             const error = `Could not deliver the editor question: ${errMsg(err)}`;
-            this.log(error);
+            this.log(`[host] question ${identity} outcome=undelivered`);
+            this.log(`task ${task.id}: ${error}`);
             return complete("failed", undefined, error);
           }
           await delay(250 * (attempt + 1), undefined, { signal }).catch(() => undefined);
@@ -472,7 +520,7 @@ export class AgentHost {
 
   /** Prepare the task folder, fetch the engine's prompt and build the MCP spec. `fresh` skips resuming the CLI session. */
   async prepare(task: Task, fresh = false): Promise<Prepared> {
-    const { task: current } = await this.client.task(task.id);
+    const { task: current } = await this.client.task(task.id, "none");
     if (current.state === "cancelled") {
       this.running.get(task.id)?.controller.abort("server-cancelled");
       throw new Error("Task cancelled");

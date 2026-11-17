@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { makeTimeMap, timelineDuration, type Note, type Timeline } from "@scarlet/timeline";
-import { api } from "./client";
+import { readTimeline } from "./timelineCache";
 
 /** Notes keep their original version and time. Only place them where the footage survives. */
 export function useNotePositions(timeline: Timeline | null | undefined, notes: Note[] | undefined, fps: number) {
@@ -18,8 +18,7 @@ export function useNotePositions(timeline: Timeline | null | undefined, notes: N
       for (const version of remaining) {
         if (!active) return;
         try {
-          const result = await api.timeline(timeline!.projectId, version);
-          versions.set(version, result.timeline);
+          versions.set(version, await readTimeline(timeline!.projectId, version));
         } catch { /* Let the user retry unavailable versions. */ }
       }
     }

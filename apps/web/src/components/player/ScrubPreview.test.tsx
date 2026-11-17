@@ -264,18 +264,75 @@ it("keeps the decoder across zooms and releases it when the preview file changes
   expect(movie.hasAttribute("src")).toBe(false);
 });
 
-it.each(["error", "timeout"])("uses the engine at the current position when the movie fails (%s)", async failure => {
+it("uses the engine at the current position when the movie fails, and opens the file again a little later", async () => {
   const bar = await show(100, 0, "/unavailable.mp4");
   const movie = bar.querySelector("video")!;
   await pointer(bar, "pointermove", 150);
   await pointer(bar, "pointermove", 350);
-  if (failure === "error") movie.dispatchEvent(new Event("error"));
-  else vi.advanceTimersByTime(500);
+  movie.dispatchEvent(new Event("error"));
   expect(movie.hasAttribute("src")).toBe(false);
   expect(asked.map(a => a.url.searchParams.get("t"))).toEqual(["35"]);
   await asked[0]!.answer();
   await finishDecode();
   expect(picture().hidden).toBe(false);
+  // The decoder is let go, and opened again after a pause.
+  await act(async () => { vi.advanceTimersByTime(2_000); });
+  expect(movie.getAttribute("src")).toBe("/unavailable.mp4");
+  // Failing again, it waits twice as long.
+  movie.dispatchEvent(new Event("error"));
+  expect(movie.hasAttribute("src")).toBe(false);
+  await act(async () => { vi.advanceTimersByTime(2_000); });
+  expect(movie.hasAttribute("src")).toBe(false);
+  await act(async () => { vi.advanceTimersByTime(2_000); });
+  expect(movie.getAttribute("src")).toBe("/unavailable.mp4");
+});
+
+it("gives a slow seek's hover the engine's stills and keeps the decoder for the next hover", async () => {
+  const bar = await show(100, 0, "/working-cut.mp4");
+  const movie = bar.querySelector("video")!;
+  let ready = 0, at = 0, seeking = false;
+  const seek = vi.fn((t: number) => { at = t; seeking = true; });
+  Object.defineProperties(movie, {
+    readyState: { get: () => ready }, seeking: { get: () => seeking },
+    duration: { value: 100 }, videoWidth: { value: 960 }, videoHeight: { value: 540 }, currentTime: { get: () => at, set: seek },
+  });
+  await pointer(bar, "pointermove", 350);
+  // The wait for the file's index doesn't count against the seek.
+  await act(async () => { vi.advanceTimersByTime(2_000); });
+  expect(asked).toEqual([]);
+  ready = 1;
+  movie.dispatchEvent(new Event("loadedmetadata"));
+  expect(seek).toHaveBeenLastCalledWith(35);
+  await act(async () => { vi.advanceTimersByTime(499); });
+  expect(asked).toEqual([]);
+  // The seek is too slow: this hover shows stills from here on, and the decoder stays open.
+  await act(async () => { vi.advanceTimersByTime(1); });
+  expect(asked.map(a => a.url.searchParams.get("t"))).toEqual(["35"]);
+  expect(movie.getAttribute("src")).toBe("/working-cut.mp4");
+  await asked[0]!.answer();
+  await finishDecode();
+  await pointer(bar, "pointermove", 600);
+  expect(asked.map(a => a.url.searchParams.get("t"))).toEqual(["35", "60"]);
+  expect(seek).toHaveBeenCalledTimes(1);
+  // The next hover goes back to the movie.
+  await pointer(bar, "pointerleave", 600);
+  ready = 4;
+  seeking = false;
+  movie.dispatchEvent(new Event("seeked"));
+  await pointer(bar, "pointerenter", 700);
+  expect(seek).toHaveBeenLastCalledWith(70);
+  expect(asked).toHaveLength(2);
+});
+
+it("waits a few seconds at most for a file's index before giving the hover stills", async () => {
+  const bar = await show(100, 0, "/working-cut.mp4");
+  const movie = bar.querySelector("video")!;
+  await pointer(bar, "pointermove", 350);
+  await act(async () => { vi.advanceTimersByTime(2_999); });
+  expect(asked).toEqual([]);
+  await act(async () => { vi.advanceTimersByTime(1); });
+  expect(asked.map(a => a.url.searchParams.get("t"))).toEqual(["35"]);
+  expect(movie.getAttribute("src")).toBe("/working-cut.mp4");
 });
 
 it("releases a slow obsolete decode once the pointer settles, and cancels a pending retarget on leave", async () => {

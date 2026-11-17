@@ -25,10 +25,25 @@ export const QUIET_ABOVE_FLOOR_DB = 20;
 /** No floor is taken as lower than this: digital silence would leave nothing quiet. */
 const LOWEST_FLOOR_RMS = 1e-4;
 
-/** The RMS at or under which a bucket of these levels is quiet: QUIET_RMS, or less on a recording with a low floor. */
-export function quietRms(rms: ArrayLike<number>): number {
+/** The bucket length the floor is read at, whatever the levels' own. */
+const FLOOR_BUCKET = .02;
+
+/**
+ * The RMS at or under which a bucket of these levels is quiet: QUIET_RMS, or less on a recording with a low floor.
+ * `step` is the levels' bucket length. The floor is read on 20 ms buckets whatever it is: finer buckets catch quieter
+ * instants, and at 10 ms the floor read 2 dB lower and a breath's soft tail after a word, quiet before, became sound;
+ * the edges moved past it and the joins played a quarter-second longer (2026-11-16).
+ */
+export function quietRms(rms: ArrayLike<number>, step = FLOOR_BUCKET): number {
   if (!rms.length) return QUIET_RMS;
-  const sorted = Float64Array.from(rms).sort();
+  const k = Math.max(1, Math.round(FLOOR_BUCKET / step));
+  const merged = new Float64Array(Math.ceil(rms.length / k));
+  for (let i = 0; i < merged.length; i++) {
+    let power = 0, n = 0;
+    for (let j = i * k; j < Math.min(rms.length, (i + 1) * k); j++) { power += rms[j]! ** 2; n++; }
+    merged[i] = Math.sqrt(power / n);
+  }
+  const sorted = merged.sort();
   // The quietest fiftieth: a minute of dense speech still has a second of pauses, and a tenth of it is already words' tails.
   const floor = Math.max(LOWEST_FLOOR_RMS, sorted[Math.floor(sorted.length * 0.02)]!);
   return Math.min(QUIET_RMS, floor * 10 ** (QUIET_ABOVE_FLOOR_DB / 20));

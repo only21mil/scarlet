@@ -135,7 +135,7 @@ export function pictureReader<W>(spec: PictureReading<W>) {
         state.queue.shift();
         for (const wake of state.waiters) wake();
       }
-    })()).finally(() => {
+    })(), media.projectId).finally(() => {
       state.reading = undefined;
       for (const wake of state.waiters) wake();
     });

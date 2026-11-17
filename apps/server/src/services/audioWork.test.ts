@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { AudioLane, audioLane, whisperLane, type AudioWork } from "./audioWork.js";
+import { AudioLane, askFor, audioLane, whisperLane, type AudioWork } from "./audioWork.js";
 
 function gate() {
   let open!: () => void;
@@ -21,6 +21,27 @@ function harness(lane: AudioLane) {
 const tick = () => new Promise(resolve => setTimeout(resolve, 0));
 
 describe("audio lane", () => {
+  it("records a blocked wait before the worker finishes and records cancellation while queued", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    try {
+      const lines: string[] = [];
+      const { add } = harness(new AudioLane(line => lines.push(line)));
+      const running = add("first", { mediaId: "med_aaaaaaaaaaaa", kind: "transcript" });
+      const cancel = new AbortController();
+      const waiting = add("second", { mediaId: "med_bbbbbbbbbbbb", kind: "alignment" }, cancel.signal);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(lines).toEqual(["[audio] waiting lane=audio work=alignment media=med_bbbbbbbbbbbb wait_ms=30000 ahead=1 blocker_work=transcript blocker=med_aaaaaaaaaaaa"]);
+      const rejected = expect(waiting.done).rejects.toMatchObject({ name: "AbortError" });
+      cancel.abort();
+      await rejected;
+      expect(lines.at(-1)).toBe("[audio] cancelled_while_waiting lane=audio work=alignment media=med_bbbbbbbbbbbb wait_ms=30000");
+      running.release();
+      await running.done;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("runs one job at a time, first come first served when nothing is focused", async () => {
     const lane = new AudioLane();
     const { order, add } = harness(lane);
@@ -190,6 +211,80 @@ describe("audio lane", () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(order).toEqual(["whisper", "speakers"]);
       speakers.release(); await speakers.done;
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("releases a finished attempt's own reservation without releasing a newer attempt on the same recording", async () => {
+    const lane = new AudioLane();
+    const first: AudioWork = { mediaId: "a", kind: "transcript" };
+    const next: AudioWork = { ...first };
+    await lane.run(first, undefined, async () => {}, { more: true });
+    await lane.run(next, undefined, async () => {}, { more: true });
+    const waiting = vi.fn(async () => {});
+    const done = lane.run({ mediaId: "b", kind: "speakers" }, undefined, waiting);
+    lane.finish(first);
+    await tick();
+    expect(waiting).not.toHaveBeenCalled();
+    lane.finish(next);
+    await done;
+    expect(waiting).toHaveBeenCalledOnce();
+  });
+
+  it("puts work a request waits on ahead of background work, also on a recording no pass has focused", async () => {
+    vi.useFakeTimers();
+    try {
+      const lane = new AudioLane();
+      const { order, add } = harness(lane);
+      // Another recording's transcript is under way and keeps the lane for its next turn.
+      const turn1 = add("background turn 1", { mediaId: "b", kind: "alignment" }, undefined, true);
+      await vi.advanceTimersByTimeAsync(0);
+      const background = add("background page", { mediaId: "c", kind: "page" });
+      const asked = add("asked page", { mediaId: "a", kind: "page", asked: true });
+      expect(lane.rank({ mediaId: "a", kind: "page", asked: true })).toBe(1);
+      turn1.release(); await turn1.done;
+      await vi.advanceTimersByTimeAsync(0);
+      // The asked page doesn't wait for the background transcript to finish, nor for work queued before it.
+      expect(order).toEqual(["background turn 1", "asked page"]);
+      // The transcript's next turn, queued meanwhile, still finishes it before other background work starts.
+      const turn2 = add("background turn 2", { mediaId: "b", kind: "alignment" });
+      asked.release(); await asked.done;
+      await vi.advanceTimersByTimeAsync(0);
+      for (const job of [turn2, background]) { job.release(); await job.done; await vi.advanceTimersByTimeAsync(0); }
+      expect(order).toEqual(["background turn 1", "asked page", "background turn 2", "background page"]);
+
+      // Among a read recording's work, the page a request joins goes ahead of the scan's pages queued before it.
+      const unfocus = lane.focus("a");
+      const running = add("running", { mediaId: "a", kind: "alignment" });
+      await vi.advanceTimersByTimeAsync(0);
+      const scanned = add("scan page", { mediaId: "a", kind: "page" });
+      const joined: AudioWork = { mediaId: "a", kind: "page" };
+      const read = add("read page", joined);
+      lane.ask(joined);
+      expect(lane.queued().map(w => w.kind + (w.asked ? " asked" : ""))).toEqual(["page asked", "page"]);
+      for (const job of [running, read, scanned]) { job.release(); await job.done; await vi.advanceTimersByTimeAsync(0); }
+      expect(order.slice(-3)).toEqual(["running", "read page", "scan page"]);
+      unfocus();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("stops keeping the lane for a step when a request joins work that goes ahead of it", async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = { paths: { root: "/tmp/asked-hold" } };
+      const lane = audioLane(ctx);
+      const { order, add } = harness(lane);
+      const whisper = add("background whisper", { mediaId: "b", kind: "transcript" }, undefined, true);
+      await vi.advanceTimersByTimeAsync(0);
+      whisper.release(); await whisper.done;
+      const work: AudioWork = { mediaId: "a", kind: "page" };
+      const page = add("page", work);
+      await vi.advanceTimersByTimeAsync(0);
+      // Equal in rank, the page waits for the step the background transcript kept the lane for.
+      expect(order).toEqual(["background whisper"]);
+      askFor(ctx, work);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(order).toEqual(["background whisper", "page"]);
+      page.release(); await page.done;
     } finally { vi.useRealTimers(); }
   });
 

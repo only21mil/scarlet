@@ -99,36 +99,44 @@ it("cancels on pause of media processing, but allows a real viewer to take over 
   usePlayerStore.setState({ playing: true, playbackReady: true });
   await act(() => root.render(<Review />));
   await vi.advanceTimersByTimeAsync(250);
+  // Both sides are asked for at once.
+  expect(vi.mocked(api.preparePlayback)).toHaveBeenCalledTimes(2);
   const signal = vi.mocked(api.preparePlayback).mock.calls[0]![3];
   await act(() => root.render(<Review paused />));
   expect(signal.aborted).toBe(true);
   await act(() => root.render(<Review />));
   await vi.advanceTimersByTimeAsync(250);
-  const handoff = vi.mocked(api.preparePlayback).mock.calls[1]![3];
+  const handoff = vi.mocked(api.preparePlayback).mock.calls[2]![3];
   await act(() => root.render(<Review upcoming={[]} opened={{ version: original.version, removed: cut }} />));
   expect(handoff.aborted).toBe(false);
   await vi.advanceTimersByTimeAsync(1000);
   expect(handoff.aborted).toBe(true);
 });
 
-it("prepares successive visible calls one at a time and retains work across a change in review order", async () => {
+it("prepares the next two visible calls at a time and retains work across a change in review order", async () => {
   const second = { ...callToPrepare({} as Change, { ...call, index: 0 }, { start: 5, end: 10 }, original, review)!, key: "call-1" };
+  const third = { ...target, key: "call-3", cut: { start: 41, end: 43 } };
   const prepare = vi.mocked(api.preparePlayback);
-  let firstReady!: () => void;
-  prepare.mockImplementationOnce(async () => { await new Promise<void>(resolve => { firstReady = resolve; }); });
-  await act(() => root.render(<Review upcoming={[second, target]} />));
-  expect(prepare).toHaveBeenCalledTimes(1);
-  expect(prepare.mock.calls[0]?.[2]).toEqual(expect.arrayContaining([3, 5]));
-  await act(async () => firstReady());
-  expect(prepare.mock.calls.map(([, version]) => version)).toEqual(["proposed", "original", "proposed", "original"]);
+  const waiting: (() => void)[] = [];
+  prepare.mockImplementation(() => new Promise<void>(resolve => { waiting.push(resolve); }));
+  await act(() => root.render(<Review upcoming={[second, target, third]} />));
+  // Both sides of the first two calls at once, the third waiting for a free place.
+  // Both sides of the first two calls at once, the third waiting for a free place.
+  const asked = () => prepare.mock.calls.map(([, version, times]) => [version, times[0]]);
+  expect(asked().sort()).toEqual([["original", 3], ["original", 38], ["proposed", 3], ["proposed", 33]]);
+  // The two calls read the versions' full files once between them.
   expect(api.renders).toHaveBeenCalledTimes(2);
+  await act(async () => { for (const ready of waiting.splice(0, 2)) ready(); });
+  expect(prepare).toHaveBeenCalledTimes(6);
+  expect(asked().slice(4)).toEqual([["proposed", 34], ["original", 39]]);
   expect(plans.get(second.key)?.before.version).toBe(original.version);
-  await act(() => root.render(<Review upcoming={[target, second]} />));
-  expect(prepare).toHaveBeenCalledTimes(4);
+  await act(() => root.render(<Review upcoming={[target, second, third]} />));
+  expect(prepare).toHaveBeenCalledTimes(6);
+  await act(async () => { for (const ready of waiting.splice(0)) ready(); });
 });
 
 
-it("publishes a streaming plan immediately and upgrades each side only after its own short file is ready", async () => {
+it("publishes a streaming plan immediately, asks for both short files at once and upgrades each side only after its own is ready", async () => {
   const makeWindow = vi.mocked(api.cutPlaybackFile);
   const complete: (() => void)[] = [];
   makeWindow.mockImplementation(async (_, version, range) => {
@@ -141,13 +149,12 @@ it("publishes a streaming plan immediately and upgrades each side only after its
   expect(output).toHaveLength(1);
   expect(output[0]?.after.window).toBeUndefined();
   expect(makeWindow.mock.calls.map(([, version, range]) => [version, range])).toEqual([
-    ["proposed", { start: 976 / 30, end: 1141 / 30 }],
+    ["proposed", { start: 976 / 30, end: 1141 / 30 }], ["original", { start: 1126 / 30, end: 1351 / 30 }],
   ]);
   complete.shift()!();
   await vi.advanceTimersByTimeAsync(0);
   expect(output[1]!.after.window?.url).toBe("file/proposed");
   expect(output[1]!.before.window).toBeUndefined();
-  expect(makeWindow.mock.calls[1]?.[2]).toEqual({ start: 1126 / 30, end: 1351 / 30 });
   complete.shift()!();
   await done;
   expect(output[2]!.before.window?.url).toBe("file/original");
@@ -171,13 +178,15 @@ it("promotes a full render that finishes after lookup and reuses it for a differ
   vi.mocked(api.cutPlaybackFile).mockImplementation(async (_, version) => ({
     url: `full/${version}`, full: true, start: 0, end: version === original.version ? 60 : 52,
   }));
-  await act(() => root.render(<Review upcoming={[target, next]} />));
-  for (const key of [target.key, next.key]) {
+  // The same cut under a third key waits for the first, then has its files without asking.
+  const again = { ...target, key: "call-3" };
+  await act(() => root.render(<Review upcoming={[target, next, again]} />));
+  for (const key of [target.key, next.key, again.key]) {
     const cut = plans.get(key)!;
     expect([cut.before.file, cut.after.file]).toEqual(["full/original", "full/proposed"]);
     expect([cut.before.window, cut.after.window]).toEqual([undefined, undefined]);
   }
-  expect(api.cutPlaybackFile).toHaveBeenCalledTimes(2);
+  expect(api.cutPlaybackFile).toHaveBeenCalledTimes(4);
   expect(api.preparePlayback).not.toHaveBeenCalled();
 });
 
@@ -201,7 +210,7 @@ it("retains the next review candidate while the currently open cut gets its own 
   }).mockImplementation(async (_, version, range) => ({ url: version, ...range }));
   const other = { ...target, key: "another" };
   await act(() => root.render(<Review upcoming={[target, other]} opened={{ key: target.key, version: original.version, removed: cut }} />));
-  expect(files).toHaveBeenCalledTimes(1);
+  expect(files).toHaveBeenCalledTimes(2);
   expect(plans.get(target.key).after.window).toBeUndefined();
   await act(() => root.render(<Review upcoming={[other]} />));
   expect(files.mock.calls[0]?.[3].aborted).toBe(true);

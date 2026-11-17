@@ -7,12 +7,14 @@
  * At 8 kHz a cut edge on an "s" read as silence. Bump WAVEFORM_CACHE_VERSION
  * whenever the decode changes so cached waveforms are rebuilt.
  */
+import { endianness } from "node:os";
 import { LOCAL_MEDIA_INPUT, SOURCE_AUDIO_CLOCK, ffSeconds, resolveFfmpeg, runCapture } from "./exec.js";
 
 const DECODE_RATE = 16000;
-export const WAVEFORM_CACHE_VERSION = 4;
-// 24 hours at the engine's 50 points/second. The binary file holds two float32s per point.
-export const MAX_WAVEFORM_POINTS = 24 * 60 * 60 * 50;
+const nativeS16le = endianness() === "LE";
+export const WAVEFORM_CACHE_VERSION = 5;
+// 24 hours at the engine's 100 points/second. The binary file holds two float32s per point.
+export const MAX_WAVEFORM_POINTS = 24 * 60 * 60 * 100;
 export const MAX_WAVEFORM_CACHE_BYTES = 16 + MAX_WAVEFORM_POINTS * 8;
 
 export interface WaveformOptions {
@@ -52,18 +54,26 @@ function pcmArgs(file: string, opts: { from?: number; to?: number; channel?: num
   return args;
 }
 
-async function decodePcm(file: string, opts: { from?: number; to?: number; channel?: number; ffmpegPath?: string; signal?: AbortSignal }, onStdoutBytes?: (total: number) => void): Promise<Int16Array> {
-  const { stdout } = await runCapture(resolveFfmpeg(opts.ffmpegPath), pcmArgs(file, opts), { signal: opts.signal, onStdoutBytes });
-  // Align to 2 bytes; the Int16Array view needs an even byte offset/length.
-  const len = stdout.byteLength - (stdout.byteLength % 2);
-  return new Int16Array(stdout.buffer.slice(stdout.byteOffset, stdout.byteOffset + len));
+async function decodePcm(file: string, opts: { from?: number; to?: number; channel?: number; ffmpegPath?: string; signal?: AbortSignal }): Promise<Buffer> {
+  const { stdout } = await runCapture(resolveFfmpeg(opts.ffmpegPath), pcmArgs(file, opts), { signal: opts.signal });
+  return stdout;
 }
 
-/** Bucket PCM samples into `points` peak/rms values. Missing samples read as silence. */
-function bucket(samples: Int16Array, count: number, totalSamples = samples.length): Waveform {
+function pcmSamples(bytes: Buffer): Int16Array {
+  const count = Math.floor(bytes.length / 2);
+  if (nativeS16le && bytes.byteOffset % 2 === 0) return new Int16Array(bytes.buffer, bytes.byteOffset, count);
+  const samples = new Int16Array(count);
+  for (let i = 0; i < count; i++) samples[i] = bytes.readInt16LE(i * 2);
+  return samples;
+}
+
+/** Bucket a decoded 16 kHz mono s16le range. Missing samples read as silence. */
+export function waveformFromPcm(bytes: Buffer, duration: number, count: number): Waveform {
   // Whole buckets only: an array cannot be -1, 2.5, NaN or endlessly long.
   const points = Math.floor(count);
   if (!Number.isFinite(points) || points <= 0) return { peaks: [], rms: [] };
+  const samples = pcmSamples(bytes);
+  const totalSamples = Math.max(samples.length, Math.round(Math.max(0, duration) * DECODE_RATE));
   const peaks = new Array<number>(points).fill(0);
   const rms = new Array<number>(points).fill(0);
   const per = totalSamples / points;
@@ -87,9 +97,7 @@ function bucket(samples: Int16Array, count: number, totalSamples = samples.lengt
 
 /** Waveform for a source range, `points` buckets wide. */
 export async function extractWaveform(file: string, opts: WaveformOptions): Promise<Waveform> {
-  const samples = await decodePcm(file, opts);
-  const expected = Math.round(Math.max(0, opts.to - opts.from) * DECODE_RATE);
-  return bucket(samples, opts.points, Math.max(expected, samples.length));
+  return waveformFromPcm(await decodePcm(file, opts), opts.to - opts.from, opts.points);
 }
 
 /** Decode the whole file once at `pointsPerSecond` resolution for caching. */
@@ -238,7 +246,7 @@ async function loadVad() {
 export async function speechActivity(file: string, from: number, to: number, signal?: AbortSignal) {
   if (from < 0 || to <= from || to > from + 60) throw new Error("Choose a speech window up to 60 seconds.");
   const start = speechActivityStart(from);
-  return speechActivityOf(await decodePcm(file, { from: start, to, signal }), start, from, to);
+  return speechActivityOf(pcmSamples(await decodePcm(file, { from: start, to, signal })), start, from, to);
 }
 
 /** Where the audio for a speech window starts: the detector warms up on the 0.3 s before it. */

@@ -43,6 +43,61 @@ it("returns a stopped, unreplaced demo revision to preview, apply and done", asy
   expect((await finish(api.approveChange(change.id))).outcome).toBe("applied");
 });
 
+it("stops all demo edits, preserves saved work, and continues interrupted requests first", async () => {
+  const before = await finish(api.workspace(PRJ));
+  const { task: waiting } = await finish(api.createTask(PRJ, { kind: "edit", agent: "claude", instruction: "Tighten the outro" }));
+  const working = (await finish(api.projects())).projects.find(p => p.id === PRJ);
+  expect(working?.activity).toEqual([{ kind: "editing", count: 1 }]);
+
+  const { project, tasks } = await finish(api.stopEditing(PRJ));
+  expect(project.editingPaused).toBe(true);
+  const stopped = tasks.find(task => task.id === "task_running")!;
+  const resumed = tasks.find(task => task.id === stopped.retryTaskId)!;
+  expect(stopped.state).toBe("cancelled");
+  expect(resumed).toMatchObject({ state: "queued", resumeRootId: stopped.id, resumesAfterProjectStop: true });
+  // A question holds no worker: it stays, and the editor can answer it while editing is paused.
+  expect(tasks.some(task => task.id === "task_waiting")).toBe(false);
+  expect((await finish(api.task("task_waiting"))).task.state).toBe("waiting_for_user");
+  expect((await finish(api.stopEditing(PRJ))).tasks).toEqual([]);
+  await finish(api.answerTask("task_waiting", "Use the show’s purple"));
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect((await finish(api.projects())).projects.find(p => p.id === PRJ)?.activity).toBeUndefined();
+  expect(working?.activity).toEqual([{ kind: "editing", count: 1 }]);
+  expect((await finish(api.workspace(PRJ))).project.head).toBe(before.project.head);
+  expect((await finish(api.task(resumed.id))).task.state).toBe("queued");
+  expect((await finish(api.task("task_waiting"))).task.state).toBe("queued");
+  expect((await finish(api.task(waiting.id))).task.state).toBe("queued");
+
+  const continued = await finish(api.resumeEditing(PRJ));
+  expect(continued.project.editingPaused).toBe(false);
+  expect(continued.tasks).toEqual([expect.objectContaining({ id: resumed.id, state: "queued" })]);
+  expect((await finish(api.resumeEditing(PRJ))).tasks).toEqual([]);
+  await vi.advanceTimersByTimeAsync(600);
+  expect((await finish(api.task(resumed.id))).task.state).toBe("running");
+  expect((await finish(api.task("task_waiting"))).task.state).toBe("running");
+  expect((await finish(api.task(waiting.id))).task.state).toBe("queued");
+});
+
+it("advances the queue after stopping only one demo edit", async () => {
+  await finish(api.cancelTask("task_waiting"));
+  const { task: waiting } = await finish(api.createTask(PRJ, { kind: "edit", agent: "claude", instruction: "Tighten the outro" }));
+  const { task: stopped } = await finish(api.cancelTask("task_running"));
+  expect(stopped.state).toBe("cancelled");
+  expect(stopped.retryTaskId).toBeUndefined();
+  expect((await finish(api.workspace(PRJ))).project.editingPaused).toBeFalsy();
+  expect((await finish(api.task(waiting.id), 1_300)).task.state).toBe("running");
+});
+
+it("removes a held continuation without continuing it", async () => {
+  await finish(api.cancelTask("task_waiting"));
+  const { tasks } = await finish(api.stopEditing(PRJ));
+  const queued = tasks.find(task => task.resumeRootId === "task_running")!;
+  const { task: removed } = await finish(api.cancelTask(queued.id, true));
+  expect(removed.state).toBe("cancelled");
+  expect((await finish(api.resumeEditing(PRJ))).tasks).toEqual([]);
+  expect((await finish(api.projects(), 2_000)).projects.find(p => p.id === PRJ)?.activity).toBeUndefined();
+});
+
 it("waits for sibling revisions and preserves a failed proposal and its error", async () => {
   const original = await finish(api.change("chg_failed"));
   const error = original.change.error;

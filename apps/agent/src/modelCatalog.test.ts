@@ -64,5 +64,16 @@ it("reads Gemini ACP session choices and distinguishes an empty list from a fail
   peer(({ id, method }) => ({ id, result: method === "initialize" ? {} : { models: { availableModels: [] } } }));
   expect((await discoverModels("gemini", "gemini", {}))?.models).toEqual([]);
   peer(({ id }) => ({ id, error: { code: -1 } }));
-  expect(await discoverModels("gemini", "gemini", {})).toBeUndefined();
+  await expect(discoverModels("gemini", "gemini", {})).rejects.toMatchObject({ reason: "initialize_failed" });
+});
+
+
+it("reports a failed or malformed later page without exposing its contents", async () => {
+  peer(({ id }) => id === 1 ? { id, result: {} } : id === 2
+    ? { id, result: { data: [], nextCursor: "again" } }
+    : { id, error: { message: "private RPC reply" } });
+  await expect(discoverModels("codex", "codex", {})).rejects.toMatchObject({ message: "request_failed" });
+
+  peer(({ id }) => id === 1 ? { id, result: {} } : { id, result: { data: [], nextCursor: "again" } });
+  await expect(discoverModels("codex", "codex", {})).rejects.toMatchObject({ message: "repeated_cursor" });
 });

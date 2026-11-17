@@ -225,6 +225,23 @@ describe("the skills Scarlet comes with", () => {
       context: { skillIds: [style.id] }, createdBy: { type: "human", name: "Editor" } });
     expect(run.context.dialogueOperation).toBe("first-cut");
     expect(assistantSkills(app.ctx.repos.skills.select(), [style.id], true).map(s => s.name)).toEqual(["dialogue-pass", "my-style"]);
+    // A style that builds on several guides brings each along, in the order it names them, ahead of itself.
+    const framing = createSkill(app.ctx, editor, { name: "frame-screen-test", scope: "team", content: "---\nname: frame-screen-test\ndescription: Frame the screen.\n---\n\nFill the video.\n" });
+    const layered = createSkill(app.ctx, editor, { name: "my-edit", scope: "team",
+      content: "---\nname: my-edit\ndescription: My whole edit.\nextends: frame-screen-test, dialogue-pass, not-installed\n---\n\nMy camera sits bottom right.\n" });
+    expect(assistantSkills(app.ctx.repos.skills.select(), [layered.id], true).map(s => s.name)).toEqual(["frame-screen-test", "dialogue-pass", "my-edit"]);
+    expect(createTask(app.ctx, { projectId: "prj_1", kind: "edit", agent: "codex", instruction: "/my-edit",
+      context: { skillIds: [layered.id] }, createdBy: { type: "human", name: "Editor" } }).context.dialogueOperation).toBe("first-cut");
+    expect(framing.enabled).toBe(true);
+    // A guide called in the text is brought along too, with the guides that one builds on, and each only once.
+    const base = createSkill(app.ctx, editor, { name: "wide-first", scope: "team", content: "---\nname: wide-first\ndescription: Start wide.\n---\n\nStart on the whole window.\n" });
+    const demo = createSkill(app.ctx, editor, { name: "demo-framing", scope: "team", content: "---\nname: demo-framing\ndescription: Frame demos.\n---\n\n/wide-first, then push in. A path like /usr/bin and `/wide-first` in code are not calls.\n" });
+    const inline = createSkill(app.ctx, editor, { name: "my-inline", scope: "team",
+      content: "---\nname: my-inline\ndescription: Called where it applies.\n---\n\nMy edit is a /dialogue-pass cut my way.\n\n## Demos\n\n/demo-framing, with my camera bottom right (see /wide-first). My own /my-inline is not a guide under it.\n" });
+    expect(assistantSkills(app.ctx.repos.skills.select(), [inline.id], true).map(s => s.name)).toEqual(["dialogue-pass", "wide-first", "demo-framing", "my-inline"]);
+    expect(createTask(app.ctx, { projectId: "prj_1", kind: "edit", agent: "codex", instruction: "/my-inline",
+      context: { skillIds: [inline.id] }, createdBy: { type: "human", name: "Editor" } }).context.dialogueOperation).toBe("first-cut");
+    expect(base.enabled && demo.enabled).toBe(true);
     // Without the guide it builds on, the style still runs the pass on its own.
     updateSkill(app.ctx, editor, publicGuide()!, { enabled: false });
     expect(assistantSkills(app.ctx.repos.skills.select(), [style.id], true).map(s => s.name)).toEqual(["my-style"]);
@@ -521,7 +538,7 @@ describe("skills that the workflows replaced", () => {
   ].join("\n");
 
   it("ships the stock skills in skills/, and removes unedited copies of the rest on upgrade", async () => {
-    expect(app.ctx.repos.skills.select().map(skill => skill.name).sort()).toEqual(["add-captions", "cold-open", "dialogue-pass", "fit-length", "frame-screen", "make-shorts", "matt-talking-head", "motion-graphics", "punch-in", "speed-through-waits"]);
+    expect(app.ctx.repos.skills.select().map(skill => skill.name).sort()).toEqual(["add-captions", "dialogue-pass", "fit-length", "frame-screen", "make-shorts", "matt-talking-head", "motion-graphics", "punch-in", "speed-through-waits"]);
     const stock = createSkill(app.ctx, null, { name: "smooth-audio-cuts", scope: "team", content: smoothing }, { source: "bundled" });
     const run = uses([stock.id]);
     app.ctx.repos.tasks.put({ ...run, state: "done" });

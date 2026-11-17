@@ -1,5 +1,6 @@
 /** Map timelines onto the source clock of the audible dialogue recordings. */
 import type { MediaClip, Timeline } from "../../packages/timeline/src/index.ts";
+import { closesSentence, joinFragment, type FragmentEvidence } from "../../packages/shared/src/joinFragments.ts";
 import { merge, type Range } from "./intervals.ts";
 import type { MediaEvidence, PlayedWord } from "./metrics.ts";
 
@@ -70,6 +71,52 @@ export function playedWords(tl: Timeline, media: readonly MediaInfo[], evidence:
         out.push({ text: w.text, start: at(w.start), end: at(w.end), sourceStart: w.start, sourceEnd: w.end, mediaId: clip.mediaId, piece });
       }
     }
+  }
+  return out;
+}
+
+/**
+ * What a version plays once timeline ranges of it are taken out: the words inside them go, later words move up by what
+ * came out before them, and a word after a removal is in a new piece, since the removal makes a join there.
+ */
+export function wordsWithout(words: readonly TimelineWord[], removals: readonly Range[]): TimelineWord[] {
+  const cuts = removals.filter(r => r.end > r.start).slice().sort((a, b) => a.start - b.start);
+  const out: TimelineWord[] = [];
+  for (const w of words) {
+    const middle = (w.start + w.end) / 2;
+    if (cuts.some(r => middle >= r.start && middle < r.end)) continue;
+    let shift = 0, before = 0;
+    for (const r of cuts) if (r.end <= middle) { shift += r.end - r.start; before++; }
+    out.push({ ...w, start: w.start - shift, end: w.end - shift, piece: w.piece * 1000 + before });
+  }
+  return out;
+}
+
+/** A join that took words out of a sentence, with what the version plays either side of it. `at` is in timeline seconds. */
+export interface DividedJoin extends FragmentEvidence { at: number; mediaId: string }
+
+/**
+ * The joins of a version that divide a sentence, as the pass's closing check lists them (joinFragment): where a stray
+ * word or a sentence without its start or end can be, and where a join may read whole. Which it is takes reading, so
+ * this is a list to read and a count to compare, not a count of mistakes. A sentence's end is read from the words'
+ * punctuation here; the engine also has the transcript's segments.
+ */
+export function dividedJoins(tl: Timeline, media: readonly MediaInfo[], evidence: ReadonlyMap<string, MediaEvidence>): DividedJoin[] {
+  const out: DividedJoin[] = [];
+  const last = new Map<string, MediaClip>();
+  const said = new Map<string, Array<{ text: string; start: number; end: number; index: number; endsSentence: boolean }>>();
+  for (const clip of audibleClips(tl, media).sort((a, b) => a.timelineIn - b.timelineIn)) {
+    const before = last.get(clip.mediaId);
+    last.set(clip.mediaId, clip);
+    // Touching or crossfaded pieces of one recording, the later one further on in it.
+    if (!before || Math.abs(before.timelineIn + clipLength(before) - clip.timelineIn) > .2 || clip.sourceIn - before.sourceOut < 1e-3) continue;
+    let words = said.get(clip.mediaId);
+    if (!words) said.set(clip.mediaId, words = (evidence.get(clip.mediaId)?.words ?? [])
+      .map((w, index) => ({ text: w.text, start: w.start, end: w.end, index, endsSentence: closesSentence(w.text) }))
+      .filter(w => w.end > w.start && w.text.trim() && !/^\s*[[(*♪].*[\])*♪]\s*$/u.test(w.text))
+      .sort((a, b) => (a.start + a.end) - (b.start + b.end) || a.index - b.index));
+    const found = joinFragment(words, before.sourceOut, clip.sourceIn, before.sourceIn, clip.sourceOut);
+    if (found) out.push({ at: Math.round(clip.timelineIn * 1000) / 1000, mediaId: clip.mediaId, ...found });
   }
   return out;
 }

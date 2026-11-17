@@ -3,7 +3,7 @@
  * them with abort support, parsing `-progress` output, and a spawn counter
  * that tests use to prove the segment cache avoided work.
  */
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { accessSync, constants, statSync } from "node:fs";
 import { availableParallelism, homedir } from "node:os";
 import { isSea } from "node:sea";
@@ -173,6 +173,12 @@ export interface CaptureResult {
   code: number;
 }
 
+/**
+ * Told of every FFmpeg and FFprobe this package starts, as it starts. The engine lowers the priority of those started
+ * for background work while the editor plays.
+ */
+export const spawnObserver: { spawned?: (child: ChildProcess) => void } = {};
+
 function countSpawn(bin: string): void {
   if (/ffprobe/i.test(bin)) spawnStats.ffprobe++;
   else spawnStats.ffmpeg++;
@@ -187,6 +193,7 @@ export function runCapture(bin: string, args: string[], opts: CaptureOptions = {
     if (opts.signal?.aborted) return reject(new AbortError());
     countSpawn(bin);
     const child = spawn(bin, args, { stdio: [opts.stdin ? "pipe" : "ignore", "pipe", "pipe"], windowsHide: true });
+    spawnObserver.spawned?.(child);
     if (child.stdin && opts.stdin) {
       // FFmpeg can close its input early on failure or cancellation. Its exit reports the cause.
       child.stdin.on("error", () => {});
@@ -288,6 +295,7 @@ export function runFfmpeg(args: string[], opts: RunFfmpegOptions = {}): Promise<
       stdio: ["ignore", opts.onProgress ? "pipe" : "ignore", "pipe"],
       windowsHide: true,
     });
+    spawnObserver.spawned?.(child);
     let err = "";
     let aborted = false;
     let pending = "";

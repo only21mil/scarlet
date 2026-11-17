@@ -5,6 +5,7 @@
  * Conventions: every time is in SOURCE seconds of one recording unless a name says "timeline". An edge
  * is a point where kept audio stops ("out", a removal starts) or resumes ("in", a removal ends).
  */
+import { findRestarts } from "../../packages/shared/src/restarts.ts";
 import { normalizeTranscriptToken as token } from "../../packages/shared/src/transcriptSearch.ts";
 import { covered, intersect, median, merge, quantile, subtract, total, overlap, type Range } from "./intervals.ts";
 
@@ -402,6 +403,10 @@ export interface PacingSummary {
   medianJoinGapSeconds: number | null;
   /** A word or a run of words said twice in a row. A count to compare between cuts: deliberate emphasis is in it too. */
   repeats: { total: number; singleWords: number; phrases: number; atJoins: number };
+  /** Phrases that play again within a moment, as the pass's closing check finds them: restarts, retakes left in, deliberate parallels. */
+  restarts: number;
+  /** Stretches of two seconds or more without a word. */
+  silences: number;
 }
 export interface Pacing extends PacingSummary { gapList: PacingGap[]; repeatList: PacingRepeat[] }
 
@@ -410,7 +415,7 @@ const endsSentence = (text: string) => /[.?!]["'”’)\]]*$/u.test(text.trim())
 /** Gaps and doubled words in what a version plays. Each recording is read on its own, in playback order. */
 export function pacing(played: readonly PlayedWord[], opts: PacingOptions = DEFAULT_PACING_OPTIONS): Pacing {
   const gapList: PacingGap[] = [], repeatList: PacingRepeat[] = [], joinGaps: number[] = [];
-  let words = 0, joins = 0;
+  let words = 0, joins = 0, restarts = 0;
   const streams = new Map<string, PlayedWord[]>();
   for (const w of played) {
     if (!token(w.text) || /^\[.*\]$/.test(w.text.trim())) continue;
@@ -421,6 +426,7 @@ export function pacing(played: readonly PlayedWord[], opts: PacingOptions = DEFA
     const stream = unsorted.slice().sort((a, b) => a.start - b.start);
     const tokens = stream.map(w => token(w.text));
     words += stream.length;
+    restarts += findRestarts(tokens, stream.map(w => w.start), stream.map(w => w.end)).length;
     // The last word to finish holds the outgoing edge, as in overlapping speech.
     let left = stream[0];
     for (const right of stream.slice(1)) {
@@ -457,6 +463,7 @@ export function pacing(played: readonly PlayedWord[], opts: PacingOptions = DEFA
       excessSeconds: round(gapList.reduce((sum, g) => sum + g.seconds - opts.beatSeconds, 0), 1) },
     medianJoinGapSeconds: joinGaps.length ? round(median(joinGaps)!, 3) : null,
     repeats: { total: repeatList.length, singleWords: count(repeatList, r => r.words === 1), phrases: count(repeatList, r => r.words > 1), atJoins: count(repeatList, r => r.join) },
+    restarts, silences: count(gapList, g => g.seconds >= 2 - 1e-9),
     gapList, repeatList,
   };
 }

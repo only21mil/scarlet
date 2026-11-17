@@ -41,7 +41,7 @@ beforeEach(() => {
   lines = [];
   levels = [];
   vi.stubGlobal("XMLHttpRequest", FakeRequest);
-  startAppLog((batch, level) => { for (const line of batch) { lines.push(line.replace(/^(\[\w+\]) \S+ \S+ /, "$1 ").replace(/ms=\d+/, "ms=N")); levels.push(level); } });
+  startAppLog((batch, level) => { for (const line of batch) { lines.push(line.replace(/^(\[\w+\]) \S+ \S+ /, "$1 ").replace(/ms=\d+/, "ms=N").replace(/request=[a-f0-9-]{36} /, "")); levels.push(level); } });
 });
 afterEach(() => {
   stopAppLog();
@@ -56,6 +56,7 @@ it("sends the file to the project with the session's token and reports how far i
   const { promise } = uploadMedia("prj_1", file, fraction => progress.push(fraction));
   const request = FakeRequest.last;
   expect(request).toMatchObject({ method: "POST", headers: { Authorization: "Bearer sct_secret" } });
+  expect(request.headers["X-Scarlet-Request-Id"]).toMatch(/^[a-f0-9-]{36}$/);
   expect(new URL(request.url).pathname).toBe("/api/projects/prj_1/media");
   const sent = request.body!.get("file") as File;
   expect(sent.name).toBe("A001 private take.mov");
@@ -73,14 +74,14 @@ it("sends the file to the project with the session's token and reports how far i
 it("sends no sign-in header when there is no token", () => {
   vi.spyOn(api, "token", "get").mockReturnValue(undefined);
   void uploadMedia("prj_1", file, () => {}).promise.catch(() => {});
-  expect(FakeRequest.last.headers).toEqual({});
+  expect(FakeRequest.last.headers).toEqual({ "X-Scarlet-Request-Id": expect.stringMatching(/^[a-f0-9-]{36}$/) });
 });
 
 it("fails with the engine's reason when it refuses the file, and logs it as a warning", async () => {
   const { promise } = uploadMedia("prj_1", file, () => {});
   FakeRequest.last.answer(415, { error: { code: "unsupported", message: "This file is not video, audio or a picture." } });
   await expect(promise).rejects.toThrow("This file is not video, audio or a picture.");
-  expect(lines).toEqual(['[api] failed method=POST path=/api/projects/prj_1/media status=415 reason="This file is not video, audio or a picture." ms=N']);
+  expect(lines).toEqual(['[api] failed method=POST path=/api/projects/prj_1/media status=415 code=unsupported ms=N']);
   expect(levels).toEqual(["warn"]);
 });
 
@@ -95,7 +96,7 @@ it("fails with the status when the answer has no reason, no footage, or isn't re
   expect(lines).toEqual([
     "[api] failed method=POST path=/api/projects/prj_1/media status=500 ms=N",
     "[api] failed method=POST path=/api/projects/prj_1/media status=200 ms=N",
-    '[api] failed method=POST path=/api/projects/prj_1/media status=502 reason="unreadable answer" ms=N',
+    '[api] invalid-body method=POST path=/api/projects/prj_1/media status=502 ms=N',
   ]);
 });
 

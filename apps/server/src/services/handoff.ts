@@ -2,7 +2,8 @@
  * The folder an editor takes to DaVinci Resolve, Final Cut Pro or Premiere Pro: timeline files, the captions, a Read me
  * and a copy of the footage. The engine says what goes in it; the desktop app writes it where the editor chose.
  */
-import { mkdir, rename, stat, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { extname, isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
@@ -66,7 +67,11 @@ export async function buildHandoff(ctx: Ctx, project: Project, timeline: Timelin
   if (!isAbsolute(folder)) throw badRequest("handoff_folder", "Choose where to save the folder.");
   const base = safeFileName(folder.split(/[\\/]/).filter(Boolean).pop() || project.name).trim() || "Scarlet";
   const assets = usedMedia(project, timeline);
-  const names = handoffFileNames(assets.map(a => extname(a.name) ? a.name : `${a.name}${extname(a.path)}`));
+  const colors = [...new Set(timeline.tracks.flatMap(track => track.clips.flatMap(clip => clip.kind === "color" && parseColor(clip.color) ? [clip.color] : [])))];
+  const names = handoffFileNames([
+    ...assets.map(a => extname(a.name) ? a.name : `${a.name}${extname(a.path)}`),
+    ...colors.map(color => `Solid ${color.replace(/^#/, "")}.png`),
+  ]);
   const mediaUrl = (name: string) => pathToFileURL(join(folder, "Media", name)).href;
   const files: HandoffFile[] = [];
   const sources = new Map<string, HandoffSource>();
@@ -95,23 +100,24 @@ export async function buildHandoff(ctx: Ctx, project: Project, timeline: Timelin
   // Solid colour clips become stills of their colour.
   const colorStills = new Map<string, HandoffSource>();
   const { width, height } = project.settings;
-  for (const track of timeline.tracks) {
-    for (const clip of track.clips) {
-      if (clip.kind !== "color" || colorStills.has(clip.color)) continue;
-      if (!parseColor(clip.color)) continue;
-      const name = safeFileName(`Solid ${clip.color.replace(/^#/, "")}.png`);
-      colorStills.set(clip.color, { url: mediaUrl(name), fileName: name, hasVideo: true, hasAudio: false, width, height, duration: 0, still: true });
-      // Kept in the library's temporary folder, where the desktop app copies from; the same colour and size reuse it.
-      const still = join(ctx.paths.tmp, "handoff", `${Buffer.from(`${clip.color}:${width}x${height}`).toString("hex")}.png`);
-      const size = await stat(still).then(s => s.size, async () => {
-        await mkdir(join(ctx.paths.tmp, "handoff"), { recursive: true });
-        const png = await solidPng(clip.color, width, height, signal);
-        await writeFile(`${still}.part`, png);
-        await rename(`${still}.part`, still);
-        return png.length;
-      });
-      files.push({ path: `Media/${name}`, source: still, size });
-    }
+  for (const [i, color] of colors.entries()) {
+    const name = names[assets.length + i]!;
+    colorStills.set(color, { url: mediaUrl(name), fileName: name, hasVideo: true, hasAudio: false, width, height, duration: 0, still: true });
+    // Kept in the library's temporary folder, where the desktop app copies from; the same colour and size reuse it.
+    const still = join(ctx.paths.tmp, "handoff", `${Buffer.from(`${color}:${width}x${height}`).toString("hex")}.png`);
+    const size = await stat(still).then(s => s.size, async () => {
+      await mkdir(join(ctx.paths.tmp, "handoff"), { recursive: true });
+      const png = await solidPng(color, width, height, signal);
+      const staged = `${still}.${randomUUID()}.part`;
+      try {
+        await writeFile(staged, png);
+        await rename(staged, still);
+      } finally {
+        await rm(staged, { force: true });
+      }
+      return png.length;
+    });
+    files.push({ path: `Media/${name}`, source: still, size });
   }
 
   const fcpxml = `${base}.fcpxml`, otio = `${base}.otio`;
@@ -119,12 +125,11 @@ export async function buildHandoff(ctx: Ctx, project: Project, timeline: Timelin
     { path: fcpxml, text: toFcpxml(project, timeline, sources, { colorStills }) },
     { path: otio, text: JSON.stringify(toOtio(project, timeline, { sources }), null, 2) },
   );
-  const captionFiles: string[] = [];
   const captions = captionTracks(timeline);
-  for (const { track, cues } of captions) {
-    const name = captions.length > 1 ? `${base} captions (${safeFileName(track.name)}).srt` : `${base} captions.srt`;
-    captionFiles.push(name);
-    files.push({ path: name, text: toSrt(cues) });
+  const captionFiles = handoffFileNames(captions.map(({ track }) =>
+    captions.length > 1 ? `${base} captions (${safeFileName(track.name)}).srt` : `${base} captions.srt`));
+  for (const [i, { cues }] of captions.entries()) {
+    files.push({ path: captionFiles[i]!, text: toSrt(cues) });
   }
   files.push({ path: "Read me.txt", text: handoffReadMe({
     projectName: project.name, timelineFiles: { fcpxml, otio }, captionFiles,

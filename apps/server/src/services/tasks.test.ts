@@ -1,13 +1,15 @@
 import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import os, { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { createProject, type Project } from "@scarlet/timeline";
-import { ATTEMPT_HEADER, TASK_HEADER, taskPlan, type Task, type TaskEvent, type TaskPrompt, type WsEvent } from "@scarlet/shared";
+import { createProject, type Change, type Project } from "@scarlet/timeline";
+import { ATTEMPT_HEADER, TASK_HEADER, queueOrder, queueWait, taskPlan, type Task, type TaskEvent, type TaskPrompt, type WsEvent } from "@scarlet/shared";
 import { createApp, type ScarletApp } from "../app.js";
 import { accessToken } from "../auth.js";
 import { PLAN_STEPS } from "@scarlet/mcp/prompt";
-import { createTask, pairQuestionsAndAnswers } from "./tasks.js";
+import { appendTaskEvent, createTask, pairQuestionsAndAnswers, queueRepeatCheck } from "./tasks.js";
+import { recoverTasks } from "./taskRecovery.js";
+import { runAttemptIds } from "./runAttempts.js";
 import { learningCheckContext } from "./learnings.js";
 
 let dataDir: string;
@@ -29,6 +31,21 @@ async function api<T>(method: string, path: string, body?: unknown): Promise<{ s
   if (body !== undefined) headers.set("Content-Type", "application/json");
   const res = await app.app.request("/api" + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
   return { status: res.status, body: await res.json() as T };
+}
+
+async function readQueue() {
+  const path = `/projects/${project.id}`;
+  const [tasks, changes] = await Promise.all([api<{ tasks: Task[] }>("GET", `${path}/tasks`), api<{ changes: Change[] }>("GET", `${path}/changes`)]);
+  expect(tasks.status).toBe(200);
+  expect(changes.status).toBe(200);
+  return {
+    order: queueOrder(tasks.body.tasks, changes.body.changes).map(task => task.id),
+    wait(id: string) {
+      const task = tasks.body.tasks.find(t => t.id === id);
+      if (!task) throw new Error(`Task ${id} missing from the project snapshot`);
+      return queueWait(task, tasks.body.tasks, changes.body.changes);
+    },
+  };
 }
 
 async function claimed(agent = "claude", instruction = "Tighten the intro", context?: Record<string, unknown>): Promise<Task> {
@@ -291,6 +308,65 @@ it("logs a run starting, asking and being answered, without what was asked or an
   expect(said()).toEqual([`[task] ${eager.id} claimed → waiting_for_user: asked the editor a question`]);
 });
 
+it("persists active time across questions, queue waits, and a repeat check", async () => {
+  const start = Date.parse("2026-11-05T10:00:00.000Z");
+  const at = (seconds: number) => vi.setSystemTime(start + seconds * 1000);
+  vi.useFakeTimers({ toFake: ["Date"], now: start });
+  try {
+    const task = await claimed();
+    const read = async () => (await api<{ task: Task }>("GET", `/tasks/${task.id}?events=conversation`)).body.task;
+    const claim = async () => (await api<{ task: Task }>("POST", `/hosts/${task.hostId}/claim`, { taskId: task.id })).body.task;
+    expect(task.workedMs).toBe(0);
+    at(30);
+    await api("POST", `/tasks/${task.id}/question`, { startedAt: task.startedAt, text: "Which take?" });
+    expect(await read()).toMatchObject({ state: "waiting_for_user", workedMs: 30_000 });
+    at(90);
+    await api("POST", `/tasks/${task.id}/answer`, { text: "The second take" });
+    expect(await read()).toMatchObject({ state: "queued", workedMs: 30_000 });
+    at(150);
+    const resumed = await claim();
+    expect(resumed).toMatchObject({ state: "claimed", workedMs: 30_000, startedAt: new Date().toISOString() });
+    at(180);
+    queueRepeatCheck(app.ctx, resumed, "ver_checked");
+    expect(await read()).toMatchObject({ state: "queued", workedMs: 60_000 });
+    at(240);
+    const last = await claim();
+    at(285);
+    await api("POST", `/tasks/${task.id}/complete`, { state: "done", ifStartedAt: last.startedAt });
+    const finished = await read();
+    expect(finished).toMatchObject({ state: "done", workedMs: 105_000 });
+    at(350);
+    expect(queueRepeatCheck(app.ctx, finished, "ver_later")).toMatchObject({ state: "queued", workedMs: 105_000 });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("uses the last observed work for a lost worker and starts a separate resumed attempt", async () => {
+  const start = Date.parse("2026-11-05T10:00:00.000Z");
+  const uptime = vi.spyOn(os, "uptime").mockReturnValue(3600);
+  vi.useFakeTimers({ toFake: ["Date"], now: start });
+  try {
+    const task = await claimed();
+    const ctx = app.ctx;
+    vi.setSystemTime(start + 45_000);
+    ctx.db.prepare("UPDATE tasks SET worker_pid = ?, worker_seen_at = ? WHERE id = ?")
+      .run(2_000_000_000, new Date().toISOString(), task.id);
+    vi.setSystemTime(start + 60_000);
+    appendTaskEvent(ctx, task, { type: "log", text: "Reading transcript" });
+    vi.setSystemTime(start + 300_000);
+    recoverTasks(ctx, true);
+    const stopped = ctx.repos.tasks.get(task.id)!;
+    expect(stopped).toMatchObject({ state: "failed", workedMs: 60_000, finishedAt: new Date().toISOString() });
+    const resumed = ctx.repos.tasks.get(stopped.retryTaskId!);
+    expect(resumed).toMatchObject({ state: "queued", resumeRootId: task.id });
+    expect(resumed?.workedMs).toBeUndefined();
+  } finally {
+    vi.useRealTimers();
+    uptime.mockRestore();
+  }
+});
+
 it("still hands over the prompt for a revision whose edit can no longer be laid out, and logs what is missing", async () => {
   const { body: { change } } = await api<{ change: { id: string; toVersion: string } }>("POST", `/projects/${project.id}/changes`,
     { description: "Add label", ops: [{ op: "addMarker", marker: { id: "marker", time: 0, text: "Start" } }] });
@@ -506,7 +582,8 @@ it("finds a run's attempts among its own project's tasks, not by reading every p
   await save(resumed, "again");
   expect((await api<{ task: Task }>("POST", `/tasks/${resumed.id}/complete`, { state: "done", ifStartedAt: resumed.startedAt })).body.task.state).toBe("done");
   // The staged-call check on each save, putting away a stale save, and the resumed run's earlier passes on finishing.
-  const lookups = [...new Set(prepare.mock.calls.map(([sql]) => sql))].filter(sql => sql.includes("SELECT id FROM tasks WHERE"));
+  const attempts = runAttemptIds(project.id, run.id).sql;
+  const lookups = [...new Set(prepare.mock.calls.map(([sql]) => sql))].filter(sql => sql.includes(attempts));
   expect(lookups).toHaveLength(3);
   const scans = lookups.filter(sql => (app.ctx.db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all() as { detail: string }[])
     .some(({ detail }) => /^SCAN tasks\b/.test(detail)));
@@ -533,6 +610,10 @@ it("starts requests about different cuts or edits together, and every other requ
 
   // Two agents start at once on two edits. The second request about the first edit waits for the first.
   expect(await claim()).toBe(first.id);
+  const whileFirst = await readQueue();
+  expect(whileFirst.wait(same.id)).toMatchObject({ kind: "run", task: { id: first.id } });
+  expect(whileFirst.wait(other.id)).toBeUndefined();
+  expect(whileFirst.order[0]).toBe(other.id);
   expect(await claim()).toBe(other.id);
   expect(await claim()).toBeNull();
   // A question about one edit holds only what is about that edit.
@@ -543,14 +624,89 @@ it("starts requests about different cuts or edits together, and every other requ
   // A request about the whole video runs alone: it waits for both, and the revision asked after it waits for it.
   expect(await claim()).toBeNull();
   await finish(same.id);
+  expect((await readQueue()).wait(whole.id)).toMatchObject({ kind: "question", task: { id: other.id } });
   expect(await claim()).toBeNull();
   await api("POST", `/tasks/${other.id}/answer`, { text: "Yes" });
+  const answered = await readQueue();
+  expect(answered.wait(other.id)).toBeUndefined();
+  expect(answered.wait(whole.id)).toEqual({ kind: "ahead", count: 1 });
   expect(await claim()).toBe(other.id);
   await finish(other.id);
   expect(await claim()).toBe(whole.id);
   expect(await claim()).toBeNull();
   await finish(whole.id);
   expect(await claim()).toBe(late.id);
+});
+
+it("keeps a legacy queued request's original place after it asks a question", async () => {
+  const send = async (instruction: string) =>
+    (await api<{ task: Task }>("POST", `/projects/${project.id}/tasks`, { kind: "edit", agent: "codex", instruction })).body.task;
+  const first = await send("Trim the intro");
+  const second = await send("Add a title");
+  const createdAt = new Date(Date.parse(second.createdAt!) - 60_000).toISOString();
+  app.ctx.db.prepare("UPDATE tasks SET json = json_remove(json, '$.createdAt'), created_at = ? WHERE id = ?").run(createdAt, first.id);
+  const { body: { host } } = await api<{ host: { id: string } }>("POST", "/hosts/register", { name: "test", platform: "test", agents: [{ id: "codex", installed: true }] });
+  const claim = async () => {
+    for (;;) {
+      const { body: { task } } = await api<{ task: Task | null }>("POST", `/hosts/${host.id}/claim`, {});
+      if (task?.kind !== "learning_check") return task;
+    }
+  };
+
+  expect((await readQueue()).order).toEqual([first.id, second.id]);
+  const log = vi.spyOn(app.ctx, "log");
+  const original = await claim();
+  expect(original).toMatchObject({ id: first.id, createdAt });
+  // The time it waited is counted from the row's own time, since the saved request has none.
+  expect(log.mock.calls.map(([line]) => line)).toContainEqual(expect.stringMatching(new RegExp(`^\\[task\\] ${first.id} claimed by .* after \\d`)));
+  const question = await api<{ waiting: boolean }>("POST", `/tasks/${first.id}/question`, { startedAt: original!.startedAt, text: "Keep the first line?" });
+  expect(question.body.waiting).toBe(true);
+  expect((await readQueue()).wait(second.id)).toMatchObject({ kind: "question", task: { id: first.id } });
+  expect(await claim()).toBeNull();
+
+  const answer = await api<{ task: Task }>("POST", `/tasks/${first.id}/answer`, { text: "Yes" });
+  expect(answer.body.task).toMatchObject({ id: first.id, state: "queued", createdAt });
+  expect((await readQueue()).order).toEqual([first.id, second.id]);
+  expect(await claim()).toMatchObject({ id: first.id, createdAt });
+});
+
+it("reads only what the queue needs of a pass waiting on the editor, and only for a host that can run the request", async () => {
+  const send = async (instruction: string, extra: Record<string, unknown> = {}) =>
+    (await api<{ task: Task }>("POST", `/projects/${project.id}/tasks`, { kind: "edit", agent: "codex", instruction, ...extra })).body.task;
+  const register = async (models: string[]) => (await api<{ host: { id: string } }>("POST", "/hosts/register",
+    { name: models.join(), platform: "test", agents: [{ id: "codex", installed: true, models }] })).body.host.id;
+  const full = await register(["full"]), small = await register(["small"]);
+  const claim = async (host: string) => {
+    for (;;) {
+      const { status, body: { task } } = await api<{ task: Task | null }>("POST", `/hosts/${host}/claim`, {});
+      expect(status).toBe(200);
+      if (task?.kind !== "learning_check") return task;
+    }
+  };
+  const pass = await send("/first-cut-dialogue", { model: "full" });
+  expect((await claim(full))?.id).toBe(pass.id);
+  await api("POST", `/tasks/${pass.id}/complete`, { state: "done" });
+  const zoom = await send("Zoom in on the demo", { model: "full" });
+  const reply = await send("Keep the second take", { model: "full", context: { threadId: pass.id } });
+  // The pass's hundreds of staged cuts wait on the editor. The queue counts them in SQL: the document is never read
+  // whole, so even one the schema wouldn't accept holds the queue as it should.
+  const cutReasons = Array.from({ length: 400 }, (_, i) => ({ start: i, end: i + 0.5, reason: "retake" }));
+  app.ctx.db.prepare("INSERT INTO changes (id, project_id, state, json, created_at) VALUES (?, ?, 'ready', ?, ?)").run("chg_pass", project.id,
+    JSON.stringify({ id: "chg_pass", projectId: project.id, state: "ready", intent: "suggestion", taskId: pass.id, threadId: pass.id, cutReasons }),
+    new Date().toISOString());
+  const select = vi.spyOn(app.ctx.repos.changes, "select"), parse = vi.spyOn(app.ctx.repos.changes, "parse");
+  const queue = vi.spyOn(app.ctx.repos.tasks, "queue");
+
+  // A host without the model the requests ask for never reads the project's queue.
+  expect(await claim(small)).toBeNull();
+  expect(queue).not.toHaveBeenCalled();
+  // The pass holds the zoom; the reply about the pass goes ahead of it.
+  expect((await claim(full))?.id).toBe(reply.id);
+  expect(queue).toHaveBeenCalled();
+  expect(await claim(full)).toBeNull();
+  expect(app.ctx.repos.tasks.get(zoom.id)?.state).toBe("queued");
+  expect(select).not.toHaveBeenCalled();
+  expect(parse).not.toHaveBeenCalled();
 });
 
 it("knows an applied edit by where it was made, from whichever thread or version a request names it", async () => {
@@ -577,6 +733,10 @@ it("knows an applied edit by where it was made, from whichever thread or version
   // The first edit of another change in the same thread is another edit, and runs beside it.
   const other = await send("Shorten the wrap", { threadId: "tsk_zoom", changeId: "chg_B", editIndex: 0 });
   expect(await claim()).toBe(own.id);
+  const waiting = await readQueue();
+  expect(waiting.wait(flagged.id)).toMatchObject({ kind: "run", task: { id: own.id } });
+  expect(waiting.wait(revised.id)).toMatchObject({ kind: "run", task: { id: own.id } });
+  expect(waiting.wait(other.id)).toBeUndefined();
   expect(await claim()).toBe(other.id);
   expect(await claim()).toBeNull();
   await api("POST", `/tasks/${own.id}/complete`, { state: "done" });

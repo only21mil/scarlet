@@ -34,11 +34,11 @@ export function UpdateSettings() {
       setChecking(false);
     }
   }
-  return <div className="mt-4 flex flex-wrap items-center gap-3">
-    <button type="button" className="btn-quiet" disabled={checking} onClick={check}>Check for updates</button>
-    <span role="status" className="text-sm text-muted">{message}</span>
-    {update && <button type="button" className="btn-quiet" onClick={() => {
+  return <div className="about-updates">
+    <button type="button" className="btn-primary" disabled={checking} onClick={check}>Check for updates</button>
+    {update && <button type="button" className="btn-ghost" onClick={() => {
       void desktop.openUrl(update.url).catch(() => setMessage("Couldn’t open the download page. Try again."));
     }}>Download update</button>}
+    <span role="status">{message}</span>
   </div>;
 }

@@ -4,11 +4,13 @@ import { api } from "../../lib/client";
 
 /** Names one read of a request's edits on one working cut. Reads under the same name share one request. */
 export function threadEditKey(projectId: string, head: string | null, thread?: Thread) {
-  return JSON.stringify([projectId, head, thread?.id, thread?.changes.map(c => [c.id, c.state, c.appliedVersion, c.toVersion])]);
+  // A review flag can change the edit list without changing the working cut or saving a new version.
+  const changeKey = (change: Thread["changes"][number]) => [change.id, change.state, change.appliedVersion, change.toVersion, change.flags];
+  return JSON.stringify([projectId, head, thread?.id, thread?.changes.map(changeKey), thread?.flagged?.map(changeKey)]);
 }
 
 export function useThreadEditKey(projectId: string, head: string | null, thread?: Thread) {
-  return useMemo(() => threadEditKey(projectId, head, thread), [projectId, head, thread?.id, thread?.changes]); // eslint-disable-line react-hooks/exhaustive-deps
+  return useMemo(() => threadEditKey(projectId, head, thread), [projectId, head, thread?.id, thread?.changes, thread?.flagged]); // eslint-disable-line react-hooks/exhaustive-deps
 }
 
 const pending = new Map<string, ReturnType<typeof api.threadEdits>>();

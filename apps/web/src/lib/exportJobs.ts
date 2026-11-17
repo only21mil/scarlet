@@ -97,6 +97,8 @@ async function run(projectId: string, file: ExportFile, context: string, version
   let ticket: number | null = resumed?.export?.ticket ?? null;
   const wait = new AbortController();
   let cancelled = false;
+  let keepPending = false;
+  let unrecorded = false;
   const owner = resumed?.export?.owner ?? crypto.randomUUID();
   let ownedId = resumed?.id;
   let job: ExportJob = { file, context, version, projectSettings: resumed?.projectSettings ?? project?.project.settings,
@@ -110,6 +112,7 @@ async function run(projectId: string, file: ExportFile, context: string, version
     useExports.setState(s => {
       if (s.jobs[projectId] !== job) return s;
       if (outcome) return { jobs: { ...s.jobs, [projectId]: outcome } };
+      if (prior?.phase === "done") return { jobs: { ...s.jobs, [projectId]: prior } };
       const jobs = { ...s.jobs };
       delete jobs[projectId];
       return { jobs };
@@ -214,10 +217,17 @@ async function run(projectId: string, file: ExportFile, context: string, version
     ticket = null;
     result = { phase: "done", path: saved, context: job.context };
   } catch (err) {
+    const message = errorMessage(err);
+    // Another window is saving the file: it resumed this export, whichever window started it, and it settles it.
+    keepPending = message === "Export is already saving in another Scarlet window.";
+    if (keepPending) return;
+    // The app couldn't read its record of where exports go. The failure is shown, so the export is let go even if
+    // the engine can't hear: a later launch must never save it over whatever the editor has put there since.
+    unrecorded = message === "Export destinations could not be saved or read.";
     // A resumed export whose destination is gone was already saved or discarded before the restart.
-    const settled = resumed && errorMessage(err) === "Export destination expired";
+    const settled = resumed && message === "Export destination expired";
     if (!cancelled && !settled) {
-      result = { phase: "failed", error: errorMessage(err), file, context: job.context };
+      result = { phase: "failed", error: message, file, context: job.context };
       // Where it stopped and why. Never the file's name or where it was going (the editor typed those), nor the
       // folder, which a failure can name by another file in it, nor the address the file was read from.
       const cut = path ? Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\")) : -1;
@@ -231,7 +241,9 @@ async function run(projectId: string, file: ExportFile, context: string, version
     finish(result);
     if (result?.phase === "done" && file.format === "mp4") useUiStore.getState().offerExportStar();
     // Tell the engine the export is settled. If it can't hear, leave the destination for the next launch to finish.
-    const released = !ownedId || cancelled || await api.releaseRender(ownedId, owner).then(() => true, () => false);
-    if (released) await discard();
+    if (!keepPending) {
+      const released = !ownedId || cancelled || await api.releaseRender(ownedId, owner).then(() => true, () => false);
+      if (released || unrecorded) await discard();
+    }
   }
 }

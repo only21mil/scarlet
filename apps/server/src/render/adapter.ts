@@ -76,8 +76,10 @@ export interface RenderAdapter {
   hashFile(path: string, onBytesRead?: (bytes: number) => void, signal?: AbortSignal): Promise<string>;
   extractWaveformFull(path: string, duration: number, pointsPerSecond: number, onProgress?: (fraction: number) => void, signal?: AbortSignal): Promise<BinaryWaveformCache | WaveformData>;
   waveformFromCache(cache: WaveformCache, from: number, to: number, points: number): WaveformData;
-  extractFrame(path: string, t: number, opts: { width: number; signal?: AbortSignal; indexedMp4?: boolean; decoder?: "cuda" }): Promise<Buffer>;
-  makeProxy(input: string, output: string, opts: { height: number; checkpointDir?: string; range?: TimeRange; hwaccel?: RenderOptions["hwaccel"]; signal?: AbortSignal; onProgress?: (p: number) => void }): Promise<void>;
+  extractFrame(path: string, t: number, opts: { width: number; signal?: AbortSignal; indexedMp4?: boolean; decoder?: "cuda";
+    /** Only this area of the picture, as fractions of it, and labelled percent lines over it. */
+    area?: [number, number, number, number]; grid?: { width: number; height: number } }): Promise<Buffer>;
+  makeProxy(input: string, output: string, opts: { height: number; checkpointDir?: string; range?: TimeRange; hwaccel?: RenderOptions["hwaccel"]; signal?: AbortSignal; onProgress?: (p: number) => void; onFallback?: (stage: "decode" | "encode") => void }): Promise<void>;
   /** True when footage proxies can be encoded on the GPU. The fallback adapter never can. */
   hardwareProxies?(hwaccel: RenderOptions["hwaccel"]): Promise<boolean>;
   renderRange(project: Project, timeline: Timeline, range: TimeRange, outputPath: string, opts: RenderOptions): Promise<void>;

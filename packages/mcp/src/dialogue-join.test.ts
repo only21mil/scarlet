@@ -21,6 +21,33 @@ function fixture() {
 }
 
 describe("native retake boundaries", () => {
+  it("moves an edge in running speech onto the trough the recording shows between the words, wherever their timings say", () => {
+    // “this game let me throw them”, said in one breath, then a pause and “next”. The transcript ends “game” at 1.56 s,
+    // but the level between “game” and “let” falls at 1.49–1.52 s.
+    const said = [{ start: 1, end: 1.3, text: "this" }, { start: 1.3, end: 1.56, text: "game" }, { start: 1.56, end: 1.7, text: "let" },
+      { start: 1.7, end: 1.8, text: "me" }, { start: 1.8, end: 2.1, text: "throw" }, { start: 2.1, end: 2.4, text: "them" }, { start: 3.6, end: 3.9, text: "next" }];
+    const talk = [{ start: 1, end: 2.4 }, { start: 3.6, end: 3.9 }];
+    const at = (trough: number): JoinPage => {
+      const rms = Array.from({ length: 500 }, (_, i) => i >= 149 && i <= 151 ? trough : talk.some(v => v.start <= i/100 && i/100 < v.end) ? .12 : .001);
+      return { mediaId: "mic", start: 0, end: 5, edges: joinEvidence(said, { from: 0, to: 5, peaks: rms, rms, speechActivity: talk }) };
+    };
+    const { p, tl } = fixture();
+    // Cutting “let me throw them” and the pause, from just inside “let”.
+    const placed = checkDialogueJoin(tl, p, { start: 1.57, end: 3.5 }, [at(.003)]);
+    expect(placed).toMatchObject({ status: "snapped", start: 1.5, end: 3.5 });
+    expect(placed.reason).toContain("start moved 0.07 s earlier onto the trough between the words in the recording (-50 dBFS");
+    // A trough no lower than a sibilant's hiss is nowhere to cut.
+    expect(checkDialogueJoin(tl, p, { start: 1.57, end: 3.5 }, [at(.005)]).status).toBe("review");
+    // The trough is where the sound parts, not a licence to change which words go: an edge asked for after “let”
+    // (1.7 s) has that trough a fifth of a second back, across the whole word, and stays where it was asked.
+    expect(checkDialogueJoin(tl, p, { start: 1.7, end: 3.5 }, [at(.003)])).toMatchObject({ status: "review", start: 1.7 });
+    // A word reference reads the edge from the words' timings, which reach only a little way into the kept “game”: it
+    // sees the trough's wall, not its floor, and leaves the edge to the check above rather than saving it there.
+    const page = at(.003);
+    const cut = wordCutRange(said, 2, 5, () => page.edges);
+    expect(cut.dips).toEqual([]);
+    expect(cut.problems.join(" ")).toContain("No measured silence between “game” and “let”");
+  });
   it("only moves inward, past complete edge words, onto project frames in quiet audio", () => {
     const { p, tl } = fixture();
     const fixed = checkDialogueJoin(tl,p,{start:1.15,end:3.6},[page]);

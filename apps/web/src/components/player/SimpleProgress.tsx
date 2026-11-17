@@ -10,7 +10,7 @@ export interface ProgressFocus {
    * Removed footage is hatched red (the default). `kept`: the footage stays in the edit (a sound fix, a zoom, a title), so After
    * plays it and it’s only outlined. `added`: footage an edit put back.
    */
-  tone?: "kept" | "added";
+  tone?: "kept" | "added" | "check";
 }
 
 /** Above this share of the video a band says nothing about where the change is, so the line stays whole. */

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os, { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it, vi, onTestFinished } from "vitest";
@@ -100,6 +100,26 @@ it.each(["pause", "quit"])("keeps a video that was waiting to cache through a %s
   expect(engine.app().ctx.db.prepare("SELECT media_id FROM source_cache_requests").all()).toEqual([]);
 }));
 
+it.each(["requested", "queued"])("continues a %s cache when media processing resumes before its encoder stops", how => withVideos({}, {}, async engine => {
+  const finishAbort = Promise.withResolvers<void>();
+  engine.encode.mockImplementationOnce((_, _file, { signal }) => new Promise((_, reject) => {
+    signal!.addEventListener("abort", () => void finishAbort.promise.then(() => reject(signal!.reason)), { once: true });
+  }));
+  if (how === "requested") await engine.api("POST", "/media/first/playback-cache");
+  else prepareSourceProxies(engine.app().ctx, ["first", "second"], true);
+  try {
+    await vi.waitFor(() => expect(engine.encode).toHaveBeenCalledTimes(1));
+    await engine.api("PATCH", `/projects/${engine.projectId}`, { mediaPaused: true });
+    await engine.api("PATCH", `/projects/${engine.projectId}`, { mediaPaused: false });
+    expect(engine.encode).toHaveBeenCalledTimes(1);
+  } finally {
+    engine.finish();
+    finishAbort.resolve();
+  }
+  await engine.settle();
+  expect(await engine.states()).toEqual({ first: "ready", second: how === "queued" ? "ready" : "uncached" });
+}));
+
 // Only macOS is asked when a process began: elsewhere a cache stays with whatever process has its engine's id.
 it.runIf(process.platform === "darwin")("caches a video a killed engine was caching once another program has its process id", () => withVideos({}, {}, async engine => {
   // The computer has been up for days: the engine's note is from since it started, so only `ps` can say it is gone.
@@ -120,6 +140,25 @@ it.runIf(process.platform === "darwin")("caches a video a killed engine was cach
     expect(await engine.states()).toEqual({ first: "ready", second: "uncached" });
     expect(ctx.db.prepare("SELECT media_id FROM source_cache_requests").all()).toEqual([]);
   } finally { program.kill(); }
+}));
+
+it("empties Trash during an active playback cache in another project", () => withVideos({}, {}, async engine => {
+  const { ctx } = engine.app();
+  const trashed = ctx.repos.projects.insert(createProject("Unused project"));
+  ctx.paths.ensureProject(trashed.id);
+  ctx.repos.projects.putMedia(trashed.id, {
+    id: "unused", name: "Unused", path: "unused.mov", kind: "video", duration: 90, previewMode: "on-demand",
+  }, "ready");
+  writeFileSync(join(ctx.paths.media(trashed.id), "unused.mov"), "unused recording");
+  prepareSourceProxies(ctx, ["first", "unused"], true);
+  await vi.waitFor(() => expect(engine.encode).toHaveBeenCalledTimes(1));
+  expect(ctx.db.prepare("SELECT worker_pid FROM source_cache_requests WHERE media_id = ?").get("unused")).toMatchObject({ worker_pid: null });
+
+  await engine.api("DELETE", `/projects/${trashed.id}`);
+  const projects = ctx.repos.projects.listDeleted().map(({ id, deletedAt }) => ({ id, deletedAt }));
+  expect((await engine.api("POST", "/storage/cleanup", { kind: "trash", projects })).status).toBe(200);
+  expect(existsSync(ctx.paths.project(trashed.id))).toBe(false);
+  expect((await engine.states()).first).toBe("caching");
 }));
 
 it("writes down a cache nobody asked for only where the GPU can make it, and never a file it can't cache", async () => {
@@ -151,7 +190,12 @@ it("says which video couldn't be cached and why, and shows it as failed", () => 
   engine.app().ctx.log = line => lines.push(line);
   prepareSourceProxies(engine.app().ctx, ["first"], true);
   await engine.settle();
-  expect(lines).toEqual(["[media] first couldn’t cache its source preview: Error: encoder exited with code 1"]);
+  expect(lines).toEqual([
+    "[media] proxy_queued media=unknown",
+    expect.stringContaining("[media] proxy_started media=unknown"),
+    expect.stringContaining("outcome=failed elapsed_ms="),
+    "[media] first couldn’t cache its source preview: Error: encoder exited with code 1",
+  ]);
   expect(await engine.states()).toEqual({ first: "failed", second: "uncached" });
   // Nothing is left written down for a cache that failed: it is not retried by itself.
   expect(engine.app().ctx.db.prepare("SELECT media_id FROM source_cache_requests").all()).toEqual([]);
@@ -173,7 +217,7 @@ it("logs a GPU that can't be asked about, and a video whose turn to cache couldn
     const proxies = vi.spyOn(ctx.paths, "proxies").mockImplementation(() => { throw new Error("EACCES: permission denied"); });
     prepareSourceProxies(ctx, ["first"], true);
     await engine.settle();
-    expect(lines).toEqual(["[media] first couldn’t prepare its source proxy: Error: EACCES: permission denied"]);
+    expect(lines).toEqual(["[media] proxy_queued media=unknown", "[media] first couldn’t prepare its source proxy: Error: EACCES: permission denied"]);
     proxies.mockRestore();
   });
 });

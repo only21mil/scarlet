@@ -40,8 +40,8 @@ function ExportForm({ current, hasCut, onClose }: { current: ProjectData; hasCut
   const context = fullRenderContext(project);
   const duration = useMemo(() => current.timeline ? snapToFrame(timelineDuration(current.timeline), fps) : 0, [current.timeline, fps]);
   const previous = busy?.file ?? (job?.phase === "failed" && job.context === context ? job.file : undefined);
-  // The file the last export saved, while the video is still the one it was made from.
-  const exported = job?.phase === "done" && job.context === context ? job : undefined;
+  const exported = job?.phase === "done" ? job : undefined;
+  const exportedCurrentEdit = exported?.context === context;
   // Advanced export: the folder for finishing the edit in another app. Otherwise the video.
   const [advanced, setAdvanced] = useState(previous?.format === "folder");
   const format: ExportFile["format"] = advanced ? "folder" : "mp4";
@@ -94,7 +94,7 @@ function ExportForm({ current, hasCut, onClose }: { current: ProjectData; hasCut
     const name = format === "folder" ? stem : `${stem}.${format}`;
     void exportFile(current, { format, name, video });
   };
-  const switchTo = !busy && !exported && <button type="button" className="btn-quiet mr-auto" onClick={() => setAdvanced(!advanced)}>
+  const switchTo = !busy && !exportedCurrentEdit && <button type="button" className="btn-quiet mr-auto" onClick={() => setAdvanced(!advanced)}>
     {advanced ? "Back" : "Advanced export"}
   </button>;
   return <Modal open title={advanced ? "Advanced export" : "Export"} width={600} onClose={onClose} footer={running ? <>
@@ -102,8 +102,8 @@ function ExportForm({ current, hasCut, onClose }: { current: ProjectData; hasCut
     <button type="button" className="btn-primary" onClick={onClose}>Continue editing</button>
   </> : <>
     {switchTo}
-    <button type="button" className="btn-ghost" onClick={onClose}>{busy || exported ? "Close" : "Cancel"}</button>
-    <button type="submit" form="export-working-cut" className="btn-primary" disabled={!!busy || !!invalid}>
+    <button type="button" className="btn-ghost" onClick={onClose}>{busy || exportedCurrentEdit ? "Close" : "Cancel"}</button>
+    <button type="submit" form="export-working-cut" className="btn-primary" data-log-control="export" disabled={!!busy || !!invalid}>
       {failed ? "Retry" : "Export"}
     </button>
   </>}>
@@ -143,15 +143,17 @@ function ExportForm({ current, hasCut, onClose }: { current: ProjectData; hasCut
       {busy.phase === "choosing" ? <p className="text-xs text-muted" role="status">Choose a location…</p> :
         <ActivityProgress label={`Export progress for ${busy.file.name}`} value={counting ? busy.progress : undefined}>
           {busy.phase === "saving" ? (busy.file.format === "folder" ? "Saving the folder…" : "Saving file…") : busy.waiting ? "Waiting to start" : Math.round(busy.progress * 100) >= PICTURE_DONE ? "Finishing…"
-            : `Exporting${busy.version !== project.head ? " an earlier version" : ""}${counting ? ` · ${pct(busy.progress)}` : ""}`}
+            : `Exporting${busy.context !== context ? " an earlier version" : ""}${counting ? ` · ${pct(busy.progress)}` : ""}`}
         </ActivityProgress>}
       {running && <p className="mt-2 text-xs text-muted">Your export continues in the background while you edit.</p>}
     </div>}
-    {exported && <p className="mt-3 flex items-center gap-2 text-xs" role="status"><Icon name="check" />
-      <span className="truncate" title={exported.path}>{exported.path.split(/[\\/]/).pop()}</span>
-      <button className="btn-quiet shrink-0" onClick={() => { setRevealError(""); void desktop.revealPath(exported.path).catch(e => setRevealError(errorMessage(e))); }}>Show in folder</button>
+    {exported && <p className="mt-3 flex items-center gap-2 text-xs" role="status">
+      {exportedCurrentEdit && <Icon name="check" />}
+      <span className="truncate" title={exported.path} data-log-private>{exported.path.split(/[\\/]/).pop()}</span>
+      {!exportedCurrentEdit && <span className="shrink-0 text-muted">· Earlier edit</span>}
+      <button className="btn-quiet shrink-0" data-log-control="reveal-export" onClick={() => { setRevealError(""); void desktop.revealPath(exported.path).catch(e => setRevealError(errorMessage(e))); }}>Show in folder</button>
     </p>}
-    <InlineError>{failed ? job.error : revealError}</InlineError>
+    <InlineError>{(failed || revealError) && <span data-log-private>{failed ? job.error : revealError}</span>}</InlineError>
   </Modal>;
 }
 

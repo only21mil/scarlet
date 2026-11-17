@@ -2,16 +2,17 @@
 name: matt-talking-head
 description: Edit Matt Berman’s recorded talking-head videos in Scarlet. A dialogue pass cut to his pace, acting on his notes to the editor, with camera punch-ins and any synchronized screen demo framed around what he shows.
 category: Story and pacing
-extends: dialogue-pass
 ---
 
 # Matt’s talking-head edit
 
-My style on top of the dialogue pass. A bare `/matt-talking-head` covers the current edit, including camera punch-ins and any screen demos. If I name a pass, source, selection or cut, work just on that. Keep an existing edit’s sync and composition. For separate camera, screen and mic recordings, play the dialogue mic once and carry cuts across all synchronized tracks, so my mouth, my voice and the action I describe still line up.
+My edit is a /dialogue-pass cut my way, with my screen demos framed and my camera punched in. Each part below calls the skill it builds on and says what I change. A bare `/matt-talking-head` covers the current edit, including camera punch-ins and any screen demos. If I name a pass, source, selection or cut, work just on that. Keep an existing edit’s sync and composition. For separate camera, screen and mic recordings, play the dialogue mic once and carry cuts across all synchronized tracks, so my mouth, my voice and the action I describe still line up.
 
 ## Choose the take
 
 Keep the delivery meant for the viewer. If the wording of two takes is the same but the splice changes which performance survives, keep the take I meant. Keep my genuine reactions.
+
+Keep adjacent identical words when both belong in the sentence, as in “She checked in in Boston.” If the delivery makes it unclear whether one is a stumble, bring it to me for review with the full phrase and the word you would remove.
 
 ## Notes to my editor
 
@@ -31,15 +32,17 @@ Use a two-frame audio crossfade at dialogue joins and a straight picture cut. Br
 
 ## Show the demo
 
-During a synchronized screen demo, keep my camera inset at a consistent size in the bottom right. Frame the moving recording around what I am showing. Fill the picture with the game or preview pane when I play it, the passage when I read it, or the chart and its labels when I discuss a result. Go wide enough to show both sides of a comparison or keep a tall demo intact. Keep controls I use and words I read clear of the inset.
+/frame-screen, with these changes.
 
-Follow the narration. Ease into the subject as I mention it, settling in about a second. Hold through small pointer movements. Ease back out or across when the subject changes. When the narration moves quickly between related details, one wider frame can cover them. Check frames through the move and at the reveal for the label, control or result the viewer needs to see.
+During a synchronized screen demo, my camera is an inset in the bottom right, at one size throughout. Start with the inset size you would otherwise use and scale it up by 20% in both dimensions, then crop the sides for a narrower frame. Aim for 1.5:1 (width to height), with room to go up to 2:1 if the framing needs it. Zoom in slightly more within the inset and trim a little more from the top of the frame, leaving a small margin above my head. Keep my full chest in frame throughout the demo. Round all four corners of the inset.
+
+Show the whole of what I am presenting with the rest of the page it is on: the whole watch on its web page, not a close-up of its movement. When the page is taller than the video, crop into it; cropping is fine. A move every ten seconds or so is fine while I go from one thing to the next.
 
 ## Camera punch-ins
 
-On full-screen camera footage, cut from wide to head and shoulders across a jump cut or on a line that needs emphasis. About 115–130% is a starting point when the source stays sharp. Hold for a few seconds, follow my actual face position, and keep my eyes and mouth comfortably framed. Return wide at the end of the thought. Keep the demo inset steady.
+/punch-in at every jump cut on full-screen camera footage. Place the punch-ins once the dialogue cuts are in, and again on any cut I approve later.
 
 ## When requested
 
-- **Captions.** Caption the retained speech in the project style. Correct misheard names, products and numbers. Break at spoken phrases, keeping names and units together, on one or two readable lines. Check them over the picture so the viewer can still see my face and the demo.
+- **Captions.** /add-captions in the project style.
 - **Slide B-roll.** Time each supplied slide or requested reveal to the words that introduce it. For new slide art, use one visual idea, a real screenshot, portrait, logo or headline where it helps, large type and few words. Keep the upper right open in the artwork. On a reveal, hold the setup in place and add only the new element. Put spoken detail and sourcing in the slide notes and check the rendered slide at video size.

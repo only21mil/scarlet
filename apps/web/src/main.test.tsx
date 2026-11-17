@@ -1,16 +1,17 @@
 // @vitest-environment happy-dom
 import { beforeEach, expect, it, vi } from "vitest";
 
-const { info, loadEditor, log, render } = vi.hoisted(() => ({
+const { info, loadEditor, log, render, saveEditorModel } = vi.hoisted(() => ({
   info: vi.fn(),
   loadEditor: vi.fn(),
   log: vi.fn(async () => {}),
   render: vi.fn(),
+  saveEditorModel: vi.fn(async () => {}),
 }));
 
 vi.mock("./lib/desktop", async (original) => ({
   ...await original<typeof import("./lib/desktop")>(),
-  desktop: { info, log },
+  desktop: { info, log, saveEditorModel },
 }));
 vi.mock("./App", () => { loadEditor(); return { App: () => null }; });
 vi.mock("react-dom/client", () => ({ createRoot: () => ({ render }) }));
@@ -18,6 +19,7 @@ vi.mock("react-dom/client", () => ({ createRoot: () => ({ render }) }));
 beforeEach(() => {
   vi.resetModules();
   vi.clearAllMocks();
+  localStorage.clear();
   document.body.innerHTML = '<div id="root"></div>';
   Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
 });
@@ -54,7 +56,7 @@ it("requires a successful native handshake before loading even a demo", async ()
       props: expect.objectContaining({ title: "Scarlet couldn’t start", detail: expect.stringContaining("Native bridge unavailable") }),
     })));
     expect(loadEditor).not.toHaveBeenCalled();
-    expect(log).toHaveBeenCalledWith(expect.stringContaining("startup failed: "), "error");
+    expect(log).toHaveBeenCalledWith([expect.stringContaining("startup-failed name=Error")], "error");
   } finally {
     consoleError.mockRestore();
   }
@@ -89,4 +91,30 @@ it("loads this installation's custom model lists from the native bridge", async 
   expect(log).not.toHaveBeenCalledWith(expect.anything(), "error");
   expect(useHostsStore.getState().customOpenaiModels).toEqual(["local-test"]);
   expect(useHostsStore.getState().customClaudeModels).toEqual(["claude-early-test"]);
+});
+
+it("restores the desktop model ahead of a different WebView's old pick and the engine default", async () => {
+  Object.assign(window, { __TAURI_INTERNALS__: {} });
+  localStorage.setItem("scarlet.agent", JSON.stringify({ agent: "claude", model: "opus" }));
+  const editorModel = { agent: "codex", model: "local-test", effort: "high", serviceTier: "priority" };
+  info.mockResolvedValueOnce({ platform: "macos", editorModel });
+  await import("./main");
+  await vi.waitFor(() => expect(render).toHaveBeenCalledTimes(2));
+  const { useUiStore } = await import("./stores/ui");
+  expect(useUiStore.getState().agent).toEqual(editorModel);
+  useUiStore.getState().setDefaultAgent("gemini");
+  expect(useUiStore.getState().agent).toEqual(editorModel);
+  expect(saveEditorModel).not.toHaveBeenCalled();
+});
+
+it("migrates a previous WebView pick, including its legacy speed setting", async () => {
+  Object.assign(window, { __TAURI_INTERNALS__: {} });
+  localStorage.setItem("scarlet.agent", JSON.stringify({ agent: "codex", model: "gpt-6.1-sol", effort: "high", fast: true }));
+  info.mockResolvedValueOnce({ platform: "windows", editorModel: null });
+  await import("./main");
+  await vi.waitFor(() => expect(saveEditorModel).toHaveBeenCalledExactlyOnceWith({
+    agent: "codex", model: "gpt-6.1-sol", effort: "high", serviceTier: "fast",
+  }));
+  const { useUiStore } = await import("./stores/ui");
+  expect(useUiStore.getState().agent).toMatchObject({ agent: "codex", model: "gpt-6.1-sol", serviceTier: "fast" });
 });

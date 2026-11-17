@@ -334,8 +334,10 @@ it("zooms from the timeline controls and draws no edit points, zoomed or not", a
   await click(labeled("Zoom in"));
   expect(rail()).toBeNull();
   const zoomIn = labeled("Zoom in");
-  await act(() => zoomIn.dispatchEvent(new KeyboardEvent("keydown", { key: "+", bubbles: true, cancelable: true })));
+  await act(() => zoomIn.dispatchEvent(new KeyboardEvent("keydown", { key: "]", bubbles: true, cancelable: true })));
   expect(container.querySelector(".timeline-zoom-level")?.textContent).toBe("4×");
+  await act(() => zoomIn.dispatchEvent(new KeyboardEvent("keydown", { key: "[", bubbles: true, cancelable: true })));
+  expect(container.querySelector(".timeline-zoom-level")?.textContent).toBe("2×");
   await click(labeled("Fit timeline"));
   expect(seek).not.toHaveBeenCalled();
   await act(() => trigger.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })));
@@ -359,8 +361,8 @@ it("keeps the stretch the editor zoomed to when a new working cut builds the tim
   const key = (name: string) => act(() => window.dispatchEvent(new KeyboardEvent("keydown", { key: name, bubbles: true, cancelable: true })));
   await render("ver_a", 200);
   const whole = stamps();
-  await key("+");
-  await key("+");
+  await key("]");
+  await key("]");
   // 4×: fifty seconds around the playhead.
   const zoomed = stamps();
   expect(zoomed).not.toEqual(whole);
@@ -379,8 +381,8 @@ it("keeps the stretch the editor zoomed to when a new working cut builds the tim
   await render("ver_d", 180);
   expect([stamps()[0], stamps().at(-1)]).toEqual([expect.stringMatching(/0:00$/), expect.stringMatching(/2:30$/)]);
   // A stretch the editor moved to with the playhead elsewhere stays in view too, until the playhead moves.
-  await key("+");
-  await key("+");
+  await key("]");
+  await key("]");
   const track = container.querySelector<HTMLElement>(".timeline-track")!;
   await act(() => { track.dispatchEvent(new WheelEvent("wheel", { deltaX: -800, bubbles: true, cancelable: true })); });
   const away = stamps();
@@ -472,6 +474,27 @@ it("draws crowded edits as one pill that zooms to its run on a press, and a dot 
   expect(opened).toEqual([5]);
 });
 
+it("zooms a pill when another group's circle is under the pointer too", async () => {
+  vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(1000);
+  const reduced = window.matchMedia("(prefers-reduced-motion: reduce)");
+  vi.spyOn(window, "matchMedia").mockReturnValue(Object.create(reduced, { matches: { value: true } }));
+  const openOther = vi.fn(), openCall = vi.fn(), seek = vi.fn();
+  await show(<TimelineScrubber duration={100} playhead={0} frameAt={() => undefined} onSeek={seek} marks={[
+    { time: 11.1, n: 13, title: "Edit 13", open: openOther },
+    { time: 10.25, n: 12, title: "Cut 12", group: "call", open: openCall },
+    { time: 11.75, n: 14, title: "Cut 14", group: "call", open: openCall },
+  ]} />);
+  const pill = container.querySelector<HTMLElement>(".simple-timeline-mark.is-pill")!;
+  expect([pill.textContent, pill.style.left]).toEqual(["12+", "11%"]);
+  const strip = container.querySelector<HTMLElement>(".simple-timeline-hover")!;
+  vi.spyOn(strip, "getBoundingClientRect").mockReturnValue(new DOMRect(0, 0, 1000, 24));
+  await act(() => strip.dispatchEvent(new PointerEvent("pointerdown", { pointerId: 1, isPrimary: true, button: 0, clientX: 111, bubbles: true })));
+  expect(openOther).not.toHaveBeenCalled();
+  expect(openCall).not.toHaveBeenCalled();
+  expect(seek).not.toHaveBeenCalled();
+  expect([...container.querySelectorAll(".simple-timeline-mark")].map(mark => mark.textContent)).toEqual(["12", "13", "14"]);
+});
+
 it("names what waits on the editor in one amber line under the frame", async () => {
   vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(1000);
   const dot = (time: number, n: number, waits = false) => ({ time, n, title: `Cut ${n} of 6`, open: () => {},
@@ -531,10 +554,10 @@ it("anchors wheel and pinch zoom to the pointer and defers new media samples unt
     expect(level()).toBe("3×");
     expect(parseFloat(playheadX()!)).toBeCloseTo(25);
     const key = (value: string) => act(() => window.dispatchEvent(new KeyboardEvent("keydown", { key: value, cancelable: true })));
-    await key("+");
+    await key("]");
     await act(() => vi.advanceTimersByTime(550));
     expect(level()).toBe("6×");
-    await key("-");
+    await key("[");
     await act(() => vi.advanceTimersByTime(550));
     expect(level()).toBe("3×");
     await key("0");
@@ -1126,26 +1149,39 @@ it("keeps the destination untouched if the cut changes while choosing where to e
   expect(discard).toHaveBeenCalledWith(12);
 });
 
-it("follows the video when an edit lands while Export is open, and drops the last export's line once the video has changed", async () => {
-  vi.spyOn(desktop, "chooseVideoExport").mockResolvedValue({ ticket: 8, path: "/chosen/cut.mp4" });
+it("labels a saved file from an earlier edit and still exports the current video", async () => {
+  const choose = vi.spyOn(desktop, "chooseVideoExport").mockResolvedValue({ ticket: 8, path: "/chosen/cut.mp4" });
   vi.spyOn(desktop, "discardVideoExport").mockResolvedValue();
   vi.spyOn(desktop, "finishVideoExport").mockResolvedValue("/chosen/cut.mp4");
+  const reveal = vi.spyOn(desktop, "revealPath").mockResolvedValue();
+  const earlierEdit = () => container.querySelector('[role="status"]')?.textContent?.includes("Earlier edit");
   const request = vi.spyOn(api, "requestRender").mockImplementation(async (_id, body) => ({ render: {
     ...data.renders[0]!, id: "final", version: body.version!, kind: "full", quality: "delivery", range: null, state: "done" } }));
   await show(<ExportSheet hasCut onClose={() => {}} />);
   await click(exportButton()!);
   await act(async () => { await vi.waitFor(() => expect(button("Show in folder")).toBeDefined()); });
   expect(button("Close")).toBeDefined();
-  // Scarlet applies an edit: the video is a newer version, and shorter. The saved file is the earlier video, so its
-  // line goes, and the sheet doesn't ask to be reopened.
+  expect(earlierEdit()).toBe(false);
+  // The saved file is still available if the edit changes while the sheet is open.
   const earlier = buildDb().timelines.ver_2!;
   expect(timelineDuration(earlier)).not.toBe(timelineDuration(data.timeline!));
   const edited = { ...data, project: { ...data.project, head: "ver_4" }, timeline: { ...earlier, version: "ver_4" } };
   await act(async () => useProjectStore.setState({ current: edited }));
-  expect(button("Show in folder")).toBeUndefined();
+  expect(earlierEdit()).toBe(true);
+  await click(button("Show in folder")!);
+  expect(reveal).toHaveBeenCalledWith("/chosen/cut.mp4");
   expect(button("Close")).toBeUndefined();
   expect(button("Cancel")).toBeDefined();
+  expect(button("Advanced export")).toBeDefined();
   expect(container.querySelector('[role="alert"]')?.textContent ?? "").toBe("");
+  // Cancelling the chooser leaves the last successful file available.
+  choose.mockResolvedValueOnce(null);
+  await click(exportButton()!);
+  expect(request).toHaveBeenCalledTimes(1);
+  expect(earlierEdit()).toBe(true);
+  await show(null);
+  await show(<ExportSheet hasCut onClose={() => {}} />);
+  expect(earlierEdit()).toBe(true);
   // A range picked from here starts as the whole of the video as it is now.
   await selectOption(container.querySelector<HTMLButtonElement>("#export-range")!, "Custom range");
   expect(Number(container.querySelector<HTMLInputElement>("#export-end")!.value.split(":")[1])).toBeCloseTo(timelineDuration(earlier), 1);
@@ -1155,9 +1191,13 @@ it("follows the video when an edit lands while Export is open, and drops the las
   await click(exportButton()!);
   expect(request).toHaveBeenLastCalledWith(PRJ, expect.objectContaining({ version: "ver_4" }));
   await act(async () => { await vi.waitFor(() => expect(button("Show in folder")).toBeDefined()); });
-  // Back on the version exported first, the newest export is of another video.
+  expect(earlierEdit()).toBe(false);
+  // Changes to the project settings distinguish exports even when the timeline version is the same.
+  await act(async () => useProjectStore.setState({ current: { ...edited, project: { ...edited.project, settings: { ...edited.project.settings, width: 1280 } } } }));
+  expect(earlierEdit()).toBe(true);
+  // Back on the version exported first, the newest export is still available as an earlier edit.
   await act(async () => useProjectStore.setState({ current: data }));
-  expect(button("Show in folder")).toBeUndefined();
+  expect(earlierEdit()).toBe(true);
 });
 
 it("asks for the file's name once, in the system's Save dialog, which opens on the project's name", async () => {

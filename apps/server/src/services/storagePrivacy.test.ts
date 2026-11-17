@@ -135,7 +135,7 @@ it.skipIf(process.platform === "win32")("sweeps ordinary temporary files and ski
   const working = ["recording_0123456789ab.wav", "chunk_0123456789ab.wav", "speech_0123456789ab.webm",
     "wcpp_0123456789ab.wav", "wcpp_0123456789ab.json", `${uuid}.wav`, `recording-${uuid}.wav`];
   const unrelated = ["my-recording.wav", "recording_backup.wav", "first-draft.json"];
-  working.push(`screen-text-${uuid}.rgb`, `faces-${uuid}.rgb`);
+  working.push(`review-${uuid}.jpg`, `review-${uuid}.pcm`, `screen-text-${uuid}.rgb`, `faces-${uuid}.rgb`);
   for (const name of [...working, ...unrelated]) writeFileSync(join(paths.tmp, name), "fixture");
   // What a killed engine leaves outside the temporary folder: a model's download, the joined parts of an export, a
   // full source cache's part, a screen-text or face save and a voice note's recording that never became a note.

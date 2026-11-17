@@ -6,7 +6,7 @@
 import { WsEvent } from "@scarlet/shared";
 import type { WsClientMessage } from "@scarlet/shared";
 import { api, IS_MOCK, mockClient } from "./client";
-import { appLog } from "./appLog";
+import { appLog, errorName, withoutAddresses } from "./appLog";
 import { reportImportCheck } from "./upload";
 import { useHostsStore } from "../stores/hosts";
 import { useProjectStore } from "../stores/project";
@@ -16,11 +16,17 @@ import { useUiStore } from "../stores/ui";
 let socket: WebSocket | null = null;
 let currentProjectId: string | null = null;
 let confirmedProjectId: string | null = null;
-let pendingSubscription: { id: string; done: Promise<void>; finish(): void } | undefined;
+/**
+ * A project read waiting for the engine to confirm it is listening. `sent` is false while it waits for the connection
+ * itself to open: the subscription is asked for then, and the read goes ahead once it is confirmed.
+ */
+let pendingSubscription: { id: string; done: Promise<void>; finish(): void; sent: boolean; wait(): void } | undefined;
 let attempts = 0;
 let reconnectTimer: number | null = null;
 let pingTimer: number | null = null;
 let stopped = true;
+/** `WebSocket.CONNECTING`, which a stand-in socket may leave out. */
+const CONNECTING = 0;
 /** Failed tries, about fifteen seconds of them, before the window says it is offline instead of reconnecting. */
 const OFFLINE_AFTER = 5;
 /**
@@ -87,24 +93,36 @@ export function subscribeProject(projectId: string) {
     confirmedProjectId = null;
   }
   currentProjectId = projectId;
-  if (!socket || socket.readyState !== WebSocket.OPEN || confirmedProjectId === projectId) return;
-  if (pendingSubscription?.id !== projectId) appLog("realtime", "subscribe", { project: projectId });
+  // A connection still opening is waited for too: a read made before it opens would be made again once it does, as
+  // it could miss what the engine did in between.
+  const opening = !!socket && socket.readyState === CONNECTING;
+  if (!socket || (!opening && socket.readyState !== WebSocket.OPEN) || confirmedProjectId === projectId) return;
   if (pendingSubscription?.id === projectId) return pendingSubscription.done;
   let release!: () => void;
   const done = new Promise<void>(resolve => { release = resolve; });
+  let timer: number | undefined;
   // A replacement or older engine can go away before confirming the subscription.
   const finish = () => {
     window.clearTimeout(timer);
     pendingSubscription = undefined;
     release();
   };
-  const timer = window.setTimeout(() => {
-    // The project is read anyway. Until the engine confirms, nothing it does there reaches the window.
-    appLog("realtime", "subscribe-unconfirmed", { project: projectId }, { level: "warn" });
-    finish();
-  }, 1000);
-  pendingSubscription = { id: projectId, done, finish };
-  send({ type: "subscribe", projectId });
+  // A second for the engine to confirm, from when the subscription is asked for. The project is read anyway after it.
+  // Until the engine confirms, nothing it does there reaches the window.
+  const wait = () => {
+    window.clearTimeout(timer);
+    timer = window.setTimeout(() => {
+      if (pending.sent) appLog("realtime", "subscribe-unconfirmed", { project: projectId }, { level: "warn" });
+      finish();
+    }, 1000);
+  };
+  const pending = { id: projectId, done, finish, sent: !opening, wait };
+  pendingSubscription = pending;
+  wait();
+  if (!opening) {
+    appLog("realtime", "subscribe", { project: projectId });
+    send({ type: "subscribe", projectId });
+  }
   return done;
 }
 
@@ -114,7 +132,9 @@ function connect() {
   let ws: WebSocket;
   try {
     ws = new WebSocket(api.wsUrl());
-  } catch {
+  } catch (error) {
+    appLog("realtime", "connect-failed", { attempt: attempts + 1, project: currentProjectId ?? undefined,
+      name: errorName(error) }, { level: "warn" });
     scheduleReconnect();
     useUiStore.getState().setWsStatus(downStatus());
     return;
@@ -134,8 +154,15 @@ function connect() {
     appLog("realtime", "connected", { after: attempts ? `${attempts} tries` : undefined, project: currentProjectId ?? undefined });
     attempts = 0;
     useUiStore.getState().setWsStatus("open");
-    // An HTTP snapshot already in flight when the socket opened may have missed edits.
-    if (currentProjectId) void useProjectStore.getState().load(currentProjectId);
+    // A read that waited for this connection asks for its project now, and reads it once that is confirmed. Any other
+    // read of the open project was made without the engine listening and may have missed edits: it is made again.
+    const waiting = pendingSubscription && !pendingSubscription.sent && pendingSubscription.id === currentProjectId ? pendingSubscription : undefined;
+    if (waiting) {
+      waiting.sent = true;
+      appLog("realtime", "subscribe", { project: waiting.id });
+      send({ type: "subscribe", projectId: waiting.id });
+      waiting.wait();
+    } else if (currentProjectId) void useProjectStore.getState().load(currentProjectId);
     if (pingTimer !== null) window.clearInterval(pingTimer);
     pingTimer = window.setInterval(() => send({ type: "ping" }), 25_000);
   };
@@ -166,7 +193,7 @@ function connect() {
   ws.onclose = (e) => {
     if (socket !== ws) return;
     // Until it reconnects, nothing the engine does reaches the window: lists and progress go stale.
-    if (!stopped) appLog("realtime", "disconnected", { code: e.code, reason: e.reason || undefined, clean: e.wasClean }, { level: "warn" });
+    if (!stopped) appLog("realtime", "disconnected", { code: e.code, reason: e.reason ? withoutAddresses(e.reason) : undefined, clean: e.wasClean }, { level: "warn" });
     socket = null;
     confirmedProjectId = null;
     pendingSubscription?.finish();
@@ -175,7 +202,10 @@ function connect() {
     scheduleReconnect();
     useUiStore.getState().setWsStatus(downStatus());
   };
-  ws.onerror = () => ws.close();
+  ws.onerror = () => {
+    if (socket === ws && !stopped) appLog("realtime", "socket-error", { attempt: attempts + 1, project: currentProjectId ?? undefined }, { level: "warn" });
+    ws.close();
+  };
 }
 
 function scheduleReconnect() {

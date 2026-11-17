@@ -1,5 +1,5 @@
 import { SOURCE_PREVIEW_SECONDS } from "@scarlet/timeline";
-import { playbackLog } from "./playbackLog";
+import { logPlayRefusal, playbackLog } from "./playbackLog";
 
 /** Keep the editor clock in source seconds while a standalone preview starts at zero. */
 export function openSourcePlayback(video: HTMLVideoElement, options: {
@@ -71,7 +71,7 @@ export function openSourcePlayback(video: HTMLVideoElement, options: {
     video.defaultPlaybackRate = video.playbackRate;
     onState(index === undefined ? "ready" : "loading");
     video.src = url ?? (index === undefined ? options.original : options.chunkUrl(index));
-    if (wantsPlay) void video.play().catch(() => {});
+    if (wantsPlay) void video.play().catch(error => logPlayRefusal(video, "source-switch", error));
   }
   function requestChunk() {
     const time = sourceTime();

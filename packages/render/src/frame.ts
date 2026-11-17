@@ -5,6 +5,8 @@ import { FILMSTRIP_SEEK_BATCH, sparseFilmstrip, type Project, type Timeline, typ
 import { buildFilterGraph, type GraphOptions } from "./graph.js";
 import { INDEXED_MP4_INPUT, LOCAL_MEDIA_INPUT, failureReason, ffSeconds, resolveFfmpeg, runCapture, withStreamInfoFallback } from "./exec.js";
 import { isStoredAsShown } from "./probe.js";
+import { resolveFontFile } from "./fonts.js";
+import { escapeFilterPath } from "./effects.js";
 
 export interface FrameOptions {
   /** Output width in pixels; height follows the source aspect (default 320). */
@@ -21,8 +23,43 @@ export interface FrameOptions {
   decoder?: "cuda";
   /** Hears why the frame came the slower way: the GPU could not decode it, or the movie's index could not be used. */
   onFallback?: (reason: string) => void;
+  /** Only this area of the picture, as fractions of it: left, top, right, bottom. */
+  area?: [number, number, number, number];
+  /** Lines over the picture at round percents of the whole source, each labelled, so an area of it can be named. Needs the source's size. */
+  grid?: { width: number; height: number };
   ffmpegPath?: string;
   signal?: AbortSignal;
+}
+
+/**
+ * Filters that draw lines at round percents of a source picture over the part of it in `area`, drawn `width` by
+ * `height` pixels, with each line's percent beside it at the top and left edges. The step is the roundest that puts
+ * at least four lines across the picture's width.
+ */
+export function percentGrid(area: [number, number, number, number], width: number, height: number): string[] {
+  const [left, top, right, bottom] = area.map(n => n * 100) as [number, number, number, number];
+  const step = [10, 5, 2, 1, 0.5].find(s => (right - left) / s >= 4) ?? 0.5;
+  const font = resolveFontFile("Arial");
+  const face = font ? `fontfile=${escapeFilterPath(font.file)}` : "font=sans";
+  const size = Math.max(11, Math.round(width / 90));
+  const label = (n: number) => String(Math.round(n * 10) / 10);
+  const filters: string[] = [];
+  const lines = (from: number, to: number) => {
+    const out: number[] = [];
+    for (let n = Math.ceil(from / step - 1e-9) * step; n <= to + 1e-9; n += step) if (n > from + step / 4 && n < to - step / 4) out.push(n);
+    return out;
+  };
+  for (const n of lines(left, right)) {
+    const x = Math.round((n - left) / (right - left) * width);
+    filters.push(`drawbox=x=${x}:y=0:w=1:h=${height}:color=white@0.45:t=fill`, `drawbox=x=${x + 1}:y=0:w=1:h=${height}:color=black@0.35:t=fill`,
+      `drawtext=${face}:text='${label(n)}':x=${x + 3}:y=3:fontsize=${size}:fontcolor=white:box=1:boxcolor=black@0.65:boxborderw=2`);
+  }
+  for (const n of lines(top, bottom)) {
+    const y = Math.round((n - top) / (bottom - top) * height);
+    filters.push(`drawbox=x=0:y=${y}:w=${width}:h=1:color=white@0.45:t=fill`, `drawbox=x=0:y=${y + 1}:w=${width}:h=1:color=black@0.35:t=fill`,
+      `drawtext=${face}:text='${label(n)}':x=3:y=${y + 3}:fontsize=${size}:fontcolor=white:box=1:boxcolor=black@0.65:boxborderw=2`);
+  }
+  return filters;
 }
 
 /** Decode the frame at `tSeconds` and return it as a JPEG. */
@@ -41,7 +78,12 @@ export async function extractFrame(file: string, tSeconds: number, opts: FrameOp
 
 async function frameFrom(file: string, tSeconds: number, opts: FrameOptions): Promise<Buffer> {
   const width = Math.max(2, Math.round(opts.width ?? 320));
-  const gpu = opts.decoder === "cuda";
+  // An area or a grid is drawn on the CPU, where the picture is in memory.
+  const gpu = opts.decoder === "cuda" && !opts.area && !opts.grid;
+  const area = opts.area ?? [0, 0, 1, 1];
+  const crop = opts.area ? `crop=iw*${area[2] - area[0]}:ih*${area[3] - area[1]}:iw*${area[0]}:ih*${area[1]},` : "";
+  const height = opts.grid ? Math.max(2, Math.round(width * (area[3] - area[1]) * opts.grid.height / ((area[2] - area[0]) * opts.grid.width) / 2) * 2) : -2;
+  const grid = opts.grid ? "," + percentGrid(area, width, height).join(",") : "";
   const args = [
     "-hide_banner",
     "-nostdin",
@@ -58,7 +100,7 @@ async function frameFrom(file: string, tSeconds: number, opts: FrameOptions): Pr
     "-frames:v",
     "1",
     "-vf",
-    gpu ? `scale_cuda=${width}:-2:interp_algo=bicubic:format=yuv420p,hwdownload,format=yuv420p` : `scale=${width}:-2`,
+    gpu ? `scale_cuda=${width}:-2:interp_algo=bicubic:format=yuv420p,hwdownload,format=yuv420p` : `${crop}scale=${width}:${height}${grid}`,
     "-f",
     "image2",
     "-update",

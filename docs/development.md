@@ -106,7 +106,7 @@ Rerun the enable command after changing the helper script so the installed copy 
 
 ## Diagnose a problem
 
-**Settings → Advanced → Share logs → Export logs…** saves a ZIP with desktop logs and `system.json` for the app version, OS, engine, assistant status and desktop settings. It excludes media files, projects, transcript files, the database and sign-in tokens. For a bug report, note the time of the problem and review the bundle before sharing it.
+**Settings → Advanced → Share logs → Export logs…** saves a ZIP with operational events and `system.json` for the app version, OS, engine, assistant status and desktop settings. The ZIP retains timings, status and error codes, generated IDs and route names. Free-form error text stays in the local log. The ZIP excludes media files, projects, transcript files, the database and sign-in tokens. For a bug report, note the time of the problem and review the bundle before sharing it.
 
 | Platform | Desktop log |
 | --- | --- |
@@ -114,15 +114,17 @@ Rerun the enable command after changing the helper script so the installed copy 
 | macOS | `~/Library/Logs/com.forwardfuture.scarlet/scarlet-desktop.log` |
 | Windows | `%LOCALAPPDATA%\com.forwardfuture.scarlet\logs\scarlet-desktop.log` |
 
-Times are in UTC. Scarlet rotates the log at 5 MB and keeps the five previous files. To follow one edit, search for its `tsk_…` task ID. The `task_events` table in `scarlet.db` records its tool calls, progress and errors in order.
+Times are in UTC. Scarlet rotates the log at 5 MB and keeps the five previous files. Search for a `tsk_…` task ID to follow an edit or for `request=` and its ID to follow an API request through the renderer, engine and file transfer. The `task_events` table in `scarlet.db` records the edit's tool calls, progress and errors in order.
 
 | Log tag | Where to look |
 | --- | --- |
-| `[engine] [task]` | Queue, claim, completion, cancellation, recovery and retry. The host’s failure line and the preceding CLI output give the exit code and error. |
+| `[engine] [task]`, `[host]` | Queue blockers, claim, completion, cancellation, recovery and retry. Host completion records the requested state and the state acknowledged by the engine. |
+| `[engine] [mcp]` | Tool names, elapsed time, outcomes and counts of missing measurements for the attempt. |
 | `[engine] [transcribe]`, `[engine] [audio]` | Transcript progress, audio work and queue delays. **Finish when ready** resumes a paused edit once its transcripts are saved. |
 | `[engine] [edit]`, `[project]`, `[render]`, `[media]`, `[activity]` | Applied changes and versions, render warnings, footage and project history. |
 | `[ui] [action]`, `[ui] [nav]` | The control or shortcut used and the page it opened. |
 | `[ui] [api]`, `[engine] [http]` | The window’s request, the engine’s response, failures and slow calls. |
+| `[engine] [transfer]`, `[export]` | File reads and native saves. The engine logs bytes read from disk and the desktop logs bytes received and where the save stopped. |
 | `[ui] [realtime]`, `[engine] [ws]` | Events that changed the interface and connections that dropped or recovered. |
 | `[ui] [playback]` | Player state, transport commands, streams, dropped frames and stalls. A new `el=` identifies a replacement video element. |
 | `[ui] [error]` | UI, microphone, asset and export errors. Search for `WARN` or `ERROR` across the log for failures from other components. |

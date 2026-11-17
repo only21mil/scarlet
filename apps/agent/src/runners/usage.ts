@@ -55,13 +55,15 @@ export function claudeUsage(raw: unknown, model?: string): AgentUsage | undefine
 /** Codex `turn.completed.usage`: input includes cached input; output includes reasoning. */
 export function codexUsage(raw: unknown, model?: string): AgentUsage | undefined {
   const u = record(raw);
-  if (!has(u, "input_tokens", "output_tokens", "cached_input_tokens")) return undefined;
+  if (!has(u, "input_tokens", "output_tokens", "cached_input_tokens", "cache_write_input_tokens")) return undefined;
   const cached = tokenCount(u!.cached_input_tokens);
+  const written = tokenCount(u!.cache_write_input_tokens);
   return {
     ...emptyUsage(model),
-    inputTokens: Math.max(0, tokenCount(u!.input_tokens) - cached),
+    inputTokens: Math.max(0, tokenCount(u!.input_tokens) - cached - written),
     outputTokens: tokenCount(u!.output_tokens),
     cacheReadTokens: cached,
+    cacheWriteTokens: written,
     reasoningTokens: tokenCount(u!.reasoning_output_tokens),
   };
 }

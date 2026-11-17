@@ -69,7 +69,10 @@ it("shares cache reads between views and leaves both idle when a poll returns th
     paint.mockClear();
     await act(async () => useProjectStore.setState(s => ({ current: { ...s.current!, taskEvents: { working: [] } } })));
     expect(reads).toHaveBeenCalledTimes(1);
+    // With nothing caching, store changes say when to read, so the poll only checks in once a minute.
     await act(async () => vi.advanceTimersByTimeAsync(10_000));
+    expect(reads).toHaveBeenCalledTimes(1);
+    await act(async () => vi.advanceTimersByTimeAsync(50_000));
     expect(reads).toHaveBeenCalledTimes(2);
     expect(paint).not.toHaveBeenCalled();
     await act(async () => useProjectStore.setState(s => ({ current: { ...s.current!, sourcePreviewRevisions: { cam: 1 } } })));
@@ -85,7 +88,7 @@ it("is only the word Media, with no mark, while every file was read and has its 
   const row = await show([video("cam"), video("mic")], [transcription("mic", "failed")]);
   expect(row.textContent).toBe("Media");
   expect(mark(row)).toBeNull();
-  expect(row.title).toBe("");
+  expect(row.getAttribute("aria-description")).toBeNull();
   expect(container.querySelectorAll('[role="menuitem"]')).toHaveLength(0);
 });
 
@@ -93,7 +96,7 @@ it("marks the Media button when a file couldn't be read, and names the file", as
   const row = await show([video("cam"), video("broken", { status: "failed" })]);
   expect(row.textContent).toBe("Media");
   expect(mark(row)).toBe("Couldn’t read broken.mov");
-  expect(row.title).toBe("Couldn’t read broken.mov");
+  expect(row.getAttribute("aria-description")).toBe("Couldn’t read broken.mov");
 });
 
 it("marks the Media button when a transcription stopped and the recording still has no transcript", async () => {
@@ -112,7 +115,7 @@ it("marks the Media button when a file failed to import, and names a file the pr
   const row = await show([video("cam")], [], vi.fn(), false, 0, true);
   expect(row.textContent).toBe("Media");
   expect(mark(row)).toBe("Some files need attention");
-  expect(row.title).toBe("Some files need attention");
+  expect(row.getAttribute("aria-description")).toBe("Some files need attention");
   expect(mark(await show([video("cam"), video("broken", { status: "failed" })], [], vi.fn(), false, 0, true))).toBe("Couldn’t read broken.mov");
 });
 
@@ -120,7 +123,7 @@ it("puts the problem ahead of the caching line on hover, and opens Media on a cl
   vi.mocked(api.sourceCaches).mockResolvedValue({ caches: [{ mediaId: "cam", state: "ready" }] });
   const onOpen = vi.fn();
   const row = await show([video("cam"), video("broken", { status: "failed" })], [], onOpen);
-  expect(row.title).toBe("Couldn’t read broken.mov. Video cached for playback");
+  expect(row.getAttribute("aria-description")).toBe("Couldn’t read broken.mov. Video cached for playback");
   await act(async () => row.click());
   expect(onOpen).toHaveBeenCalledOnce();
 });
@@ -139,19 +142,18 @@ it("says Paused and offers Resume for as long as the project is paused, whatever
   const updateProject = vi.fn().mockResolvedValue(undefined);
   useProjectStore.setState({ updateProject });
   const rows = () => [...container.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].map(row => row.textContent);
-  // Every video is cached and nothing waits: the pause still holds the project's other media work, and the menu is
-  // the only place that says so or resumes it.
+  // Resume stays available while the project is paused, even after every video finishes caching.
   vi.mocked(api.sourceCaches).mockResolvedValue({ caches: [{ mediaId: "cam", state: "ready" }] });
   const row = await show([video("cam")], [], vi.fn(), true);
-  expect([rows(), row.title]).toEqual([["Resume caching"], "Caching is paused"]);
+  expect([rows(), row.getAttribute("aria-description")]).toEqual([["Resume"], "Media processing is paused"]);
   await act(async () => container.querySelector<HTMLButtonElement>('[role="menuitem"]')!.click());
-  expect(updateProject).toHaveBeenCalledExactlyOnceWith({ mediaPaused: false });
+  expect(updateProject).toHaveBeenCalledExactlyOnceWith({ mediaPaused: false }, PRJ);
   // A project with no video is the same, and so is one whose video waits to cache.
   await show([], [], vi.fn(), true);
-  expect(rows()).toEqual(["Resume caching"]);
+  expect(rows()).toEqual(["Resume"]);
   vi.mocked(api.sourceCaches).mockResolvedValue({ caches: [{ mediaId: "cam", state: "uncached", queued: true }] });
   await show([video("cam")], [], vi.fn(), true);
-  expect(rows()).toEqual(["Resume caching"]);
+  expect(rows()).toEqual(["Resume"]);
   // Not paused, with nothing to cache, there is no row.
   vi.mocked(api.sourceCaches).mockResolvedValue({ caches: [{ mediaId: "mic", state: "ready" }] });
   await show([video("mic")]);
@@ -210,8 +212,66 @@ it("leaves out a video that failed or isn't to be cached, as the project list do
 
 it("counts a single video as one video, and says how many files are being added", async () => {
   vi.mocked(api.sourceCaches).mockResolvedValue({ caches: [{ mediaId: "cam", state: "uncached" }] });
-  expect((await show([video("cam")])).title).toBe("0 of 1 video cached");
+  expect((await show([video("cam")])).getAttribute("aria-description")).toBe("0 of 1 video cached");
   vi.mocked(api.sourceCaches).mockResolvedValue({ caches: [{ mediaId: "cam", state: "ready" }, { mediaId: "mic", state: "uncached" }] });
-  expect((await show([video("cam"), video("mic")])).title).toBe("1 of 2 videos cached");
-  expect((await show([video("cam")], [], vi.fn(), false, 2)).title).toBe("Adding 2 files");
+  expect((await show([video("cam"), video("mic")])).getAttribute("aria-description")).toBe("1 of 2 videos cached");
+  expect((await show([video("cam")], [], vi.fn(), false, 2)).getAttribute("aria-description")).toBe("Adding 2 files");
+});
+
+it("pauses and resumes processing from the Media hover card during audio-only transcription", async () => {
+  const mic = { ...video("mic", { transcriptId: undefined }), kind: "audio" as const };
+  const update = vi.spyOn(api, "updateProject").mockImplementation(async (_id, body) => ({
+    project: { ...project, mediaPaused: body.mediaPaused === true },
+  }));
+  const button = await show([mic], [transcription(mic.id, "running")]);
+  const pause = container.querySelector<HTMLButtonElement>(".media-hover-card button")!;
+  expect(button.getAttribute("aria-description")).toBe("Transcription in progress");
+  expect(pause.textContent).toBe("Pause");
+  await act(async () => pause.click());
+  expect(update).toHaveBeenNthCalledWith(1, PRJ, { mediaPaused: true });
+  expect(pause.textContent).toBe("Resume");
+  await act(async () => pause.click());
+  expect(update).toHaveBeenNthCalledWith(2, PRJ, { mediaPaused: false });
+});
+
+it("lets a keyboard user dismiss the Media hover card with Escape", async () => {
+  document.body.append(container);
+  try {
+    const media = await show([video("cam")]);
+    const card = container.querySelector(".media-hover")!;
+    const pause = card.querySelector<HTMLButtonElement>(".media-hover-card button")!;
+    await act(async () => pause.focus());
+    expect(card.hasAttribute("data-escape-owner")).toBe(true);
+    await act(async () => pause.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    expect(document.activeElement).toBe(media);
+    expect(card.hasAttribute("data-dismissed")).toBe(true);
+    expect(card.hasAttribute("data-escape-owner")).toBe(false);
+  } finally {
+    container.remove();
+  }
+});
+
+it("reads the caches once at a time, and once more for a change that came meanwhile", async () => {
+  await show([video("cam")]);
+  await act(async () => root.render(null));
+  let answer: (() => void) | undefined;
+  const reads = vi.mocked(api.sourceCaches).mockClear().mockImplementation(() => new Promise(resolve => {
+    answer = () => resolve({ caches: [{ mediaId: "cam", state: "ready" }] });
+  }));
+  function View() { useSourceCaches(); return null; }
+  vi.useFakeTimers();
+  try {
+    await act(async () => root.render(<View />));
+    expect(reads).toHaveBeenCalledTimes(1);
+    await act(async () => useProjectStore.setState(s => ({ current: { ...s.current!, sourcePreviewRevisions: { cam: 1 } } })));
+    await act(async () => useProjectStore.setState(s => ({ current: { ...s.current!, sourcePreviewRevisions: { cam: 2 } } })));
+    expect(reads).toHaveBeenCalledTimes(1);
+    await act(async () => { answer!(); });
+    expect(reads).toHaveBeenCalledTimes(2);
+    await act(async () => { answer!(); });
+    expect(reads).toHaveBeenCalledTimes(2);
+  } finally {
+    await act(async () => root.render(null));
+    vi.useRealTimers();
+  }
 });

@@ -54,6 +54,9 @@ export function ImportProgress({ localImport, upload, preparing }: {
     <div className="flex items-baseline justify-between gap-3 text-[13px]">
       <span className="min-w-0 truncate font-medium" title={name}>{name ?? "Adding footage"}</span>
       {localImport && <span className="shrink-0 text-xs text-muted tnum">File {localImport.position} of {localImport.total}</span>}
+      {localImport?.cancelDownload && <button type="button" className="btn-quiet shrink-0 px-1 py-0.5" onClick={localImport.cancelDownload}>
+        Cancel download
+      </button>}
     </div>
     {held ? <div role="status" className="mt-1.5 text-xs text-muted">{step}</div>
       : <ActivityProgress label={name ? `Import progress for ${name}` : "Import progress"} value={value}>{step}</ActivityProgress>}

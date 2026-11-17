@@ -50,10 +50,11 @@ it("shows the name as it was saved once a renamed skill is saved", async () => {
   }
 });
 
-it("says unsaved only while the page differs from what was loaded, and keeps no draft of a change that was put back", async () => {
+it.each(["\n", "\r\n"])("says unsaved only while the page differs from what was loaded (line endings %j)", async (lineEnding) => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   const db = buildDb();
-  const skill = db.skills[0]!;
+  const bundled = db.skills[0]!;
+  const skill = { ...bundled, content: bundled.content.replace(/\r?\n/g, lineEnding) };
   vi.spyOn(api, "skill").mockImplementation(async () => ({ skill, versions: db.skillVersions[skill.id] ?? [] }));
   const el = document.createElement("div");
   document.body.append(el);
@@ -103,15 +104,18 @@ it("says unsaved only while the page differs from what was loaded, and keeps no 
   }
 });
 
-it("sends the editor's words to Scarlet and shows the revision it saved", async () => {
+it("sends the editor's words to the chosen model and shows the revision it saved", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.useFakeTimers();
+  const previousHosts = useHostsStore.getState().hosts;
+  const previousAgent = useUiStore.getState().agent;
+  const savedAgent = localStorage.getItem("scarlet.agent");
   const db = buildDb();
   let skill = db.skills[0]!;
   let versions = db.skillVersions[skill.id] ?? [];
   const host = db.hosts.find(h => h.online)!;
   useHostsStore.setState({ hosts: [host] });
-  const agent = host.agents.find(a => a.installed && a.loggedIn !== false)!.id;
+  useUiStore.setState({ agent: { agent: "codex", model: "gpt-6.1-sol" } });
   let task = { ...db.tasks[0]!, id: "task_skill", kind: "skill_edit" as const, state: "queued" as const, instruction: "Never cut laughter.", context: { skillId: skill.id }, summary: null, question: null };
   // An earlier request is already in the conversation.
   const earlier = { ...task, id: "task_earlier", state: "done" as const, instruction: "Keep the cold open.", summary: "Added a rule for the cold open." };
@@ -124,6 +128,21 @@ it("sends the editor's words to Scarlet and shows the revision it saved", async 
   const router = createMemoryRouter([{ path: "/settings/skills/:skillId", element: <SkillEditorPage /> }], { initialEntries: [`/settings/skills/${skill.id}`] });
   try {
     await act(async () => root.render(<RouterProvider router={router} />));
+    const picker = el.querySelector<HTMLButtonElement>('.skill-editor-toolbar button[aria-label="Choose model"]')!;
+    expect(picker.textContent?.trim()).toBe("");
+    expect(picker.querySelector("svg")).not.toBeNull();
+    expect(picker.title).toContain("gpt-6.1-sol");
+    await act(() => picker.click());
+    const model = "gpt-6-astra";
+    const option = el.querySelector<HTMLButtonElement>(`[role="radio"][aria-label="Codex · ${model}"]`)!;
+    await act(() => option.click());
+    expect(picker.title).toContain(model);
+    option.focus();
+    await act(() => option.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })));
+    expect(router.state.location.pathname).toBe(`/settings/skills/${skill.id}`);
+    expect(el.querySelector('[aria-label="Model selector"]')).toBeNull();
+    expect(document.activeElement).toBe(picker);
+
     const box = el.querySelector<HTMLTextAreaElement>(".skill-chat textarea")!;
     const body = el.querySelector<HTMLTextAreaElement>('[aria-label="Skill markdown"]')!;
     expect(box.placeholder).toBe("Tell Scarlet what to change…");
@@ -132,7 +151,7 @@ it("sends the editor's words to Scarlet and shows the revision it saved", async 
       box.dispatchEvent(new Event("input", { bubbles: true }));
     });
     await act(async () => box.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })));
-    expect(editSkill).toHaveBeenCalledWith(skill.id, expect.objectContaining({ prompt: "Never cut laughter.", agent }));
+    expect(editSkill).toHaveBeenCalledWith(skill.id, expect.objectContaining({ prompt: "Never cut laughter.", agent: "codex", model }));
     // While Scarlet works the request is over the box, and the skill can't be changed under it.
     // The conversation is the left column, with the name and description over the instructions.
     expect(el.querySelector(".skill-chat")!.compareDocumentPosition(el.querySelector(".skill-details")!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
@@ -174,7 +193,10 @@ it("sends the editor's words to Scarlet and shows the revision it saved", async 
     el.remove();
     router.dispose();
     useSkillsStore.setState(useSkillsStore.getInitialState());
-    useHostsStore.setState(useHostsStore.getInitialState());
+    useHostsStore.setState({ hosts: previousHosts });
+    useUiStore.setState({ agent: previousAgent });
+    if (savedAgent === null) localStorage.removeItem("scarlet.agent");
+    else localStorage.setItem("scarlet.agent", savedAgent);
     vi.useRealTimers();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
@@ -249,6 +271,67 @@ const write = async (field: HTMLInputElement | HTMLTextAreaElement, text: string
 const named = (el: Element, text: string) => [...el.querySelectorAll("button")].find(b => b.textContent?.trim() === text);
 const markdown = (el: Element) => el.querySelector<HTMLTextAreaElement>('[aria-label="Skill markdown"]')!;
 
+it("replaces the active match or every match in the draft", async () => {
+  let skill = {
+    ...buildDb().skills[0]!,
+    id: "skill-replace-test",
+    description: "cut [here]",
+    content: "First CUT [HERE].\r\nThen cut [here].\r\nLast Cut [here].\r\nLeave the cut here.",
+  };
+  vi.spyOn(api, "skill").mockImplementation(async () => ({ skill, versions: [] }));
+  const update = vi.spyOn(api, "updateSkill").mockImplementation(async (_id, input) => {
+    skill = { ...skill, content: input.content ?? skill.content };
+    return { skill };
+  });
+  vi.spyOn(api, "listTemplates").mockResolvedValue({ templates: [] });
+  vi.spyOn(api, "skills").mockResolvedValue({ skills: [] });
+  const view = await open(`/settings/skills/${skill.id}`);
+  const { el } = view;
+  const button = (label: string) => el.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`) ?? named(el, label)!;
+  const click = (label: string) => act(() => button(label).click());
+  const replacement = () => el.querySelector<HTMLInputElement>('input[aria-label="Replace with"]');
+  const replacementIsHidden = () => !replacement() || !!replacement()?.closest("[hidden]");
+  const search = () => el.querySelector<HTMLInputElement>('input[aria-label="Find in skill"]')!;
+  try {
+    const editor = markdown(el);
+    expect(button("Save").disabled).toBe(true);
+    await act(() => editor.dispatchEvent(new KeyboardEvent("keydown", { key: "f", metaKey: true, bubbles: true, cancelable: true })));
+    expect(document.activeElement).toBe(search());
+    expect(button("Show replace").getAttribute("aria-expanded")).toBe("false");
+    expect(replacementIsHidden()).toBe(true);
+    await click("Show replace");
+    expect(replacementIsHidden()).toBe(false);
+    await write(search(), "cut [here]");
+    await write(replacement()!, "$& beat");
+    await click("Next match");
+    await click("Replace");
+    const oneChanged = "First CUT [HERE].\nThen $& beat.\nLast Cut [here].\nLeave the cut here.";
+    expect(editor.value).toBe(oneChanged);
+    expect(el.querySelector("mark[data-active]")?.textContent).toBe("Cut [here]");
+    await click("Replace All");
+    const final = "First $& beat.\nThen $& beat.\nLast $& beat.\nLeave the cut here.";
+    expect(editor.value).toBe(final);
+    expect(button("Replace All").disabled).toBe(true);
+    await click("Undo");
+    expect(editor.value).toBe(oneChanged);
+    await click("Replace All");
+    expect(editor.value).toBe(final);
+    expect(button("Save").disabled).toBe(false);
+    expect(update).not.toHaveBeenCalled();
+    await act(() => search().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })));
+    expect(view.router.state.location.pathname).toBe(`/settings/skills/${skill.id}`);
+    await click("Find in skill");
+    expect(button("Show replace").getAttribute("aria-expanded")).toBe("false");
+    expect(replacementIsHidden()).toBe(true);
+    await click("Save");
+    expect(update).toHaveBeenCalledExactlyOnceWith(skill.id, expect.objectContaining({
+      content: expect.stringContaining(final.replace(/\n/g, "\r\n")),
+      description: "cut [here]",
+    }));
+    expect(button("Save").disabled).toBe(true);
+  } finally { await view.close(); }
+});
+
 it("lists what each version changed, newest first, and shows a picked one with its changes until Done", async () => {
   const db = buildDb();
   const skill = db.skills.find(s => s.version === 2)!;
@@ -277,6 +360,11 @@ it("lists what each version changed, newest first, and shows a picked one with i
     expect(el.querySelector('[aria-label="Skill markdown, v1"]')!.textContent).toContain("(v1)");
     expect(said()).toMatch(/^v1, the first version/);
     expect(named(el, "Restore v1")).toBeDefined();
+    await act(() => el.querySelector<HTMLButtonElement>('button[aria-label="Find in skill"]')!.click());
+    const find = el.querySelector<HTMLInputElement>('input[aria-label="Find in skill"]')!;
+    await write(find, "(v1)");
+    expect(find.closest('[role="search"]')?.querySelector('[role="status"]')?.textContent).toBe("1 of 1");
+    expect(el.querySelector('button[aria-label="Show replace"], button[aria-label="Hide replace"]')).toBeNull();
     // The newest shows what it changed from the one before, with the way to undo it.
     await pick(0);
     expect(said()).toMatch(/^What Scarlet changed in v2/);
@@ -287,6 +375,34 @@ it("lists what each version changed, newest first, and shows a picked one with i
     await act(async () => named(el, "Done")!.click());
     expect(markdown(el).readOnly).toBe(false);
     expect(said()).toBeUndefined();
+  } finally {
+    await view.close();
+  }
+});
+
+it.each(["", 'description: ""\n'])("restores a version with a blank description (%j)", async olderDescription => {
+  const db = buildDb();
+  const original = db.skills.find(s => s.version === 2)!;
+  const description = "When there is a longer pause.";
+  const skill = { ...original, description, content: `---\nname: ${original.name}\ndescription: ${description}\n---\nCurrent instructions.\n` };
+  const versions = db.skillVersions[skill.id]!.map(version => ({
+    ...version, content: version.version === 2 ? skill.content : `---\nname: ${skill.name}\n${olderDescription}---\nOriginal instructions.\n`,
+  }));
+  vi.spyOn(api, "skill").mockResolvedValue({ skill, versions });
+  const update = vi.spyOn(api, "updateSkill").mockResolvedValue({ skill });
+  const view = await open(`/settings/skills/${skill.id}`);
+  const { el } = view;
+  try {
+    expect(el.querySelector<HTMLTextAreaElement>("#sk-desc")!.value).toBe(description);
+    await act(async () => el.querySelector<HTMLButtonElement>('[aria-label="Version history"]')!.click());
+    await act(async () => [...document.querySelectorAll<HTMLElement>('[role="option"]')][1]!.click());
+    await act(async () => named(el, "Restore v1")!.click());
+    expect(markdown(el).value).toContain("Original instructions.");
+    expect(el.querySelector<HTMLTextAreaElement>("#sk-desc")!.value).toBe("");
+    await act(async () => named(el, "Save")!.click());
+    expect(update).toHaveBeenCalledExactlyOnceWith(skill.id, expect.objectContaining({
+      description: "", content: expect.stringContaining("Original instructions."),
+    }));
   } finally {
     await view.close();
   }
@@ -777,6 +893,30 @@ it("keeps what was typed while a save was on its way as unsaved", async () => {
     useSkillsStore.setState(useSkillsStore.getInitialState());
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+  }
+});
+
+it("keeps a new skill's fields read-only while Create is saving and restores them if it fails", async () => {
+  let fail!: () => void;
+  vi.spyOn(api, "createSkill").mockImplementation(() => new Promise((_resolve, reject) => {
+    fail = () => reject(new Error("Engine unreachable"));
+  }));
+  const view = await open("/settings/skills/new");
+  const { el } = view;
+  const name = el.querySelector<HTMLInputElement>("#sk-name")!;
+  const description = el.querySelector<HTMLTextAreaElement>("#sk-desc")!;
+  const enabled = el.querySelector<HTMLButtonElement>('[aria-label="Enabled"]')!;
+  try {
+    await write(name, "My new skill");
+    await write(markdown(el), "Never cut laughter.");
+    await act(async () => named(el, "Create skill")!.click());
+    expect([name.disabled, description.disabled, enabled.disabled, markdown(el).readOnly]).toEqual([true, true, true, true]);
+    await act(async () => fail());
+    expect([name.disabled, description.disabled, enabled.disabled, markdown(el).readOnly]).toEqual([false, false, false, false]);
+    expect(markdown(el).value).toBe("Never cut laughter.");
+    expect(el.textContent).toContain("Engine unreachable");
+  } finally {
+    await view.close();
   }
 });
 

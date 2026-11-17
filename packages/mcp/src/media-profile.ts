@@ -4,7 +4,7 @@
  * pause or a repeat means.
  */
 import type { TranscriptWord } from "@scarlet/timeline";
-import { normalizeTranscriptToken, sequenceSimilarity } from "@scarlet/shared";
+import { normalizeTranscriptToken, transcriptSequenceMatcher } from "@scarlet/shared";
 
 const percentile = (sorted: number[], p: number) =>
   sorted.length ? sorted[Math.min(sorted.length - 1, Math.max(0, Math.round(p * (sorted.length - 1))))]! : undefined;
@@ -93,15 +93,15 @@ export function retakeGroups(words: TranscriptWord[]) {
   const list = clauses(words);
   const pairs: Array<{ a: number; b: number; score: number }> = [];
   for (let i = 0; i < list.length; i++) {
+    const a = list[i]!;
+    if (a.tokens.length < 3) continue;
+    const compare = transcriptSequenceMatcher(a.tokens);
     for (let j = i + 1; j < list.length && list[j]!.start - list[i]!.end <= window; j++) {
-      const a = list[i]!, b = list[j]!;
-      if (Math.min(a.tokens.length, b.tokens.length) < 3) continue;
-      const dice = sequenceSimilarity(a.tokens, b.tokens);
-      // A restart: the shorter clause is (almost) a prefix of the longer one.
-      const short = a.tokens.length <= b.tokens.length ? a.tokens : b.tokens, long = short === a.tokens ? b.tokens : a.tokens;
-      const prefix = sequenceSimilarity(short, long.slice(0, short.length));
+      const b = list[j]!;
+      if (b.tokens.length < 3) continue;
+      const { score: dice, prefix } = compare(b.tokens);
       // Three-word restarts ("so if we") match too much by containment alone.
-      const score = Math.max(dice, short.length >= 4 ? prefix * .95 : 0);
+      const score = Math.max(dice, Math.min(a.tokens.length, b.tokens.length) >= 4 ? prefix * .95 : 0);
       if (score >= minScore) pairs.push({ a: i, b: j, score });
     }
   }

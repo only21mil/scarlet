@@ -53,18 +53,20 @@ async function search(text: string) {
   await act(async () => { Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(field, text); field.dispatchEvent(new Event("input", { bubbles: true })); });
 }
 
-it("shows the replacement in an open transcript and cut card when an older page finishes late", async () => {
+it.each(["a new transcript ID", "the same transcript ID after alignment"])("updates an open transcript and cut card with %s", async revision => {
   const short = { ...source, duration: 12 };
   const timeline = timelineFromKeepRanges(PRJ, short.id, [{ start: 0, end: 12 }]);
   useProjectStore.setState({ current: { ...useProjectStore.getState().current!, media: [short], timeline } });
   let releaseOld!: () => void;
   const pending = new Promise<void>(resolve => { releaseOld = resolve; });
-  let savedId = short.transcriptId;
+  let completed = false;
+  const newId = revision === "a new transcript ID";
   vi.mocked(api.transcript).mockImplementation(async () => {
-    const id = savedId;
-    const text = id === short.transcriptId ? "original" : "replacement";
-    if (id === short.transcriptId) await pending;
-    return { id, mediaId: short.id, segments: [{ id: "s", start: 3, end: 4, text, words: [{ start: 3, end: 4, text }] }] };
+    const id = completed && newId ? "new-transcript" : short.transcriptId;
+    const text = completed ? "replacement" : "original";
+    if (!completed && newId) await pending;
+    return { id, mediaId: short.id, ...(!completed && !newId && { aligning: { through: 0 } }),
+      segments: [{ id: "s", start: 3, end: 4, text, words: [{ start: 3, end: 4, text }] }] };
   });
   function OpenPassages() {
     const media = useProjectStore(s => s.current!.media);
@@ -73,9 +75,12 @@ it("shows the replacement in an open transcript and cut card when an older page 
   }
   await act(async () => root.render(<MemoryRouter><OpenPassages /></MemoryRouter>));
   expect(api.transcript).toHaveBeenCalledTimes(2);
-  savedId = "new-transcript";
-  await act(async () => useProjectStore.getState().applyEvent({ type: "media.updated", projectId: PRJ, media: { ...short, transcriptId: savedId } }));
   const shown = () => [container.querySelector("[data-w]")?.textContent, container.querySelector(".edit-passage .review-removed")?.textContent];
+  if (!newId) expect(shown()).toEqual(["original", "original"]);
+  completed = true;
+  const media = newId ? { ...short, transcriptId: "new-transcript" }
+    : { ...short, lastTranscription: { completedAt: "2026-11-16T00:00:00.000Z", model: "Whisper" } };
+  await act(async () => useProjectStore.getState().applyEvent({ type: "media.updated", projectId: PRJ, media }));
   expect(shown()).toEqual(["replacement", "replacement"]);
   await act(async () => releaseOld());
   expect(shown()).toEqual(["replacement", "replacement"]);

@@ -49,3 +49,28 @@ it("leaves alone a ↓ the page has already taken when its button has the focus,
     vi.unstubAllGlobals();
   }
 });
+
+it("opens a floating menu outside the clipped container and returns the keyboard focus on Escape", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  try {
+    await act(async () => root.render(<Dropdown label="Edit actions" floating button={<span>More</span>}>
+      {close => <MenuItem onClick={close}>Stop this edit</MenuItem>}
+    </Dropdown>));
+    const button = container.querySelector<HTMLButtonElement>('[aria-haspopup="menu"]')!;
+    await act(async () => button.click());
+    const item = document.querySelector<HTMLElement>('[role="menuitem"]')!;
+    expect(item.textContent).toBe("Stop this edit");
+    expect(container.contains(item)).toBe(false);
+    await vi.waitFor(() => expect(document.activeElement).toBe(item));
+    await act(async () => item.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    expect(document.querySelector('[role="menu"]')).toBeNull();
+    expect(document.activeElement).toBe(button);
+  } finally {
+    await act(async () => root.unmount());
+    container.remove();
+    vi.unstubAllGlobals();
+  }
+});

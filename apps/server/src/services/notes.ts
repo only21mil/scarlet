@@ -5,7 +5,7 @@ import type { Ctx } from "../context.js";
 import { now } from "../db.js";
 import { notFound } from "../errors.js";
 import { createTask, parseAssignTo } from "./tasks.js";
-import { ensureHead } from "./timeline.js";
+import { ensureProjectHead } from "./timeline.js";
 import { actorFor, agentName, logActivity, quote } from "./activity.js";
 
 export interface CreateNoteInput {
@@ -25,7 +25,7 @@ export interface CreateNoteInput {
 
 /** Create a review note; optionally dispatch it to an agent as a `note` task. Never touches the timeline. */
 export async function createNote(ctx: Ctx, user: User, projectId: string, input: CreateNoteInput, signal?: AbortSignal): Promise<{ note: Note; task?: Task }> {
-  const { project, head } = ensureHead(ctx, projectId);
+  const project = ensureProjectHead(ctx, projectId);
   let text = input.text;
   if (input.voiceTranscript) {
     const cleaned = await cleanupNote(ctx, input.voiceTranscript, { time: input.time, end: input.end, clipIds: input.clipIds }, signal);
@@ -36,7 +36,7 @@ export async function createNote(ctx: Ctx, user: User, projectId: string, input:
   let note: Note = {
     id: newId("note"),
     projectId: project.id,
-    version: input.version ?? head,
+    version: input.version ?? project.head,
     time: input.time,
     end: input.end,
     clipIds: input.clipIds ?? [],

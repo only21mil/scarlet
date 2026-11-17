@@ -1,14 +1,14 @@
 import { stat } from "node:fs/promises";
 import { join } from "node:path";
 import { Hono } from "hono";
-import { audition, soundPicture, contactSheet, fileInDirectoryAsync, pictureActivity, PREVIEW_COPY_ACTIVITY_THRESHOLD, qualityEvents, snapRange, type PictureActivity } from "@scarlet/render";
-import { AcousticWordsRequest, InspectionReviewRequest, PictureActivityRequest, SheetRequest, SourceAudioRequest, SoundPictureRequest, DialogueRangeRequest, DialogueScanRequest, DialogueWindowRequest, type CutEvent, type InspectionResult, type InspectionWindow, type PictureActivityWindow } from "@scarlet/shared";
-import { diffTimelines, timelineDuration, type MediaAsset, type Project, type Timeline, type TimeRange } from "@scarlet/timeline";
+import { audition, soundPicture, contactSheet, renderTimelineFrame, fileInDirectoryAsync, pictureActivity, PREVIEW_COPY_ACTIVITY_THRESHOLD, reviewWindow, snapRange, type PictureActivity } from "@scarlet/render";
+import { AcousticWordsRequest, InspectionReviewRequest, PictureActivityRequest, SheetRequest, TimelinePicturesRequest, SourceAudioRequest, SoundPictureRequest, DialogueRangeRequest, DialogueScanRequest, DialogueWindowRequest, type CutEvent, type InspectionResult, type InspectionWindow, type PictureActivityWindow } from "@scarlet/shared";
+import { applyOps, diffTimelines, timelineDuration, TimelineOp, type MediaAsset, type Project, type Timeline, type TimeRange } from "@scarlet/timeline";
 import type { AppEnv } from "../auth.js";
 import type { Ctx } from "../context.js";
 import { badRequest, conflict, notFound } from "../errors.js";
 import { prepareCutReview } from "../services/changes.js";
-import { dialogueDetector } from "../services/dialogueDetections.js";
+import { sharedDialogueDetector } from "../services/dialogueDetections.js";
 import { transcribeForDialogue } from "../services/ingest.js";
 import { inspectionPictures } from "../services/inspectionPictures.js";
 import { pictureDecoder, pictureLane } from "../services/pictureWork.js";
@@ -19,15 +19,14 @@ import { emissionStorePaths } from "../services/recordingAudio.js";
 import { transcriptLanguage } from "../services/transcriptReader.js";
 import { readCachedAcousticWords } from "../transcribe/acousticWords.js";
 import { readsEnglishSpeech } from "../transcribe/wordAlign.js";
-import { jsonBody, requireMedia, requireProject } from "./util.js";
+import { jsonBody, requireMedia, requireProject, requireProjectHeader } from "./util.js";
 
-interface WindowPlan {
+type WindowPlan = {
   label: string;
-  clock: "source" | "timeline";
   id: string;
   range: TimeRange;
   focus?: number;
-}
+} & ({ clock: "source"; media: MediaAsset } | { clock: "timeline"; media?: never });
 interface WindowOptions { count: number; mode: "uniform" | "scene" | "activity"; review?: boolean; includeAudio?: boolean }
 
 // Align each baseline with the proposed join. For a removal, only the retained
@@ -63,7 +62,7 @@ export function newCutEvents(before: InspectionWindow[], after: InspectionWindow
 
 export function inspectionRoutes(ctx: Ctx) {
   const r = new Hono<AppEnv>();
-  const dialogue = dialogueDetector(ctx);
+  const dialogue = sharedDialogueDetector(ctx);
   // One transcript attempt per source per pass, so a failing provider is not retried on every page.
   const transcribing = new Set<string>();
   const pictures = inspectionPictures(ctx);
@@ -73,37 +72,29 @@ export function inspectionRoutes(ctx: Ctx) {
 
   // Sheet tiles are at most 320x180 and activity compares 192x108 frames, so a source's verified
   // preview copy shows what its original would, decoding about six times faster than 4K.
-  async function sourcePicture(project: Project, media: MediaAsset, range: TimeRange, mode: WindowOptions["mode"]) {
+  async function sourcePicture(project: Pick<Project, "id">, media: MediaAsset, range: TimeRange, mode: WindowOptions["mode"]) {
     const height = Math.min(Math.max(mode === "activity" ? 540 : 180, ctx.settings().render.previewHeight), media.height ?? 0);
     if (!height) return;
     return previewPictures(ctx.paths.media(project.id))(media, range.start, range.end, height).catch(() => undefined);
   }
 
-  function projectMedia(project: Project, mediaId: string) {
-    const media = project.media.find(m => m.id === mediaId);
-    if (!media) throw notFound("media in this project");
-    return media;
-  }
-
   /** The file to listen to, and which of its audio streams: a confirmed voice's input, or the first. */
-  async function audioSource(project: Project, { mediaId, to, voice }: { mediaId: string; to: number; voice?: string }) {
-    const media = projectMedia(project, mediaId);
+  async function audioSource(projectId: string, { mediaId, to, voice }: { mediaId: string; to: number; voice?: string }) {
+    const media = requireMedia(ctx, mediaId, projectId);
     if (media.kind !== "audio" && !media.hasAudio) throw badRequest("no_audio", "Choose a source with audio.");
     if (!media.duration || to > media.duration + 0.000001) throw badRequest("outside_media", "Window exceeds source duration.");
-    const file = await fileInDirectoryAsync(ctx.paths.media(project.id), media.path);
+    const file = await fileInDirectoryAsync(ctx.paths.media(projectId), media.path);
     if (!file) throw notFound("source file");
     if (voice && !media.voiceRoles) throw badRequest("voice_roles_missing", "This recording has no confirmed voice inputs.");
     const stream = voice ? media.voiceRoles![voice === "me" ? "me" : "other"] - 1 : 0;
     return { file, stream };
   }
 
-  async function collect(project: Project, plans: WindowPlan[], options: WindowOptions): Promise<InspectionResult> {
+  async function collect(project: Pick<Project, "id" | "settings">, plans: WindowPlan[], options: WindowOptions): Promise<InspectionResult> {
     const signal = ctx.projectSignal(project.id);
     const renderIds: string[] = [];
-    const inputs = await Promise.all(plans.map(async plan => {
-      if (plan.clock === "source") {
-        const media = project.media.find(m => m.id === plan.id);
-        if (!media) throw notFound("media");
+    const inputs = await Promise.all(plans.map(async ({ media, ...plan }) => {
+      if (media) {
         const file = await fileInDirectoryAsync(ctx.paths.media(project.id), media.path);
         if (!file) throw notFound("source file");
         return { plan, file, origin: 0, local: plan.range, sourceWidth: media.width, fps: media.fps || project.settings.fps, media };
@@ -131,6 +122,7 @@ export function inspectionRoutes(ctx: Ctx) {
         const sheetOptions = { ...options, focus: plan.focus, fps, sourceWidth: input.sourceWidth, signal };
         // Decodes take turns in the engine's picture lane.
         const lane = pictureLane(ctx);
+        if (options.review) return lane.run(() => reviewWindow(file, local, { ...sheetOptions, origin, tempDir: ctx.paths.tmp }), { signal });
         // The copy's clock runs `start` seconds behind the source. Timestamps stay in source seconds.
         const fromCopy = picture && copy && await lane.run(() => contactSheet(picture.file, { start: local.start - picture.start, end: local.end - picture.start },
           { ...sheetOptions, origin: origin + picture.start, activityThreshold: PREVIEW_COPY_ACTIVITY_THRESHOLD }), { signal }).catch((err: Error) => {
@@ -141,11 +133,8 @@ export function inspectionRoutes(ctx: Ctx) {
         // An original recording is full size, so it decodes on the GPU when there is one. Preview copies and rendered
         // segments are small enough for the CPU.
         const decoder = fromCopy || !input.media ? undefined : await pictureDecoder(ctx.settings().render.hwaccel);
-        const sheet = fromCopy || await lane.run(() => contactSheet(file, local, { ...sheetOptions, origin, decoder }), { signal });
-        const events = options.review ? await qualityEvents(file, local, origin, signal) : undefined;
-        const wav = options.includeAudio ? await audition(file, local, signal) : undefined;
-        return { ...sheet, events, wav };
-      })()));
+        return fromCopy || lane.run(() => contactSheet(file, local, { ...sheetOptions, origin, decoder }), { signal });
+      })(), project.id));
       return { ...plan, range: { start: origin + local.start, end: origin + local.end }, ...analysis };
     }));
     return { state: "ready", windows };
@@ -153,20 +142,20 @@ export function inspectionRoutes(ctx: Ctx) {
 
   r.post("/projects/:id/contact-sheet", async c => {
     const body = await jsonBody(c, SheetRequest);
-    const project = requireProject(ctx, c.req.param("id"));
+    const project = requireProjectHeader(ctx, c.req.param("id"));
     const range = { start: body.from, end: body.to };
     let plan: WindowPlan;
     if (body.mediaId) {
-      const media = projectMedia(project, body.mediaId);
+      const media = requireMedia(ctx, body.mediaId, project.id);
       if (media.kind === "audio" || !media.duration) throw badRequest("no_video", "Choose a moving video source.");
       if (body.to > media.duration + 0.000001) throw badRequest("outside_media", "Window exceeds source duration.");
-      plan = { label: "Source", clock: "source", id: media.id, range, focus: body.focus };
+      plan = { label: "Source", clock: "source", media, id: media.id, range, focus: body.focus };
     } else {
       const timeline = resolveTimeline(ctx, project, body.version);
       if (body.to > timelineDuration(timeline) + 0.000001) throw badRequest("outside_timeline", "Window exceeds timeline duration.");
       const projectSignal = ctx.projectSignal(project.id);
       try {
-        const window = await pictures(project, timeline, range, body.mode, body.count, body.focus, c.req.raw.signal);
+        const window = await pictures(ctx.repos.projects.withMedia(project), timeline, range, body.mode, body.count, body.focus, c.req.raw.signal);
         return c.json({ state: "ready", windows: [window] } satisfies InspectionResult);
       } catch (err) {
         projectSignal.throwIfAborted();
@@ -180,12 +169,43 @@ export function inspectionRoutes(ctx: Ctx) {
 
   // A dialogue scan asks about every silence on a page, so the answers are numbers and stay small.
   const activity = new AnalysisCache<PictureActivity>(() => 96, 1024 * 1024);
+  // Moments of an edit as the viewer would see them. With `ops`, the edit is laid on the version and drawn without
+  // being saved, so an agent can look at a framing before it is in the video.
+  r.post("/projects/:id/timeline-pictures", async c => {
+    const body = await jsonBody(c, TimelinePicturesRequest);
+    const project = requireProject(ctx, c.req.param("id"));
+    let timeline = resolveTimeline(ctx, project, body.version);
+    if (body.ops?.length) {
+      const checked = TimelineOp.array().safeParse(body.ops);
+      if (!checked.success) throw badRequest("bad_ops", checked.error.issues.slice(0, 5).map(i => `ops[${i.path.join(".")}]: ${i.message}`).join("; "));
+      try { timeline = applyOps(timeline, checked.data); }
+      catch (error) { throw badRequest("bad_ops", (error as Error).message); }
+    }
+    const { fps } = project.settings, duration = timelineDuration(timeline);
+    const root = ctx.paths.media(project.id);
+    const signal = AbortSignal.any([c.req.raw.signal, ctx.projectSignal(project.id)]);
+    const lane = pictureLane(ctx);
+    const pictures = await Promise.all(body.times.map(async asked => {
+      const frame = Math.min(Math.max(0, Math.ceil(duration * fps - 1e-6) - 1), Math.floor(asked * fps + 1e-6));
+      const range = { start: frame / fps, end: (frame + 1) / fps };
+      const jpeg = await ctx.track(lane.run(() =>
+        renderTimelineFrame(project, timeline, range, root, signal, body.width, { pictureSource: previewPictures(root, { signal }) })
+          .catch(error => { signal.throwIfAborted(); ctx.log(`[inspection] drawing ${range.start.toFixed(2)} s from the originals: ${(error as Error).message}`);
+            return renderTimelineFrame(project, timeline, range, root, signal, body.width); }), { signal }), project.id);
+      return { time: asked, jpeg: jpeg.toString("base64") };
+    }));
+    return c.json({ pictures });
+  });
+
   r.post("/projects/:id/picture-activity", async c => {
     const { windows } = await jsonBody(c, PictureActivityRequest);
-    const project = requireProject(ctx, c.req.param("id"));
+    const project = requireProjectHeader(ctx, c.req.param("id"));
     const signal = ctx.projectSignal(project.id);
+    const assets = ctx.repos.projects.assets(project.id, new Set(windows.map(w => w.mediaId)));
+    const byId = new Map(assets.map(asset => [asset.id, asset]));
     const measured = await Promise.all(windows.map(async ({ mediaId, from, to }): Promise<PictureActivityWindow> => {
-      const media = projectMedia(project, mediaId);
+      const media = byId.get(mediaId);
+      if (!media) throw notFound("media in this project");
       if (media.kind === "audio" || !media.duration) throw badRequest("no_video", "Choose a moving video source.");
       if (to > media.duration + 0.000001) throw badRequest("outside_media", "Window exceeds source duration.");
       const file = await fileInDirectoryAsync(ctx.paths.media(project.id), media.path);
@@ -206,7 +226,7 @@ export function inspectionRoutes(ctx: Ctx) {
         if (fromCopy) return fromCopy;
         const decoder = await pictureDecoder(ctx.settings().render.hwaccel);
         return lane.run(() => pictureActivity(file, range, { origin: 0, fps, decoder, signal }), { signal });
-      })()));
+      })(), project.id));
       return { mediaId, from, to, ...result };
     }));
     return c.json({ windows: measured });
@@ -214,9 +234,9 @@ export function inspectionRoutes(ctx: Ctx) {
 
   r.post("/projects/:id/dialogue-detections", async c => {
     const { mediaId, from, to, taskId, startedAt, keptSide } = await jsonBody(c, DialogueWindowRequest);
-    const project = requireProject(ctx, c.req.param("id"));
-    const media = projectMedia(project, mediaId);
-    return c.json(await dialogue.detect(project.id, media, from, to, taskId, startedAt, keptSide));
+    const projectId = c.req.param("id");
+    const media = requireMedia(ctx, mediaId, projectId);
+    return c.json(await dialogue.detect(projectId, media, from, to, taskId, startedAt, keptSide));
   });
 
   r.post("/projects/:id/dialogue-acoustic-words", async c => {
@@ -238,42 +258,42 @@ export function inspectionRoutes(ctx: Ctx) {
 
   r.post("/projects/:id/dialogue-scan", async c => {
     const { mediaId, from, to, taskId, startedAt } = await jsonBody(c, DialogueScanRequest);
-    const project = requireProject(ctx, c.req.param("id"));
-    const media = projectMedia(project, mediaId);
-    const scan = await dialogue.start(project.id, media, from, to, taskId, startedAt);
+    const projectId = c.req.param("id");
+    const media = requireMedia(ctx, mediaId, projectId);
+    const scan = await dialogue.start(projectId, media, from, to, taskId, startedAt);
     const key = `${taskId}/${media.id}`;
     if (!transcribing.has(key)) {
       transcribing.add(key);
-      transcribeForDialogue(ctx, project.id, media);
+      transcribeForDialogue(ctx, projectId, media);
     }
     return c.json(scan);
   });
 
   r.post("/projects/:id/dialogue-checkpoints", async c => {
     const { mediaId, from, to } = await jsonBody(c, DialogueRangeRequest);
-    const project = requireProject(ctx, c.req.param("id"));
-    const media = projectMedia(project, mediaId);
-    return c.json(await dialogue.checkpoints(project.id, media, from, to));
+    const projectId = c.req.param("id");
+    const media = requireMedia(ctx, mediaId, projectId);
+    return c.json(await dialogue.checkpoints(projectId, media, from, to));
   });
 
   r.post("/projects/:id/source-audio", async c => {
     const { mediaId, from, to, voice } = await jsonBody(c, SourceAudioRequest);
-    const project = requireProject(ctx, c.req.param("id"));
-    const { file, stream } = await audioSource(project, { mediaId, to, voice });
-    return c.json({ wav: await ctx.track(audition(file, { start: from, end: to }, ctx.projectSignal(project.id), stream)) });
+    const projectId = c.req.param("id");
+    const { file, stream } = await audioSource(projectId, { mediaId, to, voice });
+    return c.json({ wav: await ctx.track(audition(file, { start: from, end: to }, ctx.projectSignal(projectId), stream), projectId) });
   });
 
   r.post("/projects/:id/sound-picture", async c => {
     const { mediaId, from, to, remove, voice, words } = await jsonBody(c, SoundPictureRequest);
-    const project = requireProject(ctx, c.req.param("id"));
-    const { file, stream } = await audioSource(project, { mediaId, to, voice });
-    const { jpeg, layout } = await ctx.track(soundPicture(file, { range: { start: from, end: to }, remove, words, stream, signal: ctx.projectSignal(project.id) }));
+    const projectId = c.req.param("id");
+    const { file, stream } = await audioSource(projectId, { mediaId, to, voice });
+    const { jpeg, layout } = await ctx.track(soundPicture(file, { range: { start: from, end: to }, remove, words, stream, signal: ctx.projectSignal(projectId) }), projectId);
     return c.json({ jpeg: jpeg.toString("base64"), layout });
   });
 
   r.post("/projects/:id/review-cut", async c => {
     const body = await jsonBody(c, InspectionReviewRequest);
-    const project = requireProject(ctx, c.req.param("id"));
+    const project = requireProjectHeader(ctx, c.req.param("id"));
     const change = ctx.repos.changes.get(body.changeId);
     if (!change || change.projectId !== project.id) throw notFound("change in this project");
     // Inspect the immutable proposal, including after approval or revision.

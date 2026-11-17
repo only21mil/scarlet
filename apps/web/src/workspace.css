@@ -87,32 +87,37 @@
 /* What the message revises, as a tag inside the box before the text. Its × makes the message a new edit. */
 .composer-tag { flex: none; align-self: center; display: inline-flex; align-items: center; gap: 3px; max-width: 55%; margin-right: 4px; padding: 0 2px 0 7px;
   border: 1px solid var(--color-line); border-radius: 4px; font-size: 11.5px; line-height: 20px; color: var(--color-muted); white-space: nowrap; }
-/* What the message is about, folded into one edit-point icon of a fixed size; hover, focus or a click opens its card. */
-.composer-aim { position: relative; flex: none; align-self: center; display: inline-flex; }
-.composer-aim-icon { position: relative; display: inline-grid; place-items: center; width: 26px; height: 28px; padding: 0; border: 0; border-radius: 6px;
-  background: none; color: var(--color-muted); cursor: pointer; }
-.composer-aim-icon:hover, .composer-aim-icon[aria-expanded="true"] { color: var(--color-fg); }
-.composer-aim-icon:focus-visible { outline: 2px solid var(--color-fg); outline-offset: 1px; }
-.composer-aim-card { position: absolute; z-index: 6; left: -6px; bottom: calc(100% + 8px); display: grid; width: max-content; min-width: 240px; max-width: 320px;
-  padding: 4px; border: 1px solid var(--color-line); border-radius: 10px; background: var(--color-panel); box-shadow: 0 6px 20px #0005; }
-/* The gap between the icon and its card stays part of the hover, so the pointer can cross it. */
-.composer-aim-card::after { content: ""; position: absolute; left: 0; right: 0; top: 100%; height: 10px; }
-.composer-aim-row { display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 4px 0 8px; border-radius: 6px; transition: background .4s; }
-.composer-aim-row.is-new { background: var(--color-raised); }
-.composer-aim-kind { display: grid; place-items: center; width: 16px; color: var(--color-dim); }
-.composer-aim-kind svg { width: 14px; height: 14px; }
-.composer-aim-name { color: var(--color-fg); font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.composer-aim-detail { color: var(--color-dim); font-size: 12px; white-space: nowrap; }
-.composer-aim-clear { margin-left: auto; display: inline-grid; place-items: center; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 4px;
-  background: none; color: var(--color-dim); cursor: pointer; }
-.composer-aim-clear:hover:not(:disabled) { background: var(--color-raised); color: var(--color-fg); }
-.composer-aim-clear:disabled { opacity: .5; cursor: default; }
-@media (prefers-reduced-motion: no-preference) {
-  .composer-aim-icon.is-pulsing::after { content: ""; position: absolute; inset: 1px; border-radius: 8px; box-shadow: 0 0 0 0 rgba(244, 241, 233, .45);
-    animation: composer-aim-pulse .7s ease-out; pointer-events: none; }
-  @keyframes composer-aim-pulse { to { box-shadow: 0 0 0 7px rgba(244, 241, 233, 0); } }
+.composer-aim { flex: 0 1 auto; align-self: flex-start; display: flex; align-items: center;
+  min-width: 0; max-width: 48%; min-height: 26px; margin-top: 3px; padding: 0 7px;
+  border: 1px solid var(--color-line); border-radius: 6px; background: var(--color-panel); color: var(--color-fg);
+  font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.composer-aim-button { flex: none; display: flex; align-items: center; gap: 2px; min-height: 22px; margin-inline-start: 3px; padding: 0 3px;
+  border: 0; border-radius: 4px; background: none; color: var(--color-muted); cursor: pointer; }
+.composer-aim-button:is(:hover, [aria-expanded="true"]) { background: var(--color-raised); color: var(--color-fg); }
+.composer-aim-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.composer-aim-button > svg { transform: rotate(90deg); }
+.composer-aim-button[aria-expanded="true"] > svg { transform: rotate(-90deg); }
+.composer-aim-card { position: absolute; z-index: 6; bottom: calc(100% + 8px); left: 0; min-width: min(176px, 100%); width: max-content;
+  max-width: 100%; padding: 4px; border: 1px solid var(--color-line); border-radius: 8px; background: var(--color-panel);
+  box-shadow: 0 6px 20px #0005; }
+.composer-aim-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-left: 7px;
+  color: var(--color-fg); font-size: 13px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.composer-aim-clear { flex: none; display: inline-grid; place-items: center; width: 26px; height: 28px; padding: 0; border: 0;
+  border-radius: 5px; background: none; color: var(--color-muted); cursor: pointer; }
+.composer-aim > .composer-aim-clear { width: 20px; min-width: 0; height: 22px; margin-inline-start: 3px; border-radius: 4px; overflow: hidden; }
+@media (hover: hover) and (pointer: fine) {
+  .composer-aim:not(:hover, :focus-within) > .composer-aim-clear {
+    width: 0; margin-inline-start: 0; opacity: 0; pointer-events: none; transition-delay: 0s;
+  }
 }
-/* While the icon is open, the timeline lights what the message is about. */
+@media (hover: hover) and (pointer: fine) and (prefers-reduced-motion: no-preference) {
+  .composer-aim > .composer-aim-clear {
+    transition: width 160ms cubic-bezier(.2, .8, .2, 1), margin-inline-start 160ms cubic-bezier(.2, .8, .2, 1), opacity 100ms ease-out 30ms;
+  }
+}
+.composer-aim-clear:hover:not(:disabled) { background: var(--color-raised); color: var(--color-fg); }
+.composer-aim-clear:disabled { color: var(--color-dim); cursor: default; }
+/* Hover or focus on the target lights what the message is about on the timeline. */
 .timeline-range.is-lit { box-shadow: 0 0 0 2px rgba(244, 241, 233, .4); }
 .simple-timeline-band.is-lit { box-shadow: 0 0 0 2px rgba(255, 160, 156, .55); }
 .composer-tag-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
@@ -142,9 +147,10 @@
 .composer-model [role="dialog"] { left: auto; right: 0; max-width: 100%; }
 .composer-model [aria-haspopup="dialog"] { min-width: 0; min-height: 30px; padding: 2px 6px; border-color: transparent; }
 .composer-model [aria-haspopup="dialog"]:hover { border-color: var(--color-line); }
-.composer-row { display: flex; align-items: flex-end; gap: 5px; }
+.composer-row { position: relative; display: flex; align-items: flex-end; gap: 5px; }
 /* The hidden text sizes the field as its value or available width changes. */
 .composer-message { position: relative; flex: 1; min-width: 0; max-height: min(10rem, 26vh); overflow: hidden; }
+.composer-aim:has(+ .composer-tag) ~ .composer-message { min-width: min(64px, 23%); }
 .composer-message > * { display: block; padding: 6px 0; font: 14px/20px var(--font-sans); white-space: pre-wrap; overflow-wrap: anywhere; }
 .composer-message > span { visibility: hidden; }
 .composer-message > textarea { position: absolute; inset: 0; width: 100%; height: 100%; resize: none; border: 0; outline: none; background: transparent; overflow-y: auto; }

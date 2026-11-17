@@ -1,4 +1,4 @@
-import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { Fragment, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from "react";
 import type { GraphicTemplateSummary, Skill } from "@scarlet/shared";
 import { isComposing } from "../../lib/hotkeys";
 import { useSkillsStore } from "../../stores/skills";
@@ -6,6 +6,7 @@ import { templatePreview, templateTokens, useTemplatesStore } from "../../stores
 import { MAKE_TEMPLATE } from "./SkillCommandInput";
 import { templateDetail, templateMatches, TemplateMenu, TransitionPicture } from "./TemplateMenu";
 import { useTokenList } from "./useTokenList";
+import { markSkillMatches, normalizeSkillLines, revealSkillMatch, type SkillFindState } from "./SkillFind";
 
 /** A `$template` or `/skill` the library has, where it is in the text. Words the library has no template or skill for stay plain. */
 export function keywordSpans(text: string, templates: readonly Pick<GraphicTemplateSummary, "name">[], skills: readonly Pick<Skill, "name">[]) {
@@ -56,14 +57,18 @@ interface Props {
   placeholder?: string;
   describedBy?: string;
   className: string;
+  box?: RefObject<HTMLTextAreaElement | null>;
+  find?: SkillFindState;
 }
 
 /**
  * A skill's instructions, as the editor writes them. A `$template` or `/skill` of theirs has a faint fill and says what
  * it is on hover, and `$` lists the templates at the cursor, as the message box does, to put one's name in.
  */
-export function SkillInstructions({ value, onChange, readOnly, placeholder, describedBy, className }: Props) {
-  const box = useRef<HTMLTextAreaElement>(null);
+export function SkillInstructions({ value: body, onChange, readOnly, placeholder, describedBy, className, box: editor, find }: Props) {
+  const localBox = useRef<HTMLTextAreaElement>(null);
+  const box = editor ?? localBox;
+  const value = useMemo(() => normalizeSkillLines(body), [body]);
   const backdrop = useRef<HTMLDivElement>(null);
   const caretMark = useRef<HTMLSpanElement>(null);
   const activeRow = useRef<HTMLButtonElement>(null);
@@ -103,21 +108,42 @@ export function SkillInstructions({ value, onChange, readOnly, placeholder, desc
   const choose = (row: GraphicTemplateSummary) => list.replaceToken(token, "$" + row.name);
   const make = () => { list.close(); list.replaceToken(token, MAKE_TEMPLATE); };
 
+  useLayoutEffect(() => {
+    const pane = backdrop.current, field = box.current;
+    if (!pane || !field || !find || find.activeIndex < 0) return;
+    const reveal = () => {
+      // A classic scrollbar consumes part of the field's width. Match it before measuring the highlighted text.
+      pane.style.width = `${field.clientWidth + pane.offsetWidth - pane.clientWidth}px`;
+      pane.scrollTop = field.scrollTop;
+      revealSkillMatch(pane, field);
+    };
+    reveal();
+    const observer = new ResizeObserver(reveal);
+    observer.observe(field);
+    return () => {
+      observer.disconnect();
+      pane.style.width = "";
+    };
+  }, [box, find?.activeIndex, find?.matches]);
+
   // The text drawn under the field: the same words, with each keyword's fill, and a mark where the cursor is so the
   // list can open there.
   const marked: ReactNode[] = [];
   let at = 0;
   const cut = (to: number) => {
     if (open && caret !== null && caret >= at && caret <= to) {
-      marked.push(value.slice(at, caret), <span key="caret" ref={caretMark} className="skill-instructions-caret" />);
+      if (at < caret) marked.push(<Fragment key={at}>{markSkillMatches(value.slice(at, caret), at, find)}</Fragment>);
+      marked.push(<span key="caret" ref={caretMark} className="skill-instructions-caret" />);
       at = caret;
     }
-    marked.push(value.slice(at, to));
+    if (at < to) marked.push(<Fragment key={at}>{markSkillMatches(value.slice(at, to), at, find)}</Fragment>);
     at = to;
   };
   for (const k of keywordSpans(value, templates, skills)) {
     cut(k.start);
-    marked.push(<span key={k.start} className={`skill-keyword${hover?.at === k.start ? " is-hover" : ""}`} data-keyword={k.sign + k.name} data-at={k.start}>{value.slice(k.start, k.end)}</span>);
+    marked.push(<span key={k.start} className={`skill-keyword${hover?.at === k.start ? " is-hover" : ""}`} data-keyword={k.sign + k.name} data-at={k.start}>
+      {markSkillMatches(value.slice(k.start, k.end), k.start, find)}
+    </span>);
     at = k.end;
   }
   cut(value.length);

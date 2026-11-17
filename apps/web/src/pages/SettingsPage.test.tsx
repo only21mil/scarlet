@@ -268,6 +268,42 @@ it("saves a General dropdown as it is chosen, with no Save to press", async () =
   expect(el.querySelector('[aria-current="true"]')?.textContent).toBe("About");
 });
 
+it.each(["Advanced", "← Projects"])("waits for General to save before going to %s", async destination => {
+  let finish!: () => void;
+  const save = vi.spyOn(api, "updateSettings").mockImplementation(patch => new Promise(resolve => {
+    finish = () => {
+      const saved = { ...settings, ...patch };
+      vi.mocked(api.settings).mockResolvedValue({ settings: saved, transcriptionAvailable: true });
+      resolve({ settings: saved });
+    };
+  }));
+  await open();
+  await selectOption(transcribeWith(), "CrisperWhisper 2.0 (default)");
+  expect(save).toHaveBeenCalledOnce();
+  await press(destination);
+  expect(el.querySelector('[aria-current="true"]')?.textContent).toBe("General");
+  expect(el.textContent).toContain("Saving…");
+  await act(async () => finish());
+  expect(el.querySelector('[aria-current="true"]')?.textContent ?? el.textContent)
+    .toBe(destination === "Advanced" ? destination : "Project library");
+});
+
+it("shows a General save error if the editor tried to change tabs during the save", async () => {
+  let fail!: () => void;
+  vi.spyOn(api, "updateSettings").mockImplementation(() => new Promise((_resolve, reject) => {
+    fail = () => reject(new Error("Engine unreachable"));
+  }));
+  await open();
+  await selectOption(transcribeWith(), "CrisperWhisper 2.0 (default)");
+  await press("Advanced");
+  await act(async () => fail());
+  expect(el.querySelector('[aria-current="true"]')?.textContent).toBe("General");
+  expect(el.querySelector('form [role="alert"]')?.textContent).toBe("Engine unreachable");
+  expect(transcribeWith().textContent).toContain("OpenAI Whisper");
+  await press("Advanced");
+  expect(el.querySelector('[aria-current="true"]')?.textContent).toBe("Advanced");
+});
+
 it("shows the bundled fallback for first-install CrisperWhisper and opens its pinned model files through the desktop", async () => {
   vi.mocked(api.settings).mockResolvedValue({ settings: freshLocalSettings, transcriptionAvailable: true });
   vi.mocked(api.localModelStatus).mockResolvedValue({ state: "ready", selected: "crisperwhisper", active: "whispercpp", fallback: true });

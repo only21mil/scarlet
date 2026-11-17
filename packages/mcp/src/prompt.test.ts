@@ -24,6 +24,16 @@ it("reads an editor's style after the guide it builds on, and has it win where t
   const prompt = buildSystemPrompt({ project: "A project.", skills: [guide, style] });
   expect(prompt.indexOf("## dialogue-pass")).toBeLessThan(prompt.indexOf("## my-style"));
   expect(prompt).toContain("This builds on dialogue-pass, above. Where the two differ, follow this one.");
+  // A style can build on several guides: each is read first, and the ones that aren't in the prompt go unmentioned.
+  const framing = skill({ id: "skl_fs", name: "frame-screen", content: "---\nname: frame-screen\ndescription: Frame the screen.\n---\nFill the video." });
+  const both = skill({ id: "skl_all", name: "my-edit", content: "---\nname: my-edit\ndescription: Mine.\nextends: dialogue-pass, frame-screen, punch-in\n---\nMy camera sits bottom right." });
+  expect(buildSystemPrompt({ project: "A project.", skills: [guide, framing, both] }))
+    .toContain("This builds on dialogue-pass and frame-screen, above. Where it and one of them differ, follow this one.");
+  // A guide can be called in the text where it applies, with no header: it reads the same, and says how it is called.
+  const inline = skill({ id: "skl_in", name: "my-demo", content: "---\nname: my-demo\ndescription: Mine.\n---\n## Show the demo\n\n/frame-screen, with these changes: my camera sits bottom right." });
+  const called = buildSystemPrompt({ project: "A project.", skills: [framing, inline] });
+  expect(called.indexOf("## frame-screen")).toBeLessThan(called.indexOf("## my-demo"));
+  expect(called).toContain("This builds on frame-screen, above, and calls each as /name where it applies, with what it changes beside the call. Where the two differ, follow this one.");
   // Alone, it says nothing about a guide that isn't there.
   expect(buildSystemPrompt({ project: "A project.", skills: [style] })).not.toContain("builds on");
 });
@@ -131,6 +141,12 @@ describe("an editing prompt", () => {
     expect(buildSystemPrompt({ ...base, task: task({}) })).not.toContain("## Context");
   });
 
+  it("asks for a reason for every edit and puts the summary in the chat", () => {
+    const prompt = buildSystemPrompt({ ...base, task: task({}) });
+    expect(prompt).toContain("Always save why you made each edit, even when the editor asked for the exact change.");
+    expect(prompt).toContain("Scarlet shows the short summary of what changed in the chat and the reason on the card above the timeline.");
+  });
+
   it("points a revision at the staged cut or the edit the editor chose", () => {
     const resumed = { ...task({ changeId: "chg_3", cutIndex: 4 }), cutConflict: { version: "changed", range: { start: 11.25, end: 12 } } };
     expect(buildSystemPrompt({ ...base, task: resumed })).toContain("On version changed, Scarlet located the passage at 11.25–12 timeline seconds.");
@@ -145,18 +161,20 @@ describe("an editing prompt", () => {
     expect(edit).toContain("- Selected edit index: 0");
     expect(edit).not.toContain("Staged cut being revised");
     // With the change at hand, the edit comes with what Scarlet told the editor about it: its name, its number in their
-    // list, what it did and what to check on it. They are answering those words.
+    // list, what it did, why and what to check on it. They are answering those words.
     const change = { id: "chg_3", state: "approved", description: "Frame the games", fromVersion: "ver_1", toVersion: "ver_2", ranges: [], ops: [], author: { type: "agent", name: "Scarlet" },
       timelineEdits: [{ label: "Frame the watch", range: { start: 10, end: 20 } },
-        { label: " Frame the Fall Guys game ", range: { start: 181, end: 260 }, summary: "Screen zooms to the game window. ", check: "A Windows dialog sits over the game from 4:17" }] } as unknown as Change;
+        { label: " Frame the Fall Guys game ", range: { start: 181, end: 260 }, summary: "Screen zooms to the game window. ",
+          reason: " The score was too small to read as you called it out. ", check: "A Windows dialog sits over the game from 4:17" }] } as unknown as Change;
     const told = buildSystemPrompt({ ...base, change: { change }, task: task({ changeId: "chg_3", editIndex: 1, editNumber: 13 }) });
     expect(told).toContain(`- Selected edit index: 1 (edit 13 in the editor's list), "Frame the Fall Guys game"`);
     expect(told).toContain(`- What you told the editor this edit did: "Screen zooms to the game window."`);
+    expect(told).toContain(`- Why you made this edit: "The score was too small to read as you called it out."`);
     expect(told).toContain(`- What you asked the editor to check on this edit: "A Windows dialog sits over the game from 4:17"`);
     // An edit Scarlet said nothing more about is its name alone, and another change's edits are never borrowed.
     const plain = buildSystemPrompt({ ...base, change: { change }, task: task({ changeId: "chg_3", editIndex: 0 }) });
     expect(plain).toContain(`- Selected edit index: 0, "Frame the watch"`);
-    expect(plain).not.toMatch(/What you told the editor|What you asked the editor/);
+    expect(plain).not.toMatch(/What you told the editor|Why you made this edit|What you asked the editor/);
     expect(buildSystemPrompt({ ...base, change: { change }, task: task({ changeId: "chg_other", editIndex: 1 }) })).toContain("- Selected edit index: 1\n");
     // An index means nothing without the change it belongs to.
     expect(buildSystemPrompt({ ...base, task: task({ editIndex: 2, cutIndex: 1 }) })).not.toMatch(/Selected edit index|Staged cut being revised/);

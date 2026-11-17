@@ -29,18 +29,17 @@ const eps = 1e-4;
 export const MAX_CROSSFADE = 1;
 
 type AudioInventory = { media: readonly { id: string; kind: string; hasAudio?: boolean }[] };
-function audible(project: AudioInventory | undefined, clip: MediaClip, muted: boolean) {
-  if (muted || !clip.enabled || clip.volume <= 0) return false;
-  const asset = project?.media.find(m => m.id === clip.mediaId);
-  return !asset || asset.kind === "audio" || asset.hasAudio !== false;
-}
-
 /** Every join between kept source ranges on the audible tracks, in playback order. */
 export function timelineJoins(tl: Timeline, project?: AudioInventory): TimelineJoin[] {
   const found: Array<TrackJoin & { at: number }> = [];
+  const audible = new Map<string, boolean>();
+  for (const m of project?.media ?? []) {
+    if (!audible.has(m.id)) audible.set(m.id, m.kind === "audio" || m.hasAudio !== false);
+  }
   for (const track of tl.tracks) {
-    if (track.kind === "caption") continue;
-    const clips = track.clips.filter((c): c is MediaClip => c.kind === "media" && audible(project, c, track.muted))
+    if (track.kind === "caption" || track.muted) continue;
+    const clips = track.clips.filter((c): c is MediaClip =>
+      c.kind === "media" && c.enabled && c.volume > 0 && audible.get(c.mediaId) !== false)
       .sort((a, b) => a.timelineIn - b.timelineIn);
     for (let i = 1; i < clips.length; i++) {
       const a = clips[i - 1]!, b = clips[i]!;
@@ -86,7 +85,7 @@ export function sourceToTimeline(tl: Timeline, mediaId: string, t: number): Plac
   for (const track of tl.tracks) for (const clip of track.clips) {
     if (clip.kind !== "media" || clip.mediaId !== mediaId || t < clip.sourceIn - eps || t > clip.sourceOut + eps) continue;
     out.push({ trackId: track.id, clipId: clip.id, time: round(clip.timelineIn + (t - clip.sourceIn) / (clip.speed ?? 1)),
-      audible: track.kind !== "caption" && audible(undefined, clip, track.muted) });
+      audible: track.kind !== "caption" && !track.muted && clip.enabled && clip.volume > 0 });
   }
   return out.sort((a, b) => a.time - b.time);
 }
@@ -133,6 +132,7 @@ export function timelineWords(tl: Timeline, transcripts: Map<string, TranscriptW
   // A long pass leaves hundreds of clips per recording. Index each recording once instead of scanning it per clip.
   const indexes = new Map<string, ReturnType<typeof wordsByMidpoint>>();
   for (const clip of clips) {
+    if (range && (round(clip.timelineIn) > range.end || round(clip.timelineIn + clipDuration(clip)) < range.start)) continue;
     const words = transcripts.get(clip.mediaId)!;
     const speed = clip.speed ?? 1;
     let inClip = indexes.get(clip.mediaId);
@@ -169,18 +169,20 @@ export function formatTimelineTranscript(words: TimelineWord[], joins: TimelineJ
     lines.push(`${head.start.toFixed(2)} #${head.index}${who ? ` ${who}:` : ""} ${line.map(w => w.text).join(" ")}`);
     line = [];
   };
-  const joinLine = (join: TimelineJoin, before?: TimelineWord, after?: TimelineWord) => {
+  const allNumbers = opts.all && new Map(opts.all.map((join, i) => [join, i + 1]));
+  const joinLine = (index: number, before?: TimelineWord, after?: TimelineWord) => {
+    const join = joins[index]!;
     const t = join.tracks[0]!;
     const jump = t.out.mediaId === t.in.mediaId ? `${t.out.mediaId} ${t.out.source.toFixed(2)}→${t.in.source.toFixed(2)}`
       : `${t.out.mediaId} ${t.out.source.toFixed(2)}→${t.in.mediaId} ${t.in.source.toFixed(2)}`;
     const either = `“${before?.text ?? "…"}” | “${after?.text ?? "…"}”`;
-    return `‖ join ${(opts.all ?? joins).indexOf(join) + 1} at ${join.at.toFixed(2)} (${formatTimecode(join.at, opts.fps)}) ${jump}${t.gap ? ` gap ${t.gap} s` : ""}${t.overlap ? ` crossfade ${t.overlap} s` : ""} ${either}`;
+    return `‖ join ${allNumbers ? allNumbers.get(join) ?? 0 : index + 1} at ${join.at.toFixed(2)} (${formatTimecode(join.at, opts.fps)}) ${jump}${t.gap ? ` gap ${t.gap} s` : ""}${t.overlap ? ` crossfade ${t.overlap} s` : ""} ${either}`;
   };
   let previous: TimelineWord | undefined;
   for (const w of words) {
     while (j < joins.length && joins[j]!.at <= w.start + 1e-3) {
       flush();
-      lines.push(joinLine(joins[j]!, previous, w));
+      lines.push(joinLine(j, previous, w));
       j++;
     }
     if (w.mediaId !== previous?.mediaId) {
@@ -205,7 +207,7 @@ export function formatTimelineTranscript(words: TimelineWord[], joins: TimelineJ
     previous = w;
   }
   flush();
-  for (; j < joins.length; j++) lines.push(joinLine(joins[j]!, previous));
+  for (; j < joins.length; j++) lines.push(joinLine(j, previous));
   return lines.join("\n");
 }
 
@@ -254,7 +256,7 @@ function bucketing(r: Reading) {
   const step = (r.to - r.from) / Math.max(1, n);
   // A span that only touches a bucket boundary (within float error) does not voice it.
   const voiced = (s: number, e: number) => (r.speechActivity ?? []).some(v => v.start < e - 1e-6 && v.end > s + 1e-6);
-  const quietBelow = quietRms(r.rms ?? []);
+  const quietBelow = quietRms(r.rms ?? [], step);
   const low = (i: number) => i >= 0 && i < n && (r.rms?.[i] ?? 0) <= quietBelow && r.peaks[i]! <= QUIET_PEAK;
   return {
     step,

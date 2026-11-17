@@ -102,8 +102,8 @@ The editor sets the brief. You decide what context to inspect, which tools to us
 ## Writing for the editor
 
 - Before your first tool call, say in one sentence what the request will come to when you are done, such as “I’ll take the retakes, false starts and dead air out of the interview and bring you any cut I’m unsure of.” Scarlet keeps that sentence above your steps for as long as you work, so it is about the whole request, not your first step.
-- Scarlet numbers each saved edit and lists its title beside your reply, in the chat and on the timeline. Give each edit in \`timelineEdits\` a short title of at most 50 characters, such as “Trim the false start”. Add \`check\` only when a doubt about that edit is left for the editor to settle by listening or looking, named in a few words, such as “Room tone comes up with it”. It holds the edit in front of the editor as one that needs them until they keep it, so an edit that did what was asked and that you verified has none. Any doubt you leave about an edit, whichever tool made it, goes on that edit: \`check\` as you save it, or \`edit_flag\` once it is in the video, an earlier request’s edit included. A doubt said only in your reply is one the editor has no way to open. Give each edit a \`summary\` too: one plain sentence on what it did, such as “Raised the narration 4 dB, which brings the room tone up with it”. The edit’s card shows that sentence alone, so anything else the edit changed belongs in it.
 - After that sentence, while you work, Scarlet shows your latest update whole as what you are doing, on two lines, until your next tool call: one sentence of at most 100 characters on what you are doing now. A longer update is cut off there.
+- Always save why you made each edit, even when the editor asked for the exact change. Scarlet shows the short summary of what changed in the chat and the reason on the card above the timeline. For example, “Zoomed in on the score” in the chat and “So viewers can read the score as you say it” on the card. Ground the reason in the footage, the editorial goal or the editor’s request. For an exact request, a short reference to that request is enough. Add \`check\` only when a doubt is left for the editor to settle by listening or looking. Any doubt you leave about an edit goes on that edit: \`check\` as you save it, or \`edit_flag\` once it is in the video, an earlier request’s edit included. The flag holds the edit among those that need the editor until they keep it.
 - End with at most two short sentences about what needs the editor: a judgment call, something you chose not to do, or a question. Scarlet shows them under the request on two lines, about 120 characters, and folds the rest of a longer message away until the editor clicks it. The same goes for a request you finish without an edit: say why in those two sentences. Don’t restate the edits; refer to them by number, such as “edit 4”. When nothing needs the editor, one short sentence is enough.
 - Give times as m:ss.t on the timeline the editor will watch. Don’t mention source seconds, clip IDs, version IDs, tool names or operations. Say “edit” for a change, and “cut” only for an edit that removes footage.`;
 
@@ -172,7 +172,7 @@ End with one short line: the rule you offered, or “No rule.”`,
 }
 
 /** The edit of a change the editor selected: as its applied edits list it, or as the change named it before it was applied. */
-function selectedEdit(change: Change, index: number): { label: string; summary?: string; check?: string } | undefined {
+function selectedEdit(change: Change, index: number): { label: string; summary?: string; reason?: string; check?: string } | undefined {
   const edit = changeEdits(change).find(edit => edit.spot === index) ?? namedTimelineEdits(change)?.[index];
   // A later request may have raised a doubt about it once it was in the video: that is the check the editor saw last.
   const flag = change.flags?.findLast(f => f.spot === index);
@@ -266,12 +266,12 @@ export function buildSystemPrompt(ctx: PromptContext): string {
     if (c.noteIds?.length) ctxLines.push(`- Note ids to address: ${c.noteIds.join(", ")} (pass them as noteIds when proposing)`);
     if (c.changeId) ctxLines.push(`- Change being revised: ${c.changeId}`);
     if (c.changeId && c.editIndex !== undefined) {
-      // The editor is answering what Scarlet told them about this edit: its name in their list, what it did and what
-      // to check on it. Those words are on the edit's row and card in front of them, so they are part of the request.
+      // The editor sees what changed in the chat and why on the card, along with any review check.
       const about = ctx.change?.change.id === c.changeId ? selectedEdit(ctx.change.change, c.editIndex) : undefined;
       const listed = c.editNumber !== undefined ? ` (edit ${c.editNumber} in the editor's list)` : "";
       ctxLines.push(`- Selected edit index: ${c.editIndex}${listed}${about ? `, "${about.label.trim()}"` : ""}`);
       if (about?.summary?.trim()) ctxLines.push(`- What you told the editor this edit did: "${about.summary.trim()}"`);
+      if (about?.reason?.trim()) ctxLines.push(`- Why you made this edit: "${about.reason.trim()}"`);
       if (about?.check?.trim()) ctxLines.push(`- What you asked the editor to check on this edit: "${about.check.trim()}"`);
     }
     if (c.changeId && c.cutIndex !== undefined) ctxLines.push(`- Staged cut being revised: index ${c.cutIndex} of ${c.changeId}. \`dialogue_revise_cut\` saves its new range.`);
@@ -324,6 +324,7 @@ export function buildSystemPrompt(ctx: PromptContext): string {
     const lines = [
       `Change ${change.id} [${change.state}] by ${change.author.name}${change.author.model ? ` (${change.author.model})` : ""}`,
       `Description: ${change.description}`,
+      ...(change.reason?.trim() && ctx.task?.context?.editIndex === undefined ? [`Reason: ${change.reason.trim()}`] : []),
       `From version ${change.fromVersion} to ${change.toVersion}`,
       `Affected ranges: ${change.ranges.map((r) => `${r.start.toFixed(2)}–${r.end.toFixed(2)} s`).join(", ") || "none"}`,
     ];
@@ -342,8 +343,11 @@ export function buildSystemPrompt(ctx: PromptContext): string {
   // Skills
   if (ctx.skills.length) {
     const blocks = ctx.skills.map((s) => {
-      const base = skillExtends(s);
-      const layered = base && ctx.skills.some(o => o.name === base) ? `\n\nThis builds on ${base}, above. Where the two differ, follow this one.` : "";
+      const bases = skillExtends(s).filter(base => ctx.skills.some(o => o.name === base));
+      const named = bases.length > 1 ? `${bases.slice(0, -1).join(", ")} and ${bases.at(-1)}` : bases[0];
+      // A guide the skill calls by name is in the prompt whether or not this request needs it, such as one the skill
+      // keeps for when the editor asks: the skill's own words say when each applies.
+      const layered = !named ? "" : `\n\nThis builds on ${named}, above${/(?:^|[\s(])\/[a-z0-9]/im.test(stripFrontmatter(s.content)) ? ", and calls each as /name where it applies, with what it changes beside the call" : ""}. Where ${bases.length > 1 ? "it and one of them" : "the two"} differ, follow this one.`;
       return `## ${s.name}\n\n${s.description}${layered}\n\n${stripFrontmatter(s.content).trim()}`;
     });
     parts.push(`# Your skills\n\nThe editor’s request and selected skills give the brief. Consult other enabled guides through skills_list as needed. Preserve the editor’s stated preferences and protected moments.\n\n${blocks.join("\n\n---\n\n")}`);

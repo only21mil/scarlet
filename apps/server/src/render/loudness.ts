@@ -1,4 +1,7 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { readFile, rename, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { LOCAL_MEDIA_INPUT } from "@scarlet/render";
 import type { Ctx } from "../context.js";
 import { AnalysisCache } from "../services/analysisCache.js";
@@ -53,11 +56,24 @@ const caches = new WeakMap<Ctx, AnalysisCache<Loudness>>();
  * everyone waiting on it; `signal` stops only this caller's wait.
  */
 export function measuredLoudness(ctx: Ctx, file: string, identity: unknown[],
-  opts: { from?: number; to?: number; stop?: AbortSignal; signal?: AbortSignal } = {}): Promise<Loudness> {
+  opts: { projectId?: string; from?: number; to?: number; stop?: AbortSignal; signal?: AbortSignal } = {}): Promise<Loudness> {
   let cache = caches.get(ctx);
-  if (!cache) caches.set(ctx, cache = new AnalysisCache<Loudness>(() => 24, 256 * 1024, 1));
-  const { from, to, stop, signal } = opts;
+  // A pass asks for each recording's loudness at once, so measure a few files side by side rather than in turn.
+  if (!cache) caches.set(ctx, cache = new AnalysisCache<Loudness>(() => 24, 256 * 1024, 3));
+  const { projectId, from, to, stop, signal } = opts;
   const key = JSON.stringify(["ebur128", file, ...identity, from, to]);
-  return cache.get(key, work => ctx.track(measureLoudness(file, from, to, stop ? AbortSignal.any([work, stop]) : work)),
-    signal ? { signal } : {});
+  // A file's loudness doesn't change while its identity holds, so keep it beside the project's waveforms across restarts.
+  const saved = projectId ? join(ctx.paths.waveforms(projectId), `loudness-${createHash("sha256").update(key).digest("hex").slice(0, 32)}.json`) : undefined;
+  return cache.get(key, async work => {
+    if (saved) {
+      const kept = await readFile(saved, "utf8").then(text => JSON.parse(text) as Loudness, () => undefined);
+      if (kept && "integratedLufs" in kept) return kept;
+    }
+    const measured = await ctx.track(measureLoudness(file, from, to, stop ? AbortSignal.any([work, stop]) : work), projectId);
+    if (saved) {
+      const temp = `${saved}.${process.pid}.tmp`;
+      await writeFile(temp, JSON.stringify(measured)).then(() => rename(temp, saved)).catch(() => {});
+    }
+    return measured;
+  }, signal ? { signal } : {});
 }

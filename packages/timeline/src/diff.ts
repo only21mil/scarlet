@@ -6,7 +6,7 @@
 import type { Clip, Timeline, TimeRange, Track } from "./schema.js";
 import { clipEnd, timelineDuration } from "./time.js";
 import { changedSpots, type ChangedSpot } from "./rebase.js";
-import { stableStringify } from "./ids.js";
+import { sameJson } from "./ids.js";
 
 export type ClipDiff =
   | { type: "added"; trackId: string; clip: Clip }
@@ -45,7 +45,7 @@ function changedFields(a: Record<string, unknown>, b: Record<string, unknown>): 
   const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
   const out: string[] = [];
   for (const k of keys) {
-    if (a[k] !== b[k] && stableStringify(a[k]) !== stableStringify(b[k])) out.push(k);
+    if (!sameJson(a[k], b[k])) out.push(k);
   }
   return out;
 }
@@ -103,7 +103,7 @@ export function diffTimelines(before: Timeline, after: Timeline, fps = 30): Time
   }
   for (const [id, t] of tb) if (!ta.has(id)) tracks.push({ type: "trackAdded", track: t });
 
-  const markersChanged = stableStringify(before.markers) !== stableStringify(after.markers);
+  const markersChanged = !sameJson(before.markers, after.markers);
   const { tracks: _t1, markers: _m1, version: _v1, parent: _p1, createdAt: _c1, ...fa } = before;
   const { tracks: _t2, markers: _m2, version: _v2, parent: _p2, createdAt: _c2, ...fb } = after;
   const timelineFieldsChanged = changedFields(fa as Record<string, unknown>, fb as Record<string, unknown>);

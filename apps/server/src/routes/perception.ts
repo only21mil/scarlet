@@ -29,7 +29,7 @@ export function perceptionRoutes(ctx: Ctx) {
     if (!file) throw notFound("source file");
     const info = await stat(file);
     // A measurement someone asked for, such as a running edit's, isn't stopped by a pause of the project's media work.
-    const result = await measuredLoudness(ctx, file, [media.hash, info.size, info.ctimeMs, info.mtimeMs], { from, to,
+    const result = await measuredLoudness(ctx, file, [media.hash, info.size, info.ctimeMs, info.mtimeMs], { from, to, projectId: media.projectId,
       stop: ctx.projectSignal(media.projectId) });
     return c.json({ mediaId: media.id, ...(from !== undefined && { from }), ...(to !== undefined && { to }), ...result });
   });

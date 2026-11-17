@@ -57,9 +57,12 @@ const CONTEXT_WORDS = 4;
 /** Seconds of audio one worker aligns before yielding its turn. */
 const BATCH_SECONDS = 300;
 /**
- * The same for a recording a dialogue pass is reading. A scan page advances 58 s and runs between two turns, so a
- * turn covers more than a page (runs are at most 30 s, so 90 to 120 s): alignment stays ahead of the pages the
- * pass reads, the first turn included, and no page waits longer than one short turn.
+ * The same while a dialogue pass reads any recording. A scan page advances 58 s and runs between two turns, so a
+ * turn covers more than a page (runs are at most 30 s, so 90 to 120 s): alignment of the recording read stays ahead
+ * of the pages the pass reads, the first turn included, and no page waits longer than one short turn. Another
+ * recording's alignment takes these turns too: on 2026-11-16 a pass's pages waited 1 to 1¾ minutes each for the
+ * five-minute turn of a transcript under way in the background. Turn boundaries can move a word edge by a frame, in
+ * about 0.3% of edges, so a transcript aligned during a pass can differ that much from one aligned without.
  */
 const SHARED_BATCH_SECONDS = 120;
 
@@ -135,9 +138,9 @@ export class WordAligner {
     } finally { await rm(request, { force: true }); }
   }
 
-  /** `wav`: 16 kHz mono PCM (as extractWav writes it) in the same time base as `segments`. With `emissions` it is
-   * not read: the model's output comes from the recording's store, which infers what it lacks from its own decode. */
-  async align(wav: string, segments: TranscriptSegment[], opts: { language?: string; signal: AbortSignal; lane?: { lane: AudioLane; work: AudioWork };
+  /** `wav` supplies 16 kHz mono PCM on the segments' clock. A recording store supplies its own inference
+   * audio for missing windows. Unplaced words still use the segments' audio to measure sound in their gaps. */
+  async align(wav: string | (() => Promise<string>), segments: TranscriptSegment[], opts: { language?: string; signal: AbortSignal; lane?: { lane: AudioLane; work: AudioWork };
     emissions?: EmissionSource; resume?: AlignmentCheckpoint;
     /** Asked before each turn: something this alignment should let finish first, or nothing. */
     hold?: () => Promise<unknown> | undefined;
@@ -183,31 +186,35 @@ export class WordAligner {
     if (nextWord > 0) report(resume?.fraction ?? reached(0));
     // Words the aligner could not place go on the sound between their placed neighbors, measured once per gap.
     const heard = new Map<string, TimeRange[]>();
+    const getWav = () => typeof wav === "string" ? wav : wav();
     const settle = async (whole: boolean) => {
       const gaps = unplacedGaps(segments, timings, MIN_SCORE, fixedPrefix, whole);
-      const sound = gaps.length ? await soundIn(wav, gaps, heard, opts.signal) : undefined;
+      const sound = gaps.length ? await soundIn(await getWav(), gaps, heard, opts.signal) : undefined;
       return applyTimings(segments, timings, MIN_SCORE, fixedPrefix, sound, whole);
     };
     for (let first = 0; first < groups.length;) {
       await opts.hold?.();
       opts.signal.throwIfAborted();
       const { lane } = opts;
-      // Read each turn: a pass can start reading the recording while its transcript is under way.
+      // Read each turn: a pass can start reading the recording, or another one, while its transcript is under way.
       const shared = lane?.lane.focusedOn(lane.work.mediaId) ?? false;
-      const seconds = shared ? SHARED_BATCH_SECONDS : BATCH_SECONDS;
+      const seconds = shared || lane?.lane.reading() ? SHARED_BATCH_SECONDS : BATCH_SECONDS;
       let last = first + 1;
       while (last < groups.length && groups[last]!.end - groups[first]!.start <= seconds) last++;
       const batch = groups.slice(first, last);
+      const runs = batch.map(({ start, end, words }, i) => {
+        const next = groups[first + i + 1]?.words.slice(0, CONTEXT_WORDS);
+        return { start, end, words, ...(next?.length && { next }) };
+      });
+      // A saved window needs only the timing search. The original audio still supplies any unplaced words' gap readings.
+      // A recording is decoded before its turn joins the audio lane, so a pass's reading never waits behind the decode.
+      const cached = emissions ? await storeCovers(emissions, runs, classes) : false;
+      const audio = cached ? "" : emissions ? await emissions.wav() : await getWav();
+      opts.signal.throwIfAborted();
       const turn = async (signal: AbortSignal) => {
-        const model = await (spanish ? this.spanishModel : this.model).get(signal);
-        const runs = batch.map(({ start, end, words }, i) => {
-          const next = groups[first + i + 1]?.words.slice(0, CONTEXT_WORDS);
-          return { start, end, words, ...(next?.length && { next }) };
-        });
-        // The recording is decoded only when the store lacks a window these words need.
-        const audio = !emissions ? wav : await storeCovers(emissions, runs, classes) ? "" : await emissions.wav();
+        const model = cached ? "" : await (spanish ? this.spanishModel : this.model).get(signal);
         // Beside the store the request ends in .part, which the leftover sweep clears from a project's folder.
-        const request = emissions ? `${emissions.file}.${randomUUID()}.part` : `${wav}.${randomUUID()}.align.json`;
+        const request = emissions ? `${emissions.file}.${randomUUID()}.part` : `${audio}.${randomUUID()}.align.json`;
         try {
           await writeFile(request, JSON.stringify({ groups: runs, after, ...(spanish && { language: "es" as const }),
             ...(emissions && { store: { file: emissions.file, offset: emissions.offset ?? 0, duration: emissions.duration } }) } satisfies AlignRequest));
@@ -244,8 +251,9 @@ function recordingAligner(ctx: { paths: { root: string } }) {
   return aligner;
 }
 
+/** A request is waiting on this measurement now, so it goes ahead of background work in the audio lane. */
 export function measureRecordingWords(ctx: { paths: { root: string } }, mediaId: string, source: EmissionSource, ranges: TimeRange[], signal: AbortSignal) {
-  return audioLane(ctx).run({ mediaId, kind: "page" }, signal, () => recordingAligner(ctx).measure(source, ranges, signal));
+  return audioLane(ctx).run({ mediaId, kind: "page", asked: true }, signal, () => recordingAligner(ctx).measure(source, ranges, signal));
 }
 
 /**
@@ -253,7 +261,7 @@ export function measureRecordingWords(ctx: { paths: { root: string } }, mediaId:
  * Returns new segments with the same text. Unsupported languages keep their original times. Throws when the
  * aligner model cannot be prepared or the worker fails; callers may keep the original segments.
  */
-export function alignWords(ctx: { paths: { root: string } }, wav: string, segments: TranscriptSegment[],
+export function alignWords(ctx: { paths: { root: string } }, wav: string | (() => Promise<string>), segments: TranscriptSegment[],
   opts: { language?: string; signal: AbortSignal; work?: AudioWork; emissions?: EmissionSource; resume?: AlignmentCheckpoint; hold?: () => Promise<unknown> | undefined;
     onProgress?: (fraction: number) => void; onTurn?: AlignmentTurn;
     onPlaced?: (placed: number, words: number) => void }): Promise<TranscriptSegment[]> {
@@ -272,7 +280,7 @@ export async function alignTranscript(ctx: { paths: { root: string; tmp: string 
     emissions?: string; resume?: AlignmentCheckpoint;
     /** Asked before each turn: something this alignment should let finish first, or nothing. */
     hold?: () => Promise<unknown> | undefined;
-    onProgress?: (fraction: number) => void; onTurn?: AlignmentTurn }) {
+    onProgress?: (fraction: number) => void; onTurn?: AlignmentTurn; onFailure?: () => void }) {
   const { source, language, segments, signal, work, onProgress, hold } = input;
   if (!alignsLanguage(language) || !segments.some(s => s.words.length)) return segments;
   let placed = segments;
@@ -281,16 +289,24 @@ export async function alignTranscript(ctx: { paths: { root: string; tmp: string 
     input.onTurn!(soFar, through, checkpoint);
   });
   const wav = input.wav ?? join(ctx.paths.tmp, `${randomUUID()}.wav`);
+  let decoded = !!input.wav;
+  const audio = async () => {
+    if (!decoded) {
+      await extractWav(source, wav, { signal });
+      decoded = true;
+    }
+    return wav;
+  };
   const started = Date.now();
   const onPlaced = (count: number, words: number) =>
     ctx.log(`[align] ${basename(source)}: placed ${count} of ${words} words in ${humanDuration(Date.now() - started)}`);
   try {
-    if (!input.wav) await extractWav(source, wav, { signal });
-    const emissions = input.emissions === undefined ? undefined : { file: input.emissions, wav: async () => wav };
-    return await alignWords(ctx, wav, segments, { language, signal, work, emissions, resume: input.resume, hold, onProgress, onTurn, onPlaced });
+    const emissions = input.emissions === undefined ? undefined : { file: input.emissions, wav: audio };
+    return await alignWords(ctx, audio, segments, { language, signal, work, emissions, resume: input.resume, hold, onProgress, onTurn, onPlaced });
   } catch (error) {
     signal.throwIfAborted();
     ctx.log(`[align] ${basename(source)}: ${(error as Error).message}`);
+    input.onFailure?.();
     return placed;
   } finally {
     if (!input.wav) await rm(wav, { force: true });

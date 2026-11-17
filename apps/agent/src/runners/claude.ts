@@ -303,6 +303,8 @@ export async function runClaude(opts: RunAgentOptions): Promise<RunAgentResult> 
   // Avoid nested-session refusal when the host itself runs under Claude Code.
   delete env.CLAUDECODE;
   delete env.CLAUDE_CODE_ENTRYPOINT;
+  // Scarlet's tools wait up to `toolWaitSeconds` (capabilities.ts) for evidence still being measured.
+  env.MCP_TOOL_TIMEOUT ??= "300000";
 
   const handle = spawnLines(cmd.file, cmd.args, {
     cwd: opts.cwd,

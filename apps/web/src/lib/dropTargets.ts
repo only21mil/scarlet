@@ -1,3 +1,4 @@
+import { appLog } from "./appLog";
 import { desktop, type DesktopPlatform } from "./desktop";
 
 interface DropTarget {
@@ -33,12 +34,15 @@ export function listenForFileDrops(platform: DesktopPlatform) {
       next?.highlight(true);
       previous = next;
     }
-    if (event.type === "drop" && event.paths.length) target?.drop(event.paths);
-  });
-  void unlisten.catch(error => console.error("Could not receive dropped files", error));
+    if (event.type === "drop" && event.paths.length) {
+      appLog("action", "file-drop", { count: event.paths.length, outcome: target ? "accepted" : "no-target" },
+        { level: target ? "info" : "warn" });
+      target?.drop(event.paths);
+    }
+  }).catch(() => undefined);
   return () => {
     active = false;
     previous?.highlight(false);
-    void unlisten.then(off => off()).catch(() => undefined);
+    void unlisten.then(off => off?.()).catch(() => undefined);
   };
 }

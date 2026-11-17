@@ -9,7 +9,7 @@ import { timelineDuration, type Project, type Timeline, type TranscriptWord } fr
 import { auditJoin, formatTimelineTranscript, newJoins, timelineJoins, timelineWords, type JoinAudit, type TimelineJoin } from "./timeline-perception.js";
 import { pictureEntranceReader } from "./picture-entrance.js";
 import { levelProfile, pauseStats, retakeGroups } from "./media-profile.js";
-import { json, text } from "./tool-result.js";
+import { json, noteEvidenceMiss, text } from "./tool-result.js";
 import { OTHER_INPUT } from "./analysis.js";
 
 type ToolRegistrar = <Shape extends z.ZodRawShape>(name: ScarletToolName, description: string, shape: Shape,
@@ -25,7 +25,7 @@ interface PerceptionDeps {
   peekTimeline(version: string): Promise<Timeline>;
   /** The portion of an edited transcript actually returned to the agent. */
   readPassage(version: string, range: { start: number; end: number }): void;
-  getProject(): Promise<ProjectDetail>;
+  getProject(): Promise<Pick<ProjectDetail, "project">>;
   /** A media's words in transcript_get order (index = stable word index), or null without a transcript. */
   /** With `through`, only words whose times are final up to that source second: it rejects while alignment hasn't reached it. */
   transcriptWords(mediaId: string, prepareMissing?: boolean, through?: number): Promise<TranscriptWord[] | null>;
@@ -208,7 +208,10 @@ export function registerPerception(deps: PerceptionDeps) {
         deps.readWaveform(mediaId, lo, hi, points),
         deps.transcriptWords(mediaId, false, hi).catch(without(`failed to read the words of ${mediaId} for its profile`, null)),
         client.get<Record<string, unknown>>(`/projects/${encodeURIComponent(deps.projectId)}/media/${encodeURIComponent(mediaId)}/loudness${qs ? `?${qs}` : ""}`)
-          .catch((err: unknown) => ({ unavailable: err instanceof ScarletApiError ? err.message : String(err) })),
+          .catch((err: unknown) => {
+            noteEvidenceMiss("loudness");
+            return { unavailable: err instanceof ScarletApiError ? err.message : String(err) };
+          }),
       ]);
       const words = all?.map((w, index) => ({ ...w, index })).filter(w => w.end > lo && w.start < hi) ?? null;
       // A transcript saved and still being aligned has its words, but pauses and retakes are measured from their times,

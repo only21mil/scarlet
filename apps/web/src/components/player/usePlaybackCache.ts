@@ -3,7 +3,11 @@ import { fullRenderContext, type PlaybackCacheStatus, type Render } from "@scarl
 import type { Project } from "@scarlet/timeline";
 import { api } from "../../lib/client";
 import { useProjectStore } from "../../stores/project";
+import { useUiStore } from "../../stores/ui";
 import { renderCompletion } from "../../lib/renderCompletion";
+
+/** How often a caching render is read back while the socket reports it anyway. */
+const SOCKET_POLL_MS = 15_000;
 
 interface Cache extends PlaybackCacheStatus { url?: string; renderId?: string }
 
@@ -79,7 +83,17 @@ export function usePlaybackCache(project: Project, { version, mediaId, automatic
           return;
         }
         waiting = new AbortController();
-        const completed = await renderCompletion(id, pendingId, delay, waiting.signal);
+        // The socket brings the render's progress and its end, so with it open, ask the engine only now and then
+        // in case an event was missed. Re-render only when the whole percent moves.
+        const socketOpen = useUiStore.getState().wsStatus === "open";
+        let shown = Math.floor((cache.progress ?? 0) * 100);
+        const completed = await renderCompletion(id, pendingId, prepareSoon || !socketOpen ? delay : SOCKET_POLL_MS, waiting.signal, render => {
+          if (!live || sequence !== generation || render.state !== "running") return;
+          const percent = Math.floor((render.progress ?? 0) * 100);
+          if (percent === shown) return;
+          shown = percent;
+          setResult({ key, cache: renderStatus(render) });
+        });
         if (!live || sequence !== generation) return;
         if (!completed || (prepareSoon && completed.state !== "done")) { void resume(); return; }
         ownedId = undefined;

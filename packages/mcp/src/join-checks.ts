@@ -1,5 +1,5 @@
 import { setTimeout as delay } from "node:timers/promises";
-import { json, text, unmeasured, type ToolResult } from "./tool-result.js";
+import { json, notePreparing, text, unmeasured, type ToolResult } from "./tool-result.js";
 
 type JoinReading = Record<string, unknown>;
 type Run = (publish: (index: number, reading: JoinReading, inspected?: () => void) => void) => Promise<ToolResult | void>;
@@ -68,7 +68,10 @@ export class JoinChecks {
       if (this.jobs.size >= 16) {
         const oldest = [...this.jobs].filter(([, j]) => j.finished !== undefined).sort((a, b) => a[1].finished! - b[1].finished!)[0];
         if (oldest) this.jobs.delete(oldest[0]);
-        else return json({ status: "busy", version, next: "Other join checks are still running. Collect one of those checks, then retry this one." });
+        else {
+          notePreparing();
+          return json({ status: "busy", version, next: "Other join checks are still running. Collect one of those checks, then retry this one." });
+        }
       }
       const readings = Array<JoinReading | undefined>(count).fill(undefined);
       const missed = new Map<string, string>();
@@ -89,7 +92,10 @@ export class JoinChecks {
     try {
       const result = await Promise.race([job.done, delay(waitMs, pending, { signal: timer.signal, ref: false })]);
       for (const [what, why] of job.missed) unmeasured.getStore()?.set(what, why);
-      if (typeof result === "symbol") return joinList(job, version, true);
+      if (typeof result === "symbol") {
+        notePreparing();
+        return joinList(job, version, true);
+      }
       if (this.jobs.get(key) === job) this.jobs.delete(key);
       if (!result) return joinList(job, version, false);
       // The single-cut response includes all of its audio evidence.

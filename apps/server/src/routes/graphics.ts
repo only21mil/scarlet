@@ -145,7 +145,7 @@ export function graphicRoutes(ctx: Ctx) {
     }
     if (!options) throw badRequest("missing_options", "multipart field `options` is required");
     const signal = AbortSignal.any([ctx.projectSignal(project.id), c.req.raw.signal]);
-    const result = await ctx.track(renderProjectGraphic(ctx, project, { options, html, assets }, c.var.user, check, signal));
+    const result = await ctx.track(renderProjectGraphic(ctx, project, { options, html, assets }, c.var.user, check, signal), project.id);
     return c.json(result, result.media ? 201 : 200);
   });
 

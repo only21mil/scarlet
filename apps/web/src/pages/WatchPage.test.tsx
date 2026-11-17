@@ -47,7 +47,7 @@ const importing = async (path: string) => {
   return projectId;
 };
 /** The request lines in the log, without their clock or how long the request took. */
-const requests = () => { stopAppLog(); return log.filter(l => l.line.startsWith("[api] ")).map(l => [l.level, l.line.replace(/^\[api\] \S+ \+\d+ms /, "").replace(/ ms=\d+/, "")]); };
+const requests = () => { stopAppLog(); return log.filter(l => l.line.startsWith("[api] ")).map(l => [l.level, l.line.replace(/^\[api\] \S+ \+\d+ms /, "").replace(/ ms=\d+/, "").replace(/ request=[a-f0-9-]{36}/, "")]); };
 
 it("shows the first frame of a file as it comes in, asked for through the logged request, by path alone", async () => {
   fetched.mockResolvedValue(new Response("frame", { status: 200 }));
@@ -56,20 +56,22 @@ it("shows the first frame of a file as it comes in, asked for through the logged
   expect(fetched).toHaveBeenCalledTimes(1);
   const [url, init] = fetched.mock.calls[0]!;
   expect(String(url)).toBe(api.url(`/projects/${projectId}/media/import-frame`));
+  expect(new Headers(init?.headers).get("X-Scarlet-Request-Id")).toMatch(/^[a-f0-9-]{36}$/);
   expect([init?.method, init?.body]).toEqual(["POST", JSON.stringify({ path: "/Users/editor/Footage/Board meeting.mov" })]);
   expect(container.querySelector("img")?.getAttribute("src")).toBe("blob:first-frame");
   // The log has the request and how it ended. Where the editor's file is and what it is called stay out of it.
-  expect(requests()).toEqual([["info", `did method=POST path=${new URL(String(url)).pathname} status=200`]]);
+  expect(requests()).toEqual([["info", `did method=POST path=${new URL(String(url)).pathname} status=200 phase=headers`]]);
   expect(log.map(l => l.line).join("\n")).not.toMatch(/Board|Footage|editor/);
 });
 
-it("logs the engine's reason when it can't read a frame, and shows the import without a picture", async () => {
+it("logs the engine status when it can’t read a frame, and shows the import without a picture", async () => {
   fetched.mockResolvedValue(new Response(JSON.stringify({ error: { code: "unreadable", message: "No frame could be decoded." } }), { status: 422 }));
   const projectId = await importing("/Volumes/Card/clip.mxf");
   await act(async () => {});
   expect(container.querySelector("img")).toBeNull();
   expect(container.textContent).toContain("clip.mxf");
-  expect(requests()).toEqual([["warn", `failed method=POST path=/api/projects/${projectId}/media/import-frame status=422 reason=${JSON.stringify(JSON.stringify({ error: { code: "unreadable", message: "No frame could be decoded." } }))}`]]);
+  expect(requests()).toEqual([["warn", `failed method=POST path=/api/projects/${projectId}/media/import-frame status=422`],
+    ["warn", `error-code method=POST path=/api/projects/${projectId}/media/import-frame status=422 code=unreadable`]]);
 });
 
 it("logs an engine that can't be reached, and one request called off by leaving as stopped, not as a failure", async () => {
@@ -84,8 +86,8 @@ it("logs an engine that can't be reached, and one request called off by leaving 
   await act(async () => root.render(null));
   await act(async () => {});
   expect(requests()).toEqual([
-    ["warn", `unreachable method=POST path=/api/projects/${projectId}/media/import-frame error="TypeError: Failed to fetch"`],
-    ["info", `stopped method=POST path=/api/projects/${second}/media/import-frame`],
+    ["warn", `unreachable method=POST path=/api/projects/${projectId}/media/import-frame name=TypeError error="TypeError: Failed to fetch"`],
+    ["info", `stopped method=POST path=/api/projects/${second}/media/import-frame name=AbortError`],
   ]);
 });
 

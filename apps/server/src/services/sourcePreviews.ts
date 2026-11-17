@@ -5,11 +5,13 @@ import type { PlaybackCacheStatus, SourceCacheStatus } from "@scarlet/shared";
 import { isPlayableMedia, SOURCE_PREVIEW_SECONDS } from "@scarlet/timeline";
 import { engineIsAlive, type Ctx } from "../context.js";
 import { badRequest } from "../errors.js";
-import { throttledLog } from "../logText.js";
+import { logId, throttledLog } from "../logText.js";
 import type { MediaWithStatus } from "../repo/projects.js";
 import { fullProxyVariants, legacyFullPicture, previewIdentity, sourceCheckpointDir } from "./previewPictures.js";
+import { editorFirst } from "./editorFirst.js";
 
 type SourceMedia = MediaWithStatus & { projectId: string };
+type SourcePlaybackCache = PlaybackCacheStatus & Pick<SourceCacheStatus, "queued">;
 type CacheRequest = { worker_pid: number | null };
 interface CachePoll {
   requests: Map<string, CacheRequest>;
@@ -37,7 +39,7 @@ export function cacheTimeLeft(now: () => number = () => performance.now()) {
 class SourcePreviews {
   private readonly encoding = new Map<string, Promise<void>>();
 
-  private readonly fullJobs = new Map<string, PlaybackCacheStatus>();
+  private readonly fullJobs = new Map<string, SourcePlaybackCache>();
   private readonly fullRuns = new Map<string, Promise<void>>();
 
   private async fullTarget(ctx: Ctx, media: SourceMedia, fileKey?: string, poll?: CachePoll) {
@@ -71,7 +73,7 @@ class SourcePreviews {
     return (await this.fullTarget(ctx, media, fileKey)).readyFile;
   }
 
-  async full(ctx: Ctx, media: SourceMedia, prepare: boolean, poll?: CachePoll): Promise<{ status: PlaybackCacheStatus; run?: Promise<void> }> {
+  async full(ctx: Ctx, media: SourceMedia, prepare: boolean, poll?: CachePoll): Promise<{ status: SourcePlaybackCache; run?: Promise<void> }> {
     if (media.kind !== "video") throw badRequest("not_video", "Choose a video to cache.");
     const signal = prepare ? ctx.mediaSignal(media.projectId) : undefined;
     const { identity, target: { file, height, suffix }, readyFile } = await this.fullTarget(ctx, media, undefined, poll);
@@ -85,43 +87,68 @@ class SourcePreviews {
     const existing = this.fullJobs.get(file);
     if (existing?.state === "caching") return { status: existing, run: this.fullRuns.get(file) };
     if (active) return { status: { state: "caching" } };
-    if (!signal || signal.aborted) return { status: existing ?? { state: "uncached" } };
+    if (!signal) return { status: existing ?? { state: "uncached" } };
+    if (signal.aborted) return { status: request ? { state: "uncached", queued: true } : existing ?? { state: "uncached" } };
     // Only one engine publishes or cleans up a recording's checkpoint directory.
-    const claimed = ctx.db.prepare(`INSERT INTO source_cache_requests VALUES (?, ?)
+    const claimed = ctx.db.prepare(`INSERT INTO source_cache_requests (media_id, worker_pid)
+      SELECT m.id, ? FROM media m JOIN projects p ON p.id = m.project_id
+      WHERE m.id = ? AND p.deleted_at IS NULL AND p.media_paused = 0
       ON CONFLICT(media_id) DO UPDATE SET worker_pid = excluded.worker_pid WHERE worker_pid IS ?`)
-      .run(media.id, process.pid, request?.worker_pid ?? null);
+      .run(process.pid, media.id, request?.worker_pid ?? null);
     if (!claimed.changes) return { status: { state: "caching" } };
-    const job: PlaybackCacheStatus = { state: "caching", progress: 0 };
+    const job: SourcePlaybackCache = { state: "caching", progress: 0 };
     this.fullJobs.set(file, job);
     const run = ctx.track((async () => {
       const temp = file + "." + randomUUID() + ".part.mp4";
       const checkpointDir = sourceCheckpointDir(ctx.paths.proxies(media.projectId), identity.local, suffix);
       const timeLeft = cacheTimeLeft();
+      const started = performance.now();
+      const target = `media=${logId(media.id)} project=${logId(media.projectId)} height=${height}`;
+      const result = (outcome: "done" | "failed" | "interrupted", reason?: "shutdown" | "media_stopped") => {
+        ctx.log(`[media] proxy_finished ${target} outcome=${outcome} elapsed_ms=${Math.round(performance.now() - started)}` +
+          (reason ? ` reason=${reason}` : ""));
+      };
+      ctx.log(`[media] proxy_started ${target}`);
+      let interrupted = false;
       try {
         await mkdir(ctx.paths.proxies(media.projectId), { recursive: true });
+        signal.throwIfAborted();
         await ctx.render.makeProxy(identity.file, temp, {
           height, hwaccel: ctx.settings().render.hwaccel, signal, checkpointDir,
+          onFallback: stage => ctx.log(`[media] proxy_fallback ${target} stage=${stage}`),
           onProgress: p => { job.progress = p; job.remainingSeconds = timeLeft(p); },
         });
         await identity.check();
         signal.throwIfAborted();
         await rename(temp, file);
         ctx.bus.publish({ type: "media.previewReady", projectId: media.projectId, mediaId: media.id });
+        result("done");
         // A scrub may still have a finished checkpoint open on Windows.
         await rm(checkpointDir, { recursive: true, force: true, maxRetries: 5 }).catch(error => ctx.log(`[media] ${media.id} couldn’t remove its source checkpoints: ${error}`));
         this.fullJobs.delete(file);
       } catch (error) {
-        job.state = "failed";
+        interrupted = signal.aborted;
         delete job.remainingSeconds;
-        if (signal.aborted) this.fullJobs.delete(file);
-        else ctx.log(`[media] ${media.id} couldn’t cache its source preview: ${error}`);
+        if (interrupted) {
+          job.state = "uncached";
+          job.queued = true;
+          delete job.progress;
+          this.fullJobs.delete(file);
+          result("interrupted", ctx.shutdown.aborted ? "shutdown" : "media_stopped");
+        } else {
+          job.state = "failed";
+          result("failed");
+          ctx.log(`[media] ${media.id} couldn’t cache its source preview: ${error}`);
+        }
       } finally {
-        if (signal.aborted) ctx.db.prepare("UPDATE source_cache_requests SET worker_pid = NULL WHERE media_id = ? AND worker_pid = ?").run(media.id, process.pid);
+        await rm(temp, { force: true }).catch(() => {});
+        if (interrupted) ctx.db.prepare("UPDATE source_cache_requests SET worker_pid = NULL WHERE media_id = ? AND worker_pid = ?").run(media.id, process.pid);
         else ctx.db.prepare("DELETE FROM source_cache_requests WHERE media_id = ? AND worker_pid = ?").run(media.id, process.pid);
         this.fullRuns.delete(file);
-        await rm(temp, { force: true }).catch(() => {});
+        // Resume can arrive before this encoder releases its claim. Put an explicit cache back in the queue then.
+        if (interrupted && !ctx.mediaSignal(media.projectId).aborted) queueSourceProxies(ctx, [media.id]);
       }
-    })());
+    })(), media.projectId);
     this.fullRuns.set(file, run);
     return { status: job, run };
   }
@@ -169,7 +196,14 @@ class SourcePreviews {
       if ((await stat(file).catch(() => null))?.size) return;
       const temp = file + "." + randomUUID() + ".part.mp4";
       try {
-        await ctx.render.makeProxy(identity.file, temp, { height, range, hwaccel: ctx.settings().render.hwaccel, signal: lifetime });
+        await ctx.render.makeProxy(identity.file, temp, {
+          height, range, hwaccel: ctx.settings().render.hwaccel, signal: lifetime,
+          onFallback: stage => {
+            let log = proxyFallbacks.get(ctx);
+            if (!log) proxyFallbacks.set(ctx, log = throttledLog(ctx.log));
+            log(`${media.id}/${stage}`, `[media] proxy_fallback media=${logId(media.id)} project=${logId(media.projectId)} height=${height} stage=${stage}`);
+          },
+        });
         await identity.check();
         try { await rename(temp, file); }
         catch (error) { if (!(await stat(file).catch(() => null))?.size) throw error; }
@@ -187,7 +221,7 @@ class SourcePreviews {
         await Promise.all(files.filter(entry => entry.path !== file).slice(0, names.length - 32)
           .map(entry => rm(entry.path, { force: true }).catch(() => {})));
       }
-    })().finally(() => this.encoding.delete(file)));
+    })().finally(() => this.encoding.delete(file)), media.projectId);
     this.encoding.set(file, job);
     await job;
     return file;
@@ -200,6 +234,7 @@ export const sourcePreviews = new SourcePreviews();
 const proxyQueue = new WeakMap<Ctx, { queued: Set<string>; tail: Promise<void> }>();
 // The window polls every cache's status, so a status that can't be read is logged once a minute, not once a poll.
 const statusFailures = new WeakMap<Ctx, ReturnType<typeof throttledLog>>();
+const proxyFallbacks = new WeakMap<Ctx, ReturnType<typeof throttledLog>>();
 
 /**
  * Prepare complete proxies at the editing resolution, one source at a time, when the GPU can encode them.
@@ -224,21 +259,28 @@ function queueSourceProxies(ctx: Ctx, mediaIds: string[]): void {
   if (ctx.shutdown.aborted) return;
   let queue = proxyQueue.get(ctx);
   if (!queue) proxyQueue.set(ctx, queue = { queued: new Set(), tail: Promise.resolve() });
-  for (const id of mediaIds) {
-    if (queue.queued.has(id)) continue;
-    ctx.db.prepare("INSERT OR IGNORE INTO source_cache_requests SELECT id, NULL FROM media WHERE id = ?").run(id);
-    queue.queued.add(id);
-    const q = queue;
+  const q = queue;
+  const pending = [...new Set(mediaIds)].filter(id => !q.queued.has(id));
+  if (!pending.length) return;
+  const added = ctx.db.prepare(`INSERT OR IGNORE INTO source_cache_requests (media_id, worker_pid)
+    SELECT m.id, NULL FROM json_each(?) AS j JOIN media m ON m.id = j.value ORDER BY j.key
+    RETURNING media_id`).all(JSON.stringify(pending)) as { media_id: string }[];
+  const registered = new Set(added.map(row => row.media_id));
+  for (const id of pending) {
+    if (registered.has(id)) ctx.log(`[media] proxy_queued media=${logId(id)}`);
+    q.queued.add(id);
     q.tail = q.tail.then(async () => {
       try {
         // Nothing to cache after all, so nothing is left waiting.
-        if (!(await cacheInTurn(ctx, id))) ctx.db.prepare("DELETE FROM source_cache_requests WHERE media_id = ? AND worker_pid IS NULL").run(id);
+        // A source proxy speeds later previews. Nobody waits for it, so it yields to the editor's playback.
+        if (!(await editorFirst.run(() => true, () => cacheInTurn(ctx, id)))) ctx.db.prepare("DELETE FROM source_cache_requests WHERE media_id = ? AND worker_pid IS NULL").run(id);
       } catch (error) {
         if (!ctx.shutdown.aborted) ctx.log(`[media] ${id} couldn’t prepare its source proxy: ${error}`);
       } finally {
         q.queued.delete(id);
       }
     });
+    // This promise may wait on another project. The encoder tracks its own project once it starts.
     void ctx.track(q.tail);
   }
 }
@@ -249,9 +291,12 @@ async function cacheInTurn(ctx: Ctx, id: string): Promise<boolean> {
   if (ctx.shutdown.aborted) return true;
   const media = ctx.repos.projects.getMedia(id);
   if (!media || media.kind !== "video" || media.status !== "ready" || !media.duration) return false;
-  if (ctx.mediaSignal(media.projectId).aborted) return true;
-  const { run } = await sourcePreviews.full(ctx, media, true);
-  await run;
+  while (!ctx.mediaSignal(media.projectId).aborted) {
+    const { status, run } = await sourcePreviews.full(ctx, media, true);
+    await run;
+    // A turn still in the queue owns its own retry if the pause ended before its worker handed back the job.
+    if (!status.queued) break;
+  }
   return true;
 }
 

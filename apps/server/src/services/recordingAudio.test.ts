@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import * as ffmpeg from "../render/ffmpeg.js";
-import { emissionStore, recordingWav } from "./recordingAudio.js";
+import { speechActivity } from "@scarlet/render";
+import { emissionStore, recordingSpeechActivity, recordingWav } from "./recordingAudio.js";
 
 let dir: string;
 beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "scarlet-recording-audio-")); });
@@ -116,3 +117,31 @@ it("leaves a decode it can't delete where it is, without an unhandled failure th
     expect(unhandled).not.toHaveBeenCalled();
   } finally { process.off("unhandledRejection", unhandled); }
 });
+
+it("finds the speech in a window from the recording's one decode where a decode of the window finds it", async () => {
+  // Two and a half minutes of compressed sound: bursts of noise and of a voiced buzz, with pauses between, at levels
+  // and lengths that vary through the recording, so windows start and end inside speech and inside pauses.
+  const source = join(dir, "talk.m4a");
+  const burst = "gt(sin(2*PI*t/(2.3+sin(t/7)))\\,-0.2)";
+  await ffmpeg.ffmpeg(["-f", "lavfi", "-i", `aevalsrc=(0.25*sin(2*PI*140*t)*sin(2*PI*3*t)+0.05*random(0))*${burst}*(0.6+0.4*sin(t/11)):d=150:s=44100`,
+    "-c:a", "aac", "-b:a", "96k", "-y", source]);
+  const decode = vi.spyOn(ffmpeg, "extractWav");
+  // The detector's 20 ms frames, voiced or not, through the window.
+  const frames = (spans: Array<{ start: number; end: number }>, from: number, to: number) => Array.from({ length: Math.round((to - from) / 0.02) },
+    (_, i) => spans.some(span => span.start <= from + (i + 0.5) * 0.02 && from + (i + 0.5) * 0.02 < span.end));
+  let total = 0, differing = 0;
+  for (const from of [0, 0.2, 17.31, 45.07, 58, 88.83, 89.99, 116]) {
+    const to = Math.min(150, from + 60);
+    const [whole, window] = await Promise.all([recordingSpeechActivity(ctx(), source, from, to, signal), speechActivity(source, from, to, signal)]);
+    expect(window.length).toBeGreaterThan(3);
+    const a = frames(whole, from, to), b = frames(window, from, to);
+    total += a.length;
+    differing += a.filter((voiced, i) => voiced !== b[i]).length;
+  }
+  // A decode of the window starts its decoder and resampler cold at the window, and the detector adapts to what it
+  // hears, so a frame on the edge of speech can go either way: here 28 of 22,700 frames did, 16 of them one short
+  // pause the window's decode heard as speech. The rest agree frame for frame.
+  expect(differing / total).toBeLessThan(0.002);
+  // Every window read the one decode.
+  expect(decode).toHaveBeenCalledTimes(1);
+}, 60_000);

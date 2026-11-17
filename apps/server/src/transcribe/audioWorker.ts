@@ -13,6 +13,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { isSea } from "node:sea";
 import { fileURLToPath } from "node:url";
+import { editorFirst, type StillBackground } from "../services/editorFirst.js";
 
 export type AudioRequest =
   /** `request`: a file holding an AlignRequest (wordAlign.ts). `wav` may be empty when the recording's store has every window. */
@@ -25,9 +26,12 @@ export type AudioRequest =
   | { kind: "faces"; frames: string; width: number; height: number; model: string };
 
 type Reply = { id: number; result?: unknown; error?: string; progress?: number } | { note: string };
-/** `worker`: the helper the job was sent to. `cancel`: stops listening to its signal, in the queue and then at work. */
+/**
+ * `worker`: the helper the job was sent to. `cancel`: stops listening to its signal, in the queue and then at work.
+ * `background`: the request is background work's (editorFirst.ts), such as an import's word alignment.
+ */
 type Job = { id: number; message: AudioRequest; signal?: AbortSignal; onProgress?: (done: number) => void;
-  resolve(value: unknown): void; reject(error: unknown): void; cancel?: () => void; worker?: ChildProcess };
+  resolve(value: unknown): void; reject(error: unknown): void; cancel?: () => void; worker?: ChildProcess; background?: StillBackground };
 
 const IDLE_MS = 30_000;
 let child: ChildProcess | undefined;
@@ -41,6 +45,12 @@ function start() {
   const args = isSea() ? [] : [fileURLToPath(new URL("../../dist/cli.js", import.meta.url))];
   const started = spawn(process.execPath, [...args, "audio-worker"], { windowsHide: true, stdio: ["ignore", "ignore", "pipe", "ipc"] });
   errors = "";
+  // The helper serves background work and a pass's alike: it yields to the editor while its request is background work's.
+  if (started.pid !== undefined) {
+    const release = editorFirst.adopt(started.pid, () => current?.worker === started && !!current.background?.());
+    started.once("exit", release);
+    started.once("error", release);
+  }
   started.stderr!.on("data", (data: Buffer) => { errors = (errors + data.toString("utf8")).slice(-4000); });
   started.on("message", (reply: Reply) => {
     if ("note" in reply) return audioWorker.log?.(`[audio] ${reply.note}`);
@@ -100,6 +110,7 @@ function pump() {
     const abort = () => { if (child === worker) child = undefined; worker.kill("SIGKILL"); };
     job.signal?.addEventListener("abort", abort, { once: true });
     job.cancel = () => job.signal?.removeEventListener("abort", abort);
+    editorFirst.check();
     worker.send({ id: job.id, ...job.message }, error => {
       if (error) finish(job, () => job.reject(error));
     });
@@ -118,7 +129,8 @@ export const audioWorker = {
     const { signal, onProgress } = options;
     if (signal?.aborted) return Promise.reject(signal.reason);
     return new Promise<T>((resolve, reject) => {
-      const job: Job = { id: next++, message, signal, onProgress, resolve: resolve as (value: unknown) => void, reject };
+      const job: Job = { id: next++, message, signal, onProgress, resolve: resolve as (value: unknown) => void, reject,
+        background: editorFirst.current() };
       const dequeue = () => {
         const index = queue.indexOf(job);
         if (index < 0) return;

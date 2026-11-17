@@ -1,118 +1,81 @@
-import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
+import { isComposing } from "../../lib/hotkeys";
 import { useUiStore } from "../../stores/ui";
 import { Icon } from "../ui/primitives";
 
-/** One thing the message is about: the cut, edit or moment the box is aimed at, or a stretch marked on the ruler. */
+/** One thing the message is about: a cut, edit, moment, or marked stretch. */
 export interface AimItem {
   key: string;
-  kind: "target" | "range";
-  /** "Cut at 0:35", "2:40 – 2:58" */
   name: string;
-  /** "the cut that’s open", "18 s you marked" */
-  detail: string;
+  displayName?: string;
   clearLabel: string;
   onClear(): void;
 }
 
-/** How long the card shows by itself when something is attached, and how long the icon's pulse runs after it folds. */
-export const ARRIVAL_MS = 2000;
-const PULSE_MS = 700;
-/** A pointer that leaves the icon for its card, or back, crosses a gap: the card waits this long before it closes. */
-const LEAVE_MS = 150;
-
-/** An edit point: two clips meeting at a line. */
-function EditPoint() {
-  return <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"
-    strokeLinejoin="round" aria-hidden="true"><path d="M8 1.5v13" /><path d="M3 4.5h3.5v7H3M13 4.5H9.5v7H13" /></svg>;
-}
-
-/**
- * What the message is about, folded into one icon of a fixed size at the start of the box. Hovering it, focusing it or
- * clicking it opens a card that lists each thing with its own ×, and lights them on the timeline. When something is
- * attached, the card shows by itself for a moment with that line lit, then folds into the icon with one pulse.
- */
-export function ComposerAim({ items, disabled, disabledReason }: { items: AimItem[]; disabled?: boolean; disabledReason?: string }) {
+export function ComposerAim({ items, disabled, disabledReason }: {
+  items: [AimItem, ...AimItem[]]; disabled?: boolean; disabledReason?: string;
+}) {
   const id = useId();
+  const group = useRef<HTMLDivElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const [open, setOpen] = useState(false);
   const [hovered, setHovered] = useState(false);
-  const [pinned, setPinned] = useState(false);
-  const [arrived, setArrived] = useState<string>();
-  const [pulse, setPulse] = useState(false);
-  const leave = useRef<number>(undefined);
+  const [focused, setFocused] = useState(false);
   const setLit = useUiStore(s => s.setAimLit);
-  // A line attached since the last render arrives: the card shows it for a moment. What was there when the box opened doesn't.
-  const known = useRef<Set<string>>(undefined);
-  const keys = items.map(i => i.key).join("\n");
-  useLayoutEffect(() => {
-    const now = new Set(items.map(i => i.key));
-    const before = known.current;
-    known.current = now;
-    // Only something added shows, also the first thing aimed in an empty box: stepping from one cut to the next swaps
-    // one line for another, and stays folded.
-    const added = before && now.size > before.size && items.find(i => !before.has(i.key));
-    if (added) setArrived(added.key);
-    else if (!now.size) { setArrived(undefined); setPinned(false); setHovered(false); }
-  }, [keys]); // eslint-disable-line react-hooks/exhaustive-deps
+  const [primary, ...additional] = items;
+  if (open && !additional.length) setOpen(false);
+
   useEffect(() => {
-    if (!arrived) return;
-    const fold = window.setTimeout(() => { setArrived(undefined); setPulse(true); }, ARRIVAL_MS);
-    return () => clearTimeout(fold);
-  }, [arrived]);
+    setLit(hovered || focused || open);
+    return () => setLit(false);
+  }, [hovered, focused, open, setLit]);
+
   useEffect(() => {
-    if (!pulse) return;
-    const done = window.setTimeout(() => setPulse(false), PULSE_MS);
-    return () => clearTimeout(done);
-  }, [pulse]);
-  const open = hovered || pinned || !!arrived;
-  useEffect(() => { setLit(hovered || pinned); }, [hovered, pinned, setLit]);
-  useEffect(() => () => { clearTimeout(leave.current); setLit(false); }, [setLit]);
-  const close = () => { clearTimeout(leave.current); setPinned(false); setHovered(false); setArrived(undefined); };
-  // Opened by a click or by focus, the card stays until a press elsewhere or Esc, wherever the keyboard is: a click
-  // focuses the icon in some windows (WebView2, WebKitGTK) and not in others (WKWebView), and opens it alike in each.
-  const own = useRef<HTMLSpanElement>(null);
-  const held = pinned || hovered;
-  useEffect(() => {
-    if (!held) return;
-    const press = (e: PointerEvent) => { if (!own.current?.contains(e.target as Node | null)) { setPinned(false); setHovered(false); } };
-    const key = (e: KeyboardEvent) => {
-      if (e.key !== "Escape" || e.defaultPrevented || e.isComposing) return;
-      e.preventDefault();
-      e.stopPropagation();
-      close();
-      if (own.current?.contains(document.activeElement)) (document.activeElement as HTMLElement).blur();
+    if (!open) return;
+    const dismissOutside = (event: Event) => {
+      if (!group.current?.contains(event.target as Node)) setOpen(false);
     };
-    document.addEventListener("pointerdown", press, true);
-    window.addEventListener("keydown", key, true);
+    const dismissOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || isComposing(event)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      setOpen(false);
+      trigger.current?.focus({ preventScroll: true });
+    };
+    document.addEventListener("pointerdown", dismissOutside, true);
+    document.addEventListener("focusin", dismissOutside);
+    document.addEventListener("keydown", dismissOnEscape, true);
     return () => {
-      document.removeEventListener("pointerdown", press, true);
-      window.removeEventListener("keydown", key, true);
+      document.removeEventListener("pointerdown", dismissOutside, true);
+      document.removeEventListener("focusin", dismissOutside);
+      document.removeEventListener("keydown", dismissOnEscape, true);
     };
-  }, [held]); // eslint-disable-line react-hooks/exhaustive-deps
-  const enter = () => { clearTimeout(leave.current); setHovered(true); };
-  const exit = () => { clearTimeout(leave.current); leave.current = window.setTimeout(() => setHovered(false), LEAVE_MS); };
-  // Nothing aimed: the box has no icon, but this stays mounted so the first thing aimed arrives.
-  if (!items.length) return null;
-  const summary = items.map(i => i.name).join(" and ");
-  return <span ref={own} className="composer-aim" onPointerEnter={enter} onPointerLeave={exit}
-    onFocus={() => setPinned(true)}
-    onBlur={e => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setPinned(false); }}
-    onKeyDown={e => { if (e.key === "Escape" && open) { e.preventDefault(); e.stopPropagation(); close(); (e.target as HTMLElement).blur(); } }}>
-    <button type="button" className={pulse ? "composer-aim-icon is-pulsing" : "composer-aim-icon"} aria-label={`About ${summary}`}
-      aria-expanded={open} aria-controls={open ? id : undefined} onClick={() => setPinned(true)}>
-      <EditPoint />
-    </button>
-    {open && <span id={id} className="composer-aim-card" role="group" aria-label="What this message is about">
-      {items.map(item => <span key={item.key} className={item.key === arrived ? "composer-aim-row is-new" : "composer-aim-row"}>
-        <span className="composer-aim-kind" aria-hidden="true">{item.kind === "range"
-          ? <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M4.5 3H2.5v10h2M11.5 3h2v10h-2M5.5 8h5" /></svg>
-          : <EditPoint />}</span>
-        <span className="composer-aim-name">{item.name}</span>
-        <span className="composer-aim-detail">{item.detail}</span>
-        {/* A spoken message stays where it was said until it is out: aiming the box elsewhere would drop it. */}
-        <button type="button" className="composer-aim-clear" disabled={disabled} aria-label={item.clearLabel}
-          title={disabled ? disabledReason : item.clearLabel} onClick={() => { item.onClear(); setPinned(false); }}>
-          <Icon name="x" size={10} />
-        </button>
-      </span>)}
-    </span>}
-  </span>;
+  }, [open]);
+
+  const showLabel = `Show ${additional.map(item => item.name).join(" and ")}`;
+  const clear = (item: AimItem) => <button type="button" className="composer-aim-clear" disabled={disabled}
+    title={disabled ? disabledReason : item.clearLabel} aria-label={item.clearLabel} aria-description={disabled ? disabledReason : undefined}
+    onClick={() => { setOpen(false); item.onClear(); }}>
+    <Icon name="x" size={12} />
+  </button>;
+
+  return <div ref={group} className="composer-aim" onPointerEnter={() => setHovered(true)} onPointerLeave={() => setHovered(false)}
+    onFocus={() => setFocused(true)}
+    onBlur={e => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setFocused(false); }}>
+    <span className="composer-aim-name" title={`About ${primary.name}`}>{primary.displayName ?? primary.name}</span>
+    {additional.length > 0 && <button ref={trigger} type="button" className="composer-aim-button"
+      aria-label={showLabel} title={showLabel}
+      aria-expanded={open} aria-controls={open ? id : undefined}
+      onClick={e => { e.currentTarget.focus({ preventScroll: true }); setOpen(value => !value); }}>
+      <span aria-hidden="true">+{additional.length}</span>
+      <Icon name="chevron" size={11} />
+    </button>}
+    {clear(primary)}
+    {open && <div id={id} className="composer-aim-card" data-escape-owner data-shortcut-overlay>
+      {additional.map(item => <div key={item.key} className="composer-aim-row" role="group" aria-label={item.name}>
+        <span aria-hidden="true" title={item.name}>{item.displayName ?? item.name}</span>
+        {clear(item)}
+      </div>)}
+    </div>}
+  </div>;
 }

@@ -90,7 +90,8 @@ it("says some notes couldn't be placed when a version can't be read, and reads a
   await act(async () => {});
   expect(positions.failed).toBe(false);
   expect(Object.keys(placed())).toEqual(["a", "b"]);
-  expect(read).toHaveBeenCalledTimes(4);
+  // A saved version is read once: only the one that failed is read again.
+  expect(read.mock.calls.map(([, version]) => version).sort()).toEqual(["ver_2", "ver_2", "ver_3"]);
 });
 
 it("drops an answer that arrives after the page moved to other notes", async () => {

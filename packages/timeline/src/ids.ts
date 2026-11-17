@@ -23,6 +23,37 @@ export function stableStringify(value: unknown): string {
   return JSON.stringify(sortKeys(value));
 }
 
+/**
+ * Whether two values serialize alike under stableStringify, without building either string. It stops at the first
+ * difference, where comparing the strings serialized a whole timeline twice.
+ */
+export function sameJson(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  // JSON writes a number that isn't finite as null.
+  const plain = (v: unknown) => typeof v === "number" && !Number.isFinite(v) ? null : v;
+  a = plain(a);
+  b = plain(b);
+  if (a === b) return true;
+  if (!a || !b || typeof a !== "object" || typeof b !== "object") return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) {
+    const other = b as unknown[];
+    if (a.length !== other.length) return false;
+    // JSON writes a missing array item as null.
+    for (let i = 0; i < a.length; i++) if (!sameJson(a[i] ?? null, other[i] ?? null)) return false;
+    return true;
+  }
+  const x = a as Record<string, unknown>, y = b as Record<string, unknown>;
+  let keys = 0;
+  for (const k in x) {
+    if (!Object.hasOwn(x, k) || x[k] === undefined) continue;
+    keys++;
+    if (!Object.hasOwn(y, k) || !sameJson(x[k], y[k])) return false;
+  }
+  for (const k in y) if (Object.hasOwn(y, k) && y[k] !== undefined) keys--;
+  return keys === 0;
+}
+
 function sortKeys(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sortKeys);
   if (value && typeof value === "object") {

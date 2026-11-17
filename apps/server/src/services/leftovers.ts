@@ -4,11 +4,12 @@ import type { Ctx } from "../context.js";
 
 const DAY = 24 * 60 * 60 * 1000;
 
-// Names written by the speech route, recording analysis, and the two transcription providers.
-function temporaryAudio(name: string) {
+// Names written by the speech route, cut review, recording analysis, and the two transcription providers.
+function temporaryMedia(name: string) {
   return /^(?:recording|chunk)_[a-z0-9]{12}\.wav$/.test(name) ||
     /^wcpp_[a-z0-9]{12}\.(?:wav|json)$/.test(name) || /^speech_[a-z0-9]{12}\.[^./\\]*$/.test(name) ||
     /^(?:recording-)?[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.wav$/.test(name) ||
+    /^review-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(?:jpg|pcm)$/.test(name) ||
     // The frames a screen-text or face read was working through.
     /^(?:screen-text|faces)-[0-9a-f-]{36}\.rgb$/.test(name) ||
     // The sound a hole reread cut out, and a word alignment's answer written beside its audio.
@@ -43,7 +44,7 @@ export function sweepLeftovers(ctx: Ctx, now = Date.now()): number {
       } catch { /* Another engine removed it, or it can't be read. Leave it. */ }
     }
   };
-  sweep(ctx.paths.tmp, temporaryAudio);
+  sweep(ctx.paths.tmp, temporaryMedia);
   // A model whose download was cut off starts again under a new name. The old part is hundreds of megabytes.
   sweep(join(ctx.paths.root, "models"), name => name.endsWith(".part"));
   const projects = join(ctx.paths.root, "projects");

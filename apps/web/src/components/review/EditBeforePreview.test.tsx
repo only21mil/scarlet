@@ -2,12 +2,13 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { timelineFromKeepRanges } from "@scarlet/timeline";
 import { startAppLog, stopAppLog } from "../../lib/appLog";
 import * as cutStream from "../../lib/cutStream";
 import { buildDb, PRJ } from "../../lib/mock/fixtures";
 import { usePlayerStore } from "../../stores/player";
 import { useProjectStore } from "../../stores/project";
-import { EditBeforePreview, type BeforePlayback, type useEditBefore } from "./EditBeforePreview";
+import { EditBeforePreview, type BeforePlayback, useEditBefore } from "./EditBeforePreview";
 
 const db = buildDb();
 const project = db.projects.find(p => p.id === PRJ)!;
@@ -66,6 +67,20 @@ it("plays a short passage of the earlier version as one prepared section", async
   await show(before({ timeline, range: { start: 2, end: 6 } }));
   expect(open).not.toHaveBeenCalled();
   expect(requestRender).toHaveBeenCalledWith(expect.objectContaining({ kind: "segment", version: timeline.version, range: { start: 2, end: 6 } }));
+});
+
+it("prepares enough Before footage to hear a brief audio edit in context", async () => {
+  const version = timelineFromKeepRanges(PRJ, "source", [{ start: 0, end: 12 }]);
+  const edit = { changeId: change.id, spot: 0, label: "Mute a brief sound", range: { start: 6, end: 6.1 }, previous: [] };
+  const applied = { ...change, appliedOnto: version.version };
+  const passage = { start: 4.55, end: 7.55 };
+  function BriefEdit() {
+    const original = useEditBefore(PRJ, version, edit, applied, project.settings.fps, false, passage);
+    return <EditBeforePreview change={applied} original={original} passage={passage} active />;
+  }
+  await act(async () => root.render(<BriefEdit />));
+  expect(requestRender).toHaveBeenCalledWith(expect.objectContaining({ kind: "segment", version: version.version,
+    range: passage }));
 });
 
 it("streams a long passage, and when the stream can't open logs why once and prepares the passage as a section instead", async () => {

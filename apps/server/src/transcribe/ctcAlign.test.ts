@@ -402,6 +402,12 @@ describe("transcript alignment", () => {
     turns.length = 0;
     await aligner.align(join(dir, "decoded.wav"), segments, { language: "en", signal, lane: { lane, work: { mediaId: "media-1", kind: "alignment" } } });
     expect(turns).toEqual([10, 10, 4]);
+    // A pass reading another recording: this one's turns are short too, so the pass's pages wait for less.
+    const other = lane.focus("media-2");
+    turns.length = 0;
+    await aligner.align(join(dir, "decoded.wav"), segments, { language: "en", signal, lane: { lane, work: { mediaId: "media-1", kind: "alignment" } } });
+    expect(turns).toEqual([4, 4, 4, 4, 4, 4]);
+    other();
   });
 
   it("asks nothing of the aligner for words it can't spell, and stops before a turn once cancelled", async () => {
@@ -460,11 +466,29 @@ describe("transcript alignment", () => {
     await alignWords(ctx(), "page.wav", [segment(1, 11, [["hello", 1, 2], ["there", 10, 11]])], { language: "en", signal, emissions });
     expect(decode).not.toHaveBeenCalled();
     expect(sent).toEqual([{ wav: "", store: { file, offset: 2, duration: 60 } }]);
+    // A full transcript can use those frames even when no retained WAV or model is available.
+    const extract = vi.spyOn(ffmpeg, "extractWav").mockRejectedValue(new Error("recording unavailable"));
+    await alignTranscript(ctx(), { source: "talk.mov", emissions: file, segments: [segment(1, 2, [["hello", 1, 2]])], signal });
+    expect(extract).not.toHaveBeenCalled();
+    expect(LocalWhisperModel.prototype.get).not.toHaveBeenCalled();
+    expect(sent[1]).toEqual({ wav: "", store: { file, offset: 0 } });
     // Words at 42-52 s need the second window, so the worker gets the whole recording to infer it from.
     await alignWords(ctx(), "page.wav", [segment(40, 50, [["again", 40, 41], ["later", 49, 50]])], { language: "en", signal, emissions });
     expect(decode).toHaveBeenCalledTimes(1);
-    expect(sent[1]).toEqual({ wav: join(dir, "whole.wav"), store: { file, offset: 2, duration: 60 } });
+    expect(sent.at(-1)).toEqual({ wav: join(dir, "whole.wav"), store: { file, offset: 2, duration: 60 } });
+    expect(LocalWhisperModel.prototype.get).toHaveBeenCalledTimes(1);
     expect((await readdir(dir)).filter(f => f.endsWith(".part"))).toEqual([]);
+  });
+
+  it("keeps a retryable transcript when audio cannot be decoded without fetching model weights", async () => {
+    const segments = [segment(1, 2, [["hello", 1, 2]])];
+    const failed = vi.fn();
+    vi.spyOn(ffmpeg, "extractWav").mockRejectedValue(new Error("recording unavailable"));
+    for (const emissions of [undefined, join(dir, "missing-emissions.bin")]) {
+      expect(await alignTranscript(ctx(), { source: "talk.mov", emissions, segments, signal, onFailure: failed })).toBe(segments);
+    }
+    expect(failed).toHaveBeenCalledTimes(2);
+    expect(LocalWhisperModel.prototype.get).not.toHaveBeenCalled();
   });
 
   it("keeps the provider's times for other languages and when the aligner fails", async () => {

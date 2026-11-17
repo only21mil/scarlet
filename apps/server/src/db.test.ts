@@ -7,6 +7,8 @@ import { createRepos } from "./repo/index.js";
 import { createApp } from "./app.js";
 import { Db, migrate, openDb } from "./db.js";
 import { startWalCheckpointer } from "./walCheckpointer.js";
+import { foldStrandedPasses, recordLeftOutFootage, retireLeftoverPasses } from "./services/changes.js";
+import { migrateDialogueOperations } from "./services/tasks.js";
 
 let directory: string;
 let db: Db;
@@ -304,4 +306,26 @@ it("backfills only successful transcriptions and preserves them across old write
     olderSave.run(JSON.stringify({ transcriptId: "new" }));
     expect(fields("labelled").lastTranscription).toBeUndefined();
   } finally { library.close(); }
+});
+
+it("finds what the start-up repairs and the export list look for without reading every edit, request or render", async () => {
+  const { ctx } = createApp({ dataDir: join(directory, "engine"), skillsSeedDir: join(directory, "empty-seed"), env: {}, log: () => {} });
+  try {
+    const prepare = vi.spyOn(ctx.db, "prepare");
+    retireLeftoverPasses(ctx);
+    foldStrandedPasses(ctx);
+    recordLeftOutFootage(ctx);
+    migrateDialogueOperations(ctx);
+    ctx.renders.exports();
+    const queries = [...new Set(prepare.mock.calls.map(([sql]) => sql))].filter(sql => /^SELECT json\b.*FROM (changes|tasks|renders)\b/s.test(sql));
+    prepare.mockRestore();
+    // Each begins with an index that holds only the rows of projects with a proposal waiting, or the rows it looks for.
+    expect(queries.map(sql => (ctx.db.prepare("EXPLAIN QUERY PLAN " + sql).all() as { detail: string }[])[0]!.detail)).toEqual([
+      "SEARCH changes USING INDEX changes_project_state (project_id=? AND state=?)",
+      "SEARCH changes USING INDEX changes_state (state=?)",
+      "SCAN changes USING INDEX changes_left_out_unread",
+      "SCAN tasks USING INDEX tasks_dialogue_unset",
+      "SCAN renders USING INDEX renders_export",
+    ]);
+  } finally { await ctx.close(); }
 });

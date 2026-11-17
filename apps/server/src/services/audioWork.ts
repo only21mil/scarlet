@@ -1,4 +1,5 @@
-import { humanDuration } from "../logText.js";
+import { logId } from "../logText.js";
+import { editorFirst } from "./editorFirst.js";
 
 /**
  * Local audio models (Whisper, word alignment and speaker analysis) each use most of the CPU. Run side by
@@ -10,6 +11,12 @@ import { humanDuration } from "../logText.js";
  *  1. that recording's word alignment and scan pages, and its speaker analysis on a machine without the cores to
  *     run that beside the lane (`speakersRunBeside`);
  *  2. everything else, such as transcripts of the other recordings.
+ *
+ * Work a request is waiting on this moment (`asked`), such as the page a pass's tool call reads or the joins its
+ * repeat check hears, ranks 1 whatever recording it is on, and goes ahead of other work of its rank. A pass reads its
+ * last pages and checks its joins after its scan has let the recording go, and then they ranked 2, behind every
+ * transcript under way: on 2026-11-16 pages of about a second's work waited 52 s to 1 min 41 s each behind another
+ * recording's alignment, and the pass waited with them.
  *
  * Rank is read when the lane frees, so a transcript that started in the background moves up as soon as
  * a pass starts reading its recording. Equal ranks run first come, first served, except that work already
@@ -30,7 +37,9 @@ import { humanDuration } from "../logText.js";
  *
  * Voice notes and other short interactive transcriptions don't use the lane.
  */
-export type AudioWork = { mediaId: string; kind: "transcript" | "alignment" | "speakers" | "page" };
+export type AudioWork = { mediaId: string; kind: "transcript" | "alignment" | "speakers" | "page";
+  /** A request is waiting on this work now. Work already queued becomes asked when a request joins it. */
+  asked?: boolean };
 
 /** Log work that waited this long for the lane or held it this long, so a stalled pass shows what it queued behind. */
 const LOG_WAIT_MS = 30_000;
@@ -77,9 +86,24 @@ export class AudioLane {
     return this.focused.has(mediaId);
   }
 
+  /** Recordings a pass is reading, across both lanes. */
+  focusedMediaIds(): IterableIterator<string> {
+    return this.focused.keys();
+  }
+
+  /** Whether a dialogue pass is reading any recording now. */
+  reading(): boolean {
+    return this.focused.size > 0;
+  }
+
   rank(work: AudioWork): number {
-    if (!this.focused.has(work.mediaId)) return 2;
+    if (!this.focused.has(work.mediaId)) return work.asked ? 1 : 2;
     return work.kind === "transcript" ? 0 : 1;
+  }
+
+  /** Whether `work` goes ahead of `other`: it ranks ahead, or ranks the same and a request is waiting on it alone. */
+  private ahead(work: AudioWork, other: AudioWork) {
+    return this.rank(work) - this.rank(other) || Number(!!other.asked) - Number(!!work.asked);
   }
 
   /**
@@ -95,20 +119,30 @@ export class AudioLane {
     if (resumes) this.unhold();
     const behind = this.busy && !resumes ? this.current ?? this.held?.work : undefined;
     const ahead = behind ? this.waiting.length + 1 : 0;
+    const lane = this.name === "Whisper lane" ? "whisper" : "audio";
+    const target = `lane=${lane} work=${work.kind} media=${logId(work.mediaId)}`;
     if (resumes) {
       // The lane was kept for this step.
     } else if (this.busy) {
       await new Promise<void>((resolve, reject) => {
-        const entry = { work, seq, start: () => { signal?.removeEventListener("abort", cancel); resolve(); } };
+        const slow = this.log ? setTimeout(() => {
+          const blocker = this.current ?? this.held?.work;
+          this.log?.(`[audio] waiting ${target} wait_ms=${Math.max(0, Date.now() - queuedAt)} ahead=${ahead}` +
+            (blocker ? ` blocker_work=${blocker.kind} blocker=${logId(blocker.mediaId)}` : ""));
+        }, LOG_WAIT_MS) : undefined;
+        slow?.unref();
+        const entry = { work, seq, start: () => { clearTimeout(slow); signal?.removeEventListener("abort", cancel); resolve(); } };
         const cancel = () => {
+          clearTimeout(slow);
           const index = this.waiting.indexOf(entry);
           if (index >= 0) this.waiting.splice(index, 1);
+          this.log?.(`[audio] cancelled_while_waiting ${target} wait_ms=${Math.max(0, Date.now() - queuedAt)}`);
           reject(signal!.reason);
         };
         this.waiting.push(entry);
         signal?.addEventListener("abort", cancel, { once: true });
         // Work ranked ahead of the step the lane is kept for doesn't wait for it.
-        if (this.held && this.rank(work) < this.rank(this.held.work)) {
+        if (this.held && this.ahead(work, this.held.work) < 0) {
           this.unhold();
           this.next();
         }
@@ -120,18 +154,24 @@ export class AudioLane {
     }
     const startedAt = Date.now();
     this.current = work;
+    const waited = Math.max(0, startedAt - queuedAt);
+    if (waited >= LOG_WAIT_MS) this.log?.(`[audio] started ${target} wait_ms=${waited}`);
+    const slow = this.log ? setTimeout(() => this.log?.(`[audio] running ${target} elapsed_ms=${Math.max(0, Date.now() - startedAt)}`), LOG_RUN_MS) : undefined;
+    slow?.unref();
     let failed = false;
     try {
       signal?.throwIfAborted();
-      return await job();
+      // A recording no pass is reading is nobody's to wait for, unless work a pass needs waits behind it: it yields to
+      // the editor's playback meanwhile. A scan page is always a pass's.
+      return await (work.kind === "page" ? job() : editorFirst.run(() => this.rank(work) === 2 && !this.urgentWaiting(), job));
     } catch (error) {
       failed = true;
       throw error;
     } finally {
-      const waited = startedAt - queuedAt, ran = Date.now() - startedAt;
+      clearTimeout(slow);
+      const ran = Math.max(0, Date.now() - startedAt);
       if (this.log && (waited >= LOG_WAIT_MS || ran >= LOG_RUN_MS)) {
-        const queue = waited >= LOG_WAIT_MS ? `waited ${humanDuration(waited)} for the ${this.name}${behind ? ` behind ${behind.kind} ${behind.mediaId}` : ""}${ahead > 1 ? ` (${ahead} jobs ahead)` : ""}, then ` : "";
-        this.log(`[audio] ${work.kind} ${work.mediaId}: ${queue}${failed ? "failed" : "ran"} for ${humanDuration(ran)}`);
+        this.log(`[audio] finished ${target} outcome=${signal?.aborted ? "cancelled" : failed ? "failed" : "done"} wait_ms=${waited} elapsed_ms=${ran}`);
       }
       this.current = undefined;
       if (options.more && !failed) this.hold(work);
@@ -150,6 +190,25 @@ export class AudioLane {
     this.next();
   }
 
+  /** A late cleanup only releases the reservation made by this attempt’s own step. */
+  finish(...steps: AudioWork[]) {
+    if (this.held && steps.includes(this.held.work)) this.release(this.held.work);
+  }
+
+  /** A request now waits on `work`. Queued, it stops waiting for a step the lane is kept for that it now goes ahead of. */
+  ask(work: AudioWork) {
+    work.asked = true;
+    if (this.held && this.waiting.some(entry => entry.work === work) && this.ahead(work, this.held.work) < 0) {
+      this.unhold();
+      this.next();
+    }
+  }
+
+  /** Whether work a pass needs is waiting for the lane. */
+  urgentWaiting(): boolean {
+    return this.waiting.some(entry => this.rank(entry.work) < 2);
+  }
+
   /** Work waiting for the lane, in the order it would run. */
   queued(): AudioWork[] {
     return this.ordered().map(entry => entry.work);
@@ -158,7 +217,7 @@ export class AudioLane {
   /** Keep the lane for the next step of `work`, unless something ranked ahead of it is waiting. */
   private hold(work: AudioWork) {
     const [first] = this.ordered();
-    if (first && this.rank(first.work) < this.rank(work)) {
+    if (first && this.ahead(first.work, work) < 0) {
       this.next();
       return;
     }
@@ -178,7 +237,7 @@ export class AudioLane {
   private ordered() {
     // Work already under way keeps the place it had when it first got the lane.
     const place = (entry: { work: AudioWork; seq: number }) => Math.min(entry.seq, this.begun.get(workKey(entry.work)) ?? entry.seq);
-    return [...this.waiting].sort((a, b) => this.rank(a.work) - this.rank(b.work) || place(a) - place(b) || a.seq - b.seq);
+    return [...this.waiting].sort((a, b) => this.ahead(a.work, b.work) || place(a) - place(b) || a.seq - b.seq);
   }
 
   private next() {
@@ -209,4 +268,11 @@ export function whisperLane(ctx: { paths: { root: string }; log?: (message: stri
   let own = whisperLanes.get(ctx.paths.root);
   if (!own) whisperLanes.set(ctx.paths.root, own = lane.sibling("Whisper lane"));
   return own;
+}
+
+/** A request now waits on `work`, which may be queued in either of the engine's lanes. */
+export function askFor(ctx: { paths: { root: string } }, work: AudioWork) {
+  work.asked = true;
+  lanes.get(ctx.paths.root)?.ask(work);
+  whisperLanes.get(ctx.paths.root)?.ask(work);
 }

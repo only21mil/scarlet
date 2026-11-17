@@ -19,7 +19,7 @@ function savedBeforeRange(change: Change, edit: ThreadEdit, version: string) {
 }
 
 export function useEditBefore(projectId: string, working: Timeline | null | undefined, edit: ThreadEdit | undefined,
-  change: Change | undefined, fps: number, framing: boolean) {
+  change: Change | undefined, fps: number, framing: boolean, passage?: TimeRange) {
   const version = edit?.beforeCut?.version ?? change?.appliedOnto ?? change?.fromVersion;
   const original = useReviewTimeline(projectId, version, working);
   const source = original.timeline;
@@ -31,10 +31,16 @@ export function useEditBefore(projectId: string, working: Timeline | null | unde
     if (edit.beforeCut) return withHandles(edit.beforeCut.removed, 1.5, duration);
     const start = map?.(edit.range.start, "right");
     const end = map?.(edit.range.end, "left");
-    if (start != null && end != null && start >= 0 && start < end && end <= duration + 1e-6) return { start, end: Math.min(end, duration) };
+    if (start != null && end != null && start >= 0 && start < end && end <= duration + 1e-6) {
+      // Give the mapped edit the same lead-in and tail lengths as the passage on After.
+      const lead = passage ? edit.range.start - passage.start : 0;
+      const tail = passage ? passage.end - edit.range.end : 0;
+      return { start: Math.max(0, start - lead), end: Math.min(duration, end + tail) };
+    }
     const saved = savedBeforeRange(change, edit, version);
+    // A stored comparison may already contain handles.
     if (saved && saved.start < Math.min(saved.end, duration)) return { start: saved.start, end: Math.min(saved.end, duration) };
-  }, [duration, edit, change, version, framing, map]);
+  }, [duration, edit, change, version, framing, map, passage?.start, passage?.end]);
   const unavailable = !version ? "No earlier version is available." : duration === 0 ? "The timeline was empty before this edit."
     : source && !framing && !range ? "No matching passage in the earlier version." : undefined;
   return { ...original, duration, map, range, unavailable };

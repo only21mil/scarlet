@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::util::{env_get, hide_console, human_duration, kill_tree, lossy_lines, stderr_tail_line, KILL_AFTER};
@@ -379,7 +379,31 @@ fn finish_stops(stopped: Vec<(u32, std::time::Instant)>, now: std::time::Instant
 }
 
 /// Spawn and stream. Resolves when the process has exited and all stdout has been handled.
-pub async fn spawn_lines(file: &str, args: &[String], opts: SpawnLinesOptions, mut on_line: LineHandler) -> Result<SpawnOutcome> {
+pub async fn spawn_lines(file: &str, args: &[String], opts: SpawnLinesOptions, on_line: LineHandler) -> Result<SpawnOutcome> {
+    let input = ProcessInput::Once(opts.stdin.clone());
+    spawn_stream(file, args, opts, input, Duration::from_millis(250), None, on_line).await
+}
+
+/// Keep stdin open for a line protocol. Dropping the last sender closes it.
+pub async fn spawn_interactive(
+    file: &str, args: &[String], opts: SpawnLinesOptions, input: mpsc::UnboundedReceiver<String>,
+    stop_grace: Duration, interrupt: InterruptHandler, on_line: LineHandler,
+) -> Result<SpawnOutcome> {
+    spawn_stream(file, args, opts, ProcessInput::Stream(input), stop_grace, Some(interrupt), on_line).await
+}
+
+/// Start a protocol-level interrupt. Return whether it could be sent and needs a grace period.
+pub type InterruptHandler = Box<dyn FnOnce() -> bool + Send>;
+
+enum ProcessInput {
+    Once(Option<String>),
+    Stream(mpsc::UnboundedReceiver<String>),
+}
+
+async fn spawn_stream(
+    file: &str, args: &[String], opts: SpawnLinesOptions, input: ProcessInput,
+    stop_grace: Duration, interrupt: Option<InterruptHandler>, mut on_line: LineHandler,
+) -> Result<SpawnOutcome> {
     let spec = runner_spec(file, args, &opts.env)?;
     let mut cmd = build_command(&spec, Some(&opts.cwd), &opts.env);
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
@@ -402,20 +426,28 @@ pub async fn spawn_lines(file: &str, args: &[String], opts: SpawnLinesOptions, m
         })
     });
 
-    // stdin: write the prompt (if any) and close.
-    if let Some(mut stdin) = child.stdin.take() {
-        let input = opts.stdin.clone();
+    let stdin_task = child.stdin.take().map(|mut stdin| {
         let who = who.clone();
         tokio::spawn(async move {
-            if let Some(s) = input {
-                if let Err(e) = stdin.write_all(s.as_bytes()).await {
-                    log::warn!("{who} did not take its prompt: {e}");
+            match input {
+                ProcessInput::Once(Some(prompt)) => {
+                    if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
+                        log::warn!("{who} did not take its prompt: {e}");
+                    }
+                }
+                ProcessInput::Once(None) => {}
+                ProcessInput::Stream(mut lines) => {
+                    while let Some(line) = lines.recv().await {
+                        if let Err(e) = stdin.write_all(line.as_bytes()).await {
+                            log::warn!("{who} stopped accepting input: {e}");
+                            break;
+                        }
+                    }
                 }
             }
             let _ = stdin.shutdown().await;
-            drop(stdin);
-        });
-    }
+        })
+    });
 
     // stderr: keep the tail.
     let stderr_buf: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
@@ -440,11 +472,11 @@ pub async fn spawn_lines(file: &str, args: &[String], opts: SpawnLinesOptions, m
         })
     });
 
-    // stdout: lines -> handler. A `true` return schedules a kill. Every line is a sign of life for `stall`.
-    let killed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Every stdout line is a sign of life for `stall`.
+    let stop_requested = CancellationToken::new();
     let last_line = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
     let stdout_task = child.stdout.take().map(|out| {
-        let killed = killed.clone();
+        let stop_requested = stop_requested.clone();
         let last_line = last_line.clone();
         tokio::spawn(async move {
             let mut lines = lossy_lines(out);
@@ -455,12 +487,7 @@ pub async fn spawn_lines(file: &str, args: &[String], opts: SpawnLinesOptions, m
                     continue;
                 }
                 if on_line(line) {
-                    let killed = killed.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                        killed.store(true, std::sync::atomic::Ordering::SeqCst);
-                        kill_tree(pid).await;
-                    });
+                    stop_requested.cancel();
                 }
             }
         })
@@ -471,21 +498,25 @@ pub async fn spawn_lines(file: &str, args: &[String], opts: SpawnLinesOptions, m
         s = child.wait() => s,
         _ = opts.cancel.cancelled() => {
             outcome.aborted = true;
-            outcome.killed = true;
-            kill_tree(pid).await;
-            child.wait().await
+            stop_child(&mut child, pid, &mut outcome, stop_grace, interrupt).await
         }
         verdict = watch(opts.timeout, opts.stall, &last_line, &who) => {
             outcome.timed_out = true;
             outcome.stalled = verdict == Watch::Stalled;
+            stop_child(&mut child, pid, &mut outcome, stop_grace, interrupt).await
+        }
+        _ = async {
+            stop_requested.cancelled().await;
+            tokio::time::sleep(stop_grace).await;
+        } => {
             outcome.killed = true;
             kill_tree(pid).await;
             child.wait().await
         }
     };
     outcome.code = status.ok().and_then(|s| s.code());
-    if killed.load(std::sync::atomic::Ordering::SeqCst) {
-        outcome.killed = true;
+    if let Some(task) = stdin_task {
+        task.abort();
     }
     if outcome.killed {
         let now = std::time::Instant::now();
@@ -504,15 +535,28 @@ pub async fn spawn_lines(file: &str, args: &[String], opts: SpawnLinesOptions, m
     if let Some(note) = pid_note(pid) {
         let _ = std::fs::remove_file(note);
     }
-    if let Some(t) = stdout_task {
-        let _ = tokio::time::timeout(Duration::from_secs(5), t).await;
-    }
-    if let Some(t) = stderr_task {
-        let _ = tokio::time::timeout(Duration::from_secs(5), t).await;
+    for mut task in [stdout_task, stderr_task].into_iter().flatten() {
+        if tokio::time::timeout(Duration::from_secs(5), &mut task).await.is_err() {
+            task.abort();
+        }
     }
     outcome.stderr = stderr_buf.lock().await.clone();
     log_outcome(&who, started.elapsed(), &opts, &outcome);
     Ok(outcome)
+}
+
+async fn stop_child(
+    child: &mut tokio::process::Child, pid: u32, outcome: &mut SpawnOutcome,
+    grace: Duration, interrupt: Option<InterruptHandler>,
+) -> std::io::Result<std::process::ExitStatus> {
+    if interrupt.is_some_and(|interrupt| interrupt()) {
+        if let Ok(status) = tokio::time::timeout(grace, child.wait()).await {
+            return status;
+        }
+    }
+    outcome.killed = true;
+    kill_tree(pid).await;
+    child.wait().await
 }
 
 /// How often a run's watchdog looks at the clock.

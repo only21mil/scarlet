@@ -192,7 +192,7 @@ export function ExportLogs() {
           <button className="btn-quiet" onClick={() => void desktop.revealPath(state.path).catch(e => setState({ phase: "failed", error: errorMessage(e) }))}>Show in folder</button>
         </>}
       </div>
-      {state.phase === "failed" && <InlineError>{state.error}</InlineError>}
+      {state.phase === "failed" && <InlineError><span data-log-private>{state.error}</span></InlineError>}
     </section>
   );
 }

@@ -8,6 +8,7 @@ import { api, IS_MOCK } from "../../lib/client";
 import { CutStream } from "./CutStream";
 import { FramedVideo } from "./FramedVideo";
 import { SourcePlayer } from "./SourcePlayer";
+import { logPlayRefusal } from "../../lib/playbackLog";
 import { player } from "../../lib/player";
 import { usePlayerStore } from "../../stores/player";
 import { selectHeadRender, useProjectStore } from "../../stores/project";
@@ -89,7 +90,7 @@ export const Player = memo(function Player({ source, autoPlaySource, cut, hidden
             const saved = usePlayerStore.getState();
             v.currentTime = Math.min(saved.time, Number.isFinite(v.duration) ? v.duration : saved.time);
             v.playbackRate = saved.rate;
-            if (resume.current && active && !hidden) void v.play().catch(() => undefined);
+            if (resume.current && active && !hidden) void v.play().catch(error => logPlayRefusal(v, "monitor-resume", error));
             resume.current = false;
           }} />
       ) : (

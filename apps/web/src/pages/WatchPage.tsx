@@ -4,7 +4,7 @@ import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { useShallow } from "zustand/react/shallow";
 import type { ThreadEdit } from "@scarlet/shared";
 import { isPlayableMedia, timelineDuration, type Change, type MediaAsset, type Project, type TimeRange, type Timeline } from "@scarlet/timeline";
-import { arrowSeekTime, handleCutArrow, useHotkeys } from "../lib/hotkeys";
+import { arrowSeekTime, handleCutArrow, isComposing, useHotkeys } from "../lib/hotkeys";
 import { canPlayOriginal, isPreparingMedia } from "../lib/upload";
 import { isLink } from "../lib/pendingImports";
 import { useUploader, useImportCount } from "../components/media/UploadDropzone";
@@ -12,12 +12,11 @@ import { ImportProgress } from "../components/media/ImportProgress";
 import { pauseForScrub, player, type ScrubRelease } from "../lib/player";
 import { playbackLog } from "../lib/playbackLog";
 import type { JoinClock } from "../lib/joinClock";
-import { api, IS_MOCK, loggedFetch } from "../lib/client";
+import { api, IS_MOCK, loggedFetch, readLoggedBody } from "../lib/client";
 import { usePlayerStore } from "../stores/player";
 import { selectRender, useProjectStore } from "../stores/project";
 import { editTargetAt, markedRangeOf, useUiStore, type AgentContext, type MarkedRange } from "../stores/ui";
 import { Icon } from "../components/ui/primitives";
-import { PreferenceSelect } from "../components/ui/PreferenceSelect";
 import { CachedVideo } from "../components/player/CachedVideo";
 import { MonitorPlayback, PlayerTime } from "../components/player/MonitorPlayback";
 import { usePictureWait } from "../components/player/usePictureWait";
@@ -36,6 +35,7 @@ import { FramingPreview } from "../components/review/FramingPreview";
 import { useNotePositions } from "../lib/useNotePositions";
 import type { ProgressFocus } from "../components/player/SimpleProgress";
 import { editFocus } from "../lib/editKind";
+import { editPlaybackRange } from "../lib/editPlaybackRange";
 import { editKey } from "../lib/keptEdits";
 import { useTemplatesStore } from "../stores/templates";
 import { TransitionPicture } from "../components/agent/TemplateMenu";
@@ -63,7 +63,15 @@ interface ThreadTimelineView {
   choose(edit: ThreadEdit): void;
   clear(): void;
 }
-const RATES = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map(value => ({ value, label: `${value}×` }));
+const MIN_RATE = 0.5;
+const MAX_RATE = 2;
+const RATE_STEP = 0.25;
+
+function stepPlaybackRate(direction: -1 | 1) {
+  const rate = usePlayerStore.getState().rate;
+  const next = Math.min(MAX_RATE, Math.max(MIN_RATE, rate + direction * RATE_STEP));
+  if (next !== rate) player.setRate(next);
+}
 
 export function ImportPreview({ projectId, preparing, onMedia }: { projectId: string; preparing?: MediaAsset; onMedia(): void }) {
   const { localImport, items } = useUploader(projectId);
@@ -75,13 +83,16 @@ export function ImportPreview({ projectId, preparing, onMedia }: { projectId: st
     const controller = new AbortController();
     let url: string | undefined;
     void (async () => {
-      // Through the logged fetch, like every other request: a frame that never comes is in the log with the engine's reason.
+      // Correlate the preview with the engine log and record any transfer failure after the headers.
       const response = await loggedFetch(api.url(`/projects/${projectId}/media/import-frame`), {
         method: "POST", signal: controller.signal, body: JSON.stringify({ path }),
         headers: { "Content-Type": "application/json", ...(api.token && { Authorization: `Bearer ${api.token}` }) },
       });
-      if (!response.ok) return;
-      const image = await response.blob();
+      if (!response.ok) {
+        await readLoggedBody(response, () => response.text());
+        return;
+      }
+      const image = await readLoggedBody(response, () => response.blob());
       if (controller.signal.aborted) return;
       url = URL.createObjectURL(image);
       setFrame({ path, url });
@@ -137,6 +148,7 @@ interface PreviewProps {
   draft?: Timeline;
   draftFailed?: boolean;
   openingJoin?: boolean;
+  cutLoadError?: { message: string; reason: string; retry(): void };
   onRetryDraft(): void;
   source?: MediaAsset;
   hasCut: boolean;
@@ -176,6 +188,8 @@ interface PreviewProps {
     onRange?(range: MarkedRange | undefined, byKey?: boolean): void;
     /** The chosen edit is about to play on another version: don't start its passage on this one meanwhile. */
     holdPassage?: boolean;
+    /** Passage a pending check asks the editor to see on the working cut. */
+    reviewRange?: TimeRange;
     /** A revision was requested from the open card. Its message box is outside the player. */
     writeRequest?: number;
     /**
@@ -233,7 +247,7 @@ function CutSide({ project, timeline, url, window, parkedAt, active, fps, label,
     proposed={label === "Proposed draft"} onStart={noop} parkedAt={parkedAt} />;
 }
 
-export function CutPreview({ threadView, workingCache, draftVersion, draft, draftFailed, openingJoin, onRetryDraft, source, autoPlaySource, hasCut, change, spot, approval = false, playChange, active,
+export function CutPreview({ threadView, workingCache, draftVersion, draft, draftFailed, openingJoin, cutLoadError, onRetryDraft, source, autoPlaySource, hasCut, change, spot, approval = false, playChange, active,
   onMedia, simple, joined }: PreviewProps) {
   const current = useProjectStore(useShallow(s => {
     if (!s.current) return null;
@@ -476,13 +490,15 @@ export function CutPreview({ threadView, workingCache, draftVersion, draft, draf
     if (pressed && active) player.play();
   }, [change?.id, spot, editStart, draft?.version, playChange]);
 
-  const passage = simple.holdPassage ? undefined : reached?.range ?? threadView?.selected?.range;
-  useLayoutEffect(() => { shownPassage.current = passage; }, [passage]);
   const framing = threadView?.framing;
   const cutReview = threadView?.cutReview;
   const selectedEdit = threadView?.selected;
+  const selectedPassage = selectedEdit && (!framing && !selectedEdit.beforeCut && selectedEdit.at === undefined
+    ? editPlaybackRange(selectedEdit.range, duration) : selectedEdit.range);
   const originalChange = threadView?.originalChange;
-  const original = useEditBefore(current.id, displayedTimeline, selectedEdit, originalChange, fps, !!framing);
+  // A marker left for the editor changed nothing in the video, so it has no Before to read.
+  const compared = selectedEdit?.marker ? undefined : selectedEdit;
+  const original = useEditBefore(current.id, displayedTimeline, compared, compared && originalChange, fps, !!framing, selectedPassage);
   const cutIndex = cutReview && selectedEdit ? cutReview.cuts.indexOf(selectedEdit) : -1;
   // Before belongs to the edit that's open: it holds while that edit is played again from its top, and the next edit
   // opens on After.
@@ -494,6 +510,10 @@ export function CutPreview({ threadView, workingCache, draftVersion, draft, draf
   // The next edit can carry the same request number, so a stretch left behind would play as its passage.
   useLayoutEffect(() => { if (!selectedEdit) setReach(undefined); }, [selectedEdit]);
   const playingBefore = before && !framing;
+  const reviewPassage = selectedEdit && simple.reviewRange && !playingBefore ? editPlaybackRange(simple.reviewRange, duration) : undefined;
+  const reviewPoint = simple.reviewRange?.start;
+  const passage = simple.holdPassage ? undefined : reached?.range ?? reviewPassage ?? selectedPassage;
+  useLayoutEffect(() => { shownPassage.current = passage; }, [passage]);
   useLayoutEffect(() => { beforeShown.current = playingBefore; }, [playingBefore]);
   const overlay = playingBefore ? "before-clip" : framing ? "framing" : undefined;
   const overlaid = useRef<string>(undefined);
@@ -528,7 +548,7 @@ export function CutPreview({ threadView, workingCache, draftVersion, draft, draf
     // The clip moves the playhead as it plays. The player under it waits, and takes up from the playhead afterwards.
     if (playingBefore) return player.lendPlayhead({ pause: () => beforeClip.current?.pause() });
     if (framing && !reached) {
-      const at = framing.cue ?? usePlayerStore.getState().time;
+      const at = reviewPoint ?? framing.cue ?? usePlayerStore.getState().time;
       return player.previewRange(passage, fps, at >= passage.start && at < passage.end ? at : passage.start);
     }
     // An edit goes by its first version: a revision that lands under it is still the passage the editor chose.
@@ -546,7 +566,7 @@ export function CutPreview({ threadView, workingCache, draftVersion, draft, draf
       return release;
     }
     return player.previewRange(passage, fps, undefined, again);
-  }, [threadView?.request, passage?.start, passage?.end, framing?.beforeVersion, framing?.cue, playingBefore, selectedEdit?.at, active, playable, fps, selection, duration, reached]);
+  }, [threadView?.request, passage?.start, passage?.end, framing?.beforeVersion, framing?.cue, reviewPoint, playingBefore, selectedEdit?.at, active, playable, fps, selection, duration, reached]);
 
   // Decode the selected edit's paused frame, including effects and overlays.
   const editedVersion = draft?.version ?? head;
@@ -567,7 +587,7 @@ export function CutPreview({ threadView, workingCache, draftVersion, draft, draf
     if (draft || cut) player.prepare();
     // The way back from Settings carries the speed the editor was watching at, with their place.
     const speed = Number(params.get("speed"));
-    if (RATES.some(rate => rate.value === speed)) player.setRate(speed);
+    if (speed >= MIN_RATE && speed <= MAX_RATE && Number.isInteger(speed / RATE_STEP)) player.setRate(speed);
     const next = new URLSearchParams(params);
     next.delete("note");
     next.delete("t");
@@ -584,6 +604,10 @@ export function CutPreview({ threadView, workingCache, draftVersion, draft, draf
       e.preventDefault();
       // Held down, Space is one press: its repeats would flutter between play and pause.
       if (playable && !e.repeat) player.toggle();
+    } else if (e.key === "+" || e.key === "=" || e.key === "-") {
+      if (!playable || isComposing(e)) return;
+      e.preventDefault();
+      stepPlaybackRate(e.key === "-" ? -1 : 1);
     } else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
       e.preventDefault();
       if (!playable || duration <= 0) return;
@@ -679,20 +703,29 @@ export function CutPreview({ threadView, workingCache, draftVersion, draft, draf
             <SelectedCutFrame key={JSON.stringify([fullVideoUrl, selectedFrameUrl])} time={selectedTime} url={selectedFrameUrl} fps={fps} />}
           {simple.label && <div className="simple-on-video" role="status">{simple.label}</div>}
           <TemplateOnPicture />
-          {playingBefore && originalChange && selectedEdit ? <EditBeforePreview key={threadView?.request}
-            change={originalChange} original={original} passage={selectedEdit.range} active={active} loading={loading}
+          {cutLoadError && <div className="absolute inset-x-0 top-0 z-10 flex items-center justify-center gap-2 bg-black/75 p-2 text-sm">
+            <span role="alert" title={cutLoadError.reason}>{cutLoadError.message}</span>
+            <button type="button" className="btn-quiet" onClick={cutLoadError.retry}>Retry</button>
+          </div>}
+          {playingBefore && originalChange && selectedPassage ? <EditBeforePreview key={threadView?.request}
+            change={originalChange} original={original} passage={selectedPassage} active={active} loading={loading}
             clock={<PlayerTime end={duration} coarse />} playbackRef={beforeClip} />
             : framing && displayedTimeline ? <FramingPreview
             key={JSON.stringify([selection, threadView?.threadId, threadView?.selected?.changeId, threadView?.request])}
             project={current.project} timeline={displayedTimeline} original={original} duration={duration} before={before} loading={loading} coarse onAfter={after} />
-            : (source || cut || change || draftVersion) && <MonitorPlayback playing={playing} playable={playable} loading={loading || (!!openingJoin && !draftFailed)}
+            : (source || cut || change || draftVersion) && <MonitorPlayback playing={playing} playable={playable} loading={!cutLoadError && (loading || (!!openingJoin && !draftFailed))}
             onToggle={() => player.toggle()}>
             <PlayerTime end={duration} coarse />
           </MonitorPlayback>}
           {(source || cut || change || draftVersion) && <div className="monitor-controls">
-            {/* Picking a speed hands the keys back to the page, so the arrows go on stepping through edits. */}
-            <PreferenceSelect compact label="Playback speed" options={RATES} value={rate} valueLabel={`${rate}×`} disabled={!playable}
-              onChange={value => player.setRate(value)} onClose={() => (document.activeElement as HTMLElement | null)?.blur()} />
+            <div className="playback-speed" role="group" aria-label="Playback speed"
+              onClick={e => { if (e.detail > 0 && e.target instanceof HTMLButtonElement) e.target.blur(); }}>
+              <button type="button" className="btn-icon" aria-label="Decrease playback speed" aria-keyshortcuts="-" title="Decrease playback speed (−)"
+                disabled={!playable || rate <= MIN_RATE} onClick={() => stepPlaybackRate(-1)}>−</button>
+              <output>{rate}×</output>
+              <button type="button" className="btn-icon" aria-label="Increase playback speed" aria-keyshortcuts="plus =" title="Increase playback speed (+)"
+                disabled={!playable || rate >= MAX_RATE} onClick={() => stepPlaybackRate(1)}>+</button>
+            </div>
             <button className="btn-icon" onClick={e => { if (e.detail) e.currentTarget.blur(); void toggleFullscreen(); }} aria-label={expanded ? "Exit full screen" : "Full screen"} title={expanded ? "Exit full screen" : "Full screen"}>
               <Icon name="fullscreen" size={15} />
             </button>

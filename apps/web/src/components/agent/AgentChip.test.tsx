@@ -11,24 +11,10 @@ import { useProjectStore } from "../../stores/project";
 import { SettingsPage } from "../../pages/SettingsPage";
 import { useHostsStore } from "../../stores/hosts";
 import { useModelPreferences } from "../../stores/modelPicker";
-import { loadAgent, useUiStore } from "../../stores/ui";
+import { useUiStore } from "../../stores/ui";
 import { AgentChip } from "./AgentChip";
 import { Dropdown } from "../shell/WorkspaceNavigation";
 import { ModelSettings } from "../shell/ModelSettings";
-
-it("uses the configured default until the editor chooses an agent and model", () => {
-  const key = "scarlet.agent";
-  const previous = localStorage.getItem(key);
-  try {
-    localStorage.removeItem(key);
-    expect(loadAgent("codex")).toEqual({ agent: "codex" });
-    localStorage.setItem(key, JSON.stringify({ agent: "claude", model: "opus" }));
-    expect(loadAgent("codex")).toMatchObject({ agent: "claude", model: "opus" });
-  } finally {
-    if (previous === null) localStorage.removeItem(key);
-    else localStorage.setItem(key, previous);
-  }
-});
 
 it("shows the model name and effort dial and returns focus after keyboard navigation", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -93,6 +79,64 @@ it("shows the model name and effort dial and returns focus after keyboard naviga
     useHostsStore.setState(oldHosts, true);
     if (savedPick === null) localStorage.removeItem("scarlet.agent");
     else localStorage.setItem("scarlet.agent", savedPick);
+    vi.unstubAllGlobals();
+  }
+});
+
+it("saves picker changes to the desktop in order even when WebView storage rejects the write", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.stubGlobal("__TAURI_INTERNALS__", {});
+  const oldHosts = useHostsStore.getState();
+  const oldUi = useUiStore.getState();
+  const oldWrite = localStorage.getItem("scarlet.agent");
+  const write = vi.spyOn(localStorage, "setItem").mockImplementation(() => { throw new Error("Storage is full"); });
+  vi.spyOn(desktop, "hostStatus").mockResolvedValue({
+    agents: [], hostId: null, running: [], connected: false, configured: false, serverUrl: null, name: null, error: null, mcpCommand: null,
+  });
+  vi.spyOn(desktop, "onHostStatus").mockResolvedValue(() => {});
+  let finishWrite!: () => void;
+  const firstWrite = new Promise<void>(resolve => { finishWrite = resolve; });
+  const save = vi.spyOn(desktop, "saveEditorModel").mockReturnValueOnce(firstWrite).mockResolvedValue(undefined);
+  const host = { ...buildDb().hosts[0]!, online: true };
+  useHostsStore.setState({ hosts: [{ ...host, agents: [{
+    id: "codex", installed: true, model: "gpt-6.1-sol", models: ["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-astra"],
+  }] }] });
+  useUiStore.setState({ agent: { agent: "claude" }, agentSelected: false });
+  useUiStore.getState().setDefaultAgent("codex");
+  expect(useUiStore.getState().agent).toEqual({ agent: "codex" });
+  expect(save).not.toHaveBeenCalled();
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  const click = (selector: string) => act(() => container.querySelector<HTMLButtonElement>(selector)!.click());
+  try {
+    await act(() => root.render(<MemoryRouter><AgentChip /></MemoryRouter>));
+    await click('[aria-haspopup="dialog"]');
+    await click('[aria-label="Codex · gpt-6.1-terra"]');
+    await click('[aria-label="Codex · gpt-6-astra"]');
+    expect(container.querySelector('[aria-haspopup="dialog"]')?.textContent).toBe("gpt-6-astra");
+    expect(save).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ agent: "codex", model: "gpt-6.1-terra" }));
+    finishWrite();
+    await vi.waitFor(() => expect(save).toHaveBeenNthCalledWith(2, expect.objectContaining({ agent: "codex", model: "gpt-6-astra" })));
+
+    const catalog = useHostsStore.getState().hosts;
+    await act(() => useHostsStore.setState({ hosts: [{ ...host, agents: [{
+      id: "codex", installed: true, model: "gpt-6.1-sol", models: ["gpt-6.1-sol"],
+    }] }] }));
+    expect(container.querySelector('[aria-haspopup="dialog"]')?.textContent).toBe("gpt-6.1-sol");
+    await act(() => useHostsStore.setState({ hosts: catalog }));
+    expect(container.querySelector('[aria-haspopup="dialog"]')?.textContent).toBe("gpt-6-astra");
+    expect(save).toHaveBeenCalledTimes(2);
+  } finally {
+    finishWrite();
+    await act(() => root.unmount());
+    container.remove();
+    useUiStore.setState(oldUi, true);
+    useHostsStore.setState(oldHosts, true);
+    write.mockRestore();
+    if (oldWrite === null) localStorage.removeItem("scarlet.agent");
+    else localStorage.setItem("scarlet.agent", oldWrite);
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
   }
 });

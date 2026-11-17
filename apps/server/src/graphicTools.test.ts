@@ -78,7 +78,8 @@ describe.skipIf(!hasChrome())("graphics", () => {
     const listed = JSON.parse(textOf(await call("project_get", {})));
     expect(listed.media.find((m: { id: string }) => m.id === result.mediaId)).toMatchObject({ kind: "graphic", graphic: { source: expect.stringMatching(/^graphics\//) } });
 
-    const placed = await call("timeline_propose", { intent: "requested", description: "Lower third for Daniel", ops: [
+    const placed = await call("timeline_propose", { intent: "requested", description: "Lower third for Daniel",
+      reason: "Identify Daniel when he first appears on screen.", ops: [
       { op: "addTrack", track: { id: "v9", kind: "video", name: "Graphics", clips: [] } },
       { op: "addClip", trackId: "v9", clip: { id: "lt1", kind: "media", mediaId: result.mediaId, sourceIn: 0, sourceOut: 1, timelineIn: 0 } },
     ] });

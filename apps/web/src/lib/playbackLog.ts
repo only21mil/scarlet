@@ -5,7 +5,7 @@
  * what they asked for, so a flicker or a gap in the sound can be read back as who did what, in order.
  * Nothing is logged per frame, and a burst is capped.
  */
-import { appLog, appLogging, calledBy, logId, startAppLog, type LogFields } from "./appLog";
+import { appLog, appLogging, calledBy, errorName, logId, startAppLog, type LogFields } from "./appLog";
 
 export { calledBy, logId };
 type Fields = LogFields;
@@ -16,6 +16,14 @@ type Fields = LogFields;
  */
 export function playbackLog(event: string, fields?: Fields, key?: string) {
   appLog("playback", event, fields, { key, level: event === "error" || event.endsWith("failed") ? "warn" : "info" });
+}
+
+/** A rejected play promise does not emit a media error event. */
+export function logPlayRefusal(el: HTMLMediaElement, origin: "transport" | "comparison" | "source-switch" | "monitor-resume" | "park", error: unknown) {
+  const name = errorName(error);
+  playbackLog(name === "AbortError" ? "play-interrupted" : "play-failed", {
+    el: logId(el), origin, name, t: el.currentTime, ready: el.readyState,
+  });
 }
 
 export const playbackLogging = appLogging;

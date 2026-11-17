@@ -1,5 +1,5 @@
 import { requestText, type Task, type ThreadEdit } from "@scarlet/shared";
-import { canStartCutReview, isPublishedCall, makeTimeMap, rebaseOp, RebaseConflict, reviewReasons, type Change, type CutAssessment, type CutReview, type TimeMap, type TimeRange, type Timeline } from "@scarlet/timeline";
+import { canStartCutReview, isPublishedCall, makeTimeMap, rebaseOp, RebaseConflict, reviewCutSummaries, reviewReasons, type Change, type CutAssessment, type CutReview, type TimeMap, type TimeRange, type Timeline } from "@scarlet/timeline";
 import { requestRoots, stagingTask } from "./requestRuns";
 import { runIsActive } from "./taskRun";
 import { isRecheck, stagedCuts, type Thread } from "./threads";
@@ -44,6 +44,7 @@ export type Call = CutAssessment & { unchecked?: boolean };
 export function reviewCalls(change: Change, cuts: ReadonlyArray<Pick<CutReview["cuts"][number], "removed">> | undefined, over: boolean, prior?: Call): Call[] {
   const assessments = change.cutAssessments ?? [];
   const decided = new Set(change.cutChoices?.map(c => c.index));
+  const summaries = cuts && reviewCutSummaries(change, cuts);
   const calls: Call[] = assessments.filter(a => isPublishedCall(a) || (!a.provisional && a.askOrder !== undefined && decided.has(a.index)));
   if (over) {
     for (const a of assessments) if (a.provisional && a.verdict === "ask") calls.push({ ...a, unchecked: true });
@@ -61,7 +62,8 @@ export function reviewCalls(change: Change, cuts: ReadonlyArray<Pick<CutReview["
     if (at >= 0) calls[at] = prior;
     else calls.push(prior);
   }
-  return calls.sort((a, b) => (a.askOrder ?? Infinity) - (b.askOrder ?? Infinity) || a.index - b.index);
+  return calls.map(call => call.summary || !summaries?.[call.index] ? call : { ...call, summary: summaries[call.index] })
+    .sort((a, b) => (a.askOrder ?? Infinity) - (b.askOrder ?? Infinity) || a.index - b.index);
 }
 
 /** Where Keep goes from an edit Scarlet didn't flag, the one on `rows[shown]`: the next row of the list in time order,

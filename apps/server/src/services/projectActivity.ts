@@ -1,9 +1,7 @@
 import { cachedShare, Task, type ProjectActivity, type ProjectSummary } from "@scarlet/shared";
 import type { Ctx } from "../context.js";
 import { sourceCacheStatuses } from "./sourcePreviews.js";
-
-/** The project's own requests. A skill's edit only borrows a project to run in. */
-const REQUESTS = "('edit','note','revise')";
+import { PROJECT_EDIT_KINDS } from "./tasks.js";
 
 /**
  * What Scarlet is doing in each listed project, for the project list: a request it is working on, then files it
@@ -22,7 +20,7 @@ export async function withActivity(ctx: Ctx, summaries: ProjectSummary[]): Promi
 
   // A request asking the editor something is counted with what needs them, not as work under way.
   const editing = new Map((ctx.db.prepare(`SELECT project_id, count(*) AS n FROM tasks
-    WHERE state IN ('claimed','running') AND kind IN ${REQUESTS} GROUP BY project_id`)
+    WHERE state IN ('claimed','running') AND kind IN ${PROJECT_EDIT_KINDS} GROUP BY project_id`)
     .all() as { project_id: string; n: number }[]).map(row => [row.project_id, row.n]));
 
   // A file an engine is still reading keeps its claim until that engine sees the pause, which another engine does a moment later.

@@ -18,7 +18,9 @@ const stampFile = path.join(cache, 'build-version.json');
 const versionScript = 'apps/desktop/scripts/release-version.mjs';
 const tools = JSON.parse(fs.readFileSync(path.join(root, 'tools.json'), 'utf8').replace(/^\uFEFF/, ''));
 const logFile = path.join(root, 'launch.log');
-const env = { ...process.env, GIT_TERMINAL_PROMPT:'0', GCM_INTERACTIVE:'Never', CI:'true', CARGO_TARGET_DIR:target };
+// A local build of main is soon replaced: thin LTO across parallel codegen units, not the installers' whole-program pass.
+const env = { ...process.env, GIT_TERMINAL_PROMPT:'0', GCM_INTERACTIVE:'Never', CI:'true', CARGO_TARGET_DIR:target,
+  CARGO_PROFILE_RELEASE_LTO:'thin', CARGO_PROFILE_RELEASE_CODEGEN_UNITS:'16' };
 const pathKey = Object.keys(env).find(k => k.toLowerCase() === 'path') || 'Path';
 env[pathKey] = [path.dirname(process.execPath),path.dirname(tools.git),path.dirname(tools.pnpm),path.join(homedir(),'.cargo','bin'),env[pathKey]].join(';');
 if (tools.cmake && fs.existsSync(tools.cmake)) env.CMAKE_COMMAND = tools.cmake;

@@ -11,6 +11,7 @@ import { runItems, runLines } from "../src/lib/taskRun";
 import { RunBundle } from "../src/components/review/RunBundle";
 import { buildDb, PRJ } from "../src/lib/mock/fixtures";
 import { SimpleWorkspace } from "../src/pages/SimpleWorkspace";
+import { usePlayerStore } from "../src/stores/player";
 import { useProjectStore } from "../src/stores/project";
 import { useUiStore } from "../src/stores/ui";
 
@@ -39,7 +40,8 @@ describe("open editor with 60 pending decisions and 240 completed edits", () => 
       vi.spyOn(api, "renders").mockResolvedValue({ renders: [] });
       vi.spyOn(api, "sourceCaches").mockResolvedValue({ caches: [] });
       vi.spyOn(api, "threadEdits").mockResolvedValue({ version: project.head!, edits: [] });
-      useUiStore.setState({ wsStatus: "open" });
+      useUiStore.setState({ wsStatus: "open", agentDraft: "", agentContext: null });
+      usePlayerStore.setState({ playing: false, time: 0 });
       useProjectStore.setState({ current: {
         id: PRJ, project, timeline: db.timelines[project.head!]!, media: project.media, changes, notes: [], renders: [],
         tasks: [task], taskEvents: { [task.id]: history }, versions: db.versions[PRJ],
@@ -61,6 +63,21 @@ describe("open editor with 60 pending decisions and 240 completed edits", () => 
       event: { ...event, id: "new" + seq, taskId: task.id, at: new Date((2000 + seq) * 1000).toISOString() },
     }));
   }
+  bench("pick ten timeline points with 300 edit threads", () => {
+    for (let time = 0; time < 10; time++) {
+      flushSync(() => {
+        usePlayerStore.getState().setTime(time);
+        useUiStore.getState().setAgentContext({ time, clipIds: [], version: project.head! });
+      });
+    }
+    if (!container.querySelector(".composer-aim-name")?.textContent?.includes("At 0:09")) throw new Error("Point did not update");
+  }, options);
+  bench("play and pause five times with 300 edit threads", () => {
+    for (let i = 0; i < 5; i++) {
+      flushSync(() => usePlayerStore.setState({ playing: true }));
+      flushSync(() => usePlayerStore.setState({ playing: false }));
+    }
+  }, options);
   bench("restore a 1,500-event run and display its next ten updates", () => {
     seq = 0;
     flushSync(() => useProjectStore.setState(s => ({ current: { ...s.current!, taskEvents: { [task.id]: history } } })));

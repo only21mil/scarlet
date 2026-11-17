@@ -4,6 +4,23 @@ The [native 4K playback measurements](native-playback-benchmarks.md) cover scrub
 
 Measured on an 18-core Apple M5 Max running macOS 26.6.2. Timings are wall time. Engine benchmarks use throwaway libraries. FFmpeg 9.0.2, Whisper, Uhm and speaker identification run locally. Renderer benchmarks use a headless DOM unless a measurement identifies the native window. Physical input-to-display latency and Windows GPU performance are unmeasured.
 
+## November 16 follow-up on large edits and media review
+
+These macOS measurements compare GitHub main at `870c0000` with the performance branch on the same fixtures.
+
+| Operation | Main | Performance branch |
+| --- | ---: | ---: |
+| Return the first edited monitor JPEG for the bundled 360p sample | 226.16 ms | 64.74 ms |
+| Reopen a preview with one of 48 proposed cuts restored | 8.68 ms | 4.34 ms |
+| Read project metadata and the track summary through the agent tool | 11.63 ms | 5.72 ms |
+| Find an exact phrase in an 18,000-word transcript, first search | 52.29 ms | 41.51 ms |
+| Repeat the exact phrase search | 2.11 ms | 1.04 ms |
+| Process 60 playback-clock updates with 360 cut gaps visible | 9.31 ms | 2.24 ms |
+
+The first three rows are medians from five alternating pairs of fresh loopback engines. Each project had two 600-shot tracks. The monitor test then imported the sample, assembled two ranges, requested an edited frame and checked that a repeat returned identical JPEG bytes. The measurement ends at the engine response. Run `node apps/server/scripts/bench-editor.mjs 1 600 48 --layered --tools --media` in each built checkout.
+
+The search medians cover five generated two-hour transcripts. The first response transferred 148,236 bytes, including the exact word order used to identify stale edit references. The previous tool read 1,721,482 bytes of timed transcript. Repeat searches reuse the word order until it changes. Run `node packages/mcp/bench/transcript.mjs 5 7200`. The playback measurement is mean elapsed time per batch in the mounted, headless renderer benchmark at `apps/web/bench/timeline.bench.tsx`.
+
 ## Large projects, long runs and warm caches
 
 These comparisons use synthetic projects on macOS and the working checkout based on `4755d5e5` before and after the performance changes. Each row times the named operation. The conversation read includes request handling and JSON parsing inside the engine. React timings use a headless DOM. The playback-fragment timing ends when the engine locates an already-encoded fragment.

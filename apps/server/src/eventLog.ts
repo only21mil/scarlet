@@ -9,7 +9,7 @@ import { clip, humanDuration } from "./logText.js";
  * listening here covers every route and every agent tool at once, including ones added later.
  * Runs log their own states in services/tasks.
  */
-export function logStateChanges(ctx: Ctx) {
+export function logStateChanges(ctx: Ctx, projects: readonly { id: string; head: string | null; media_paused: number }[] = []) {
   // What was last said about each thing, so only a change is logged. Bounded: the oldest entries go first.
   const seen = new Map<string, string>();
   const started = new Map<string, number>();
@@ -25,6 +25,12 @@ export function logStateChanges(ctx: Ctx) {
     remember(seen, key, state);
     return { from };
   };
+  // `projects` come newest first. Seed the newest last, and leave room for what happens: the oldest entries are the
+  // first to go.
+  for (const project of projects.slice(0, 1000).reverse()) {
+    remember(seen, `${project.id}/head`, project.head ?? "none");
+    remember(seen, `${project.id}/paused`, String(!!project.media_paused));
+  }
   const span = (range: { start: number; end: number } | null | undefined) => range ? ` ${range.start.toFixed(2)}–${range.end.toFixed(2)} s` : "";
 
   const onEvent = (event: WsEvent) => {

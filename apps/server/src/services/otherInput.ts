@@ -1,11 +1,10 @@
 import { stat } from "node:fs/promises";
-import { availableParallelism } from "node:os";
 import { fileInDirectory } from "@scarlet/render";
 import type { MediaAsset, TimeRange } from "@scarlet/timeline";
 import type { Ctx } from "../context.js";
-import { AnalysisCache } from "./analysisCache.js";
 import { otherVoiceTurns } from "./otherVoiceTurns.js";
-import { readSourceEnergy, sourceLabels, wordSource, type measureSources } from "./transcriptSources.js";
+import { wordSource, type measureSources } from "./transcriptSources.js";
+import { ENERGY_READS, sourceEnergyReader } from "./sourceEnergy.js";
 
 type Measured = ReturnType<typeof measureSources>;
 type Word = TimeRange & { text: string };
@@ -16,7 +15,7 @@ export interface RecordingInputs { mix: number; dialogue: number; other: number 
 /** Enough words heard on one input alone to say which input the dialogue is on, and how lopsided they must be. */
 const MIN_WORDS = 150, SHARE = .8, PAGE = 60, MAX_PAGES = 16;
 /** Pages of levels decoded at once, each one FFmpeg on one core. */
-const READ_AHEAD = Math.max(2, Math.min(4, Math.floor(availableParallelism() / 4)));
+const READ_AHEAD = ENERGY_READS;
 
 /**
  * Which input a recording's dialogue is on, measured: a recording with a mix and two isolated inputs (a microphone
@@ -119,7 +118,7 @@ export function otherInputReader(ctx: Ctx) {
 
 function makeReader(ctx: Ctx) {
   const inputsOf = new Map<string, Promise<RecordingInputs | undefined>>();
-  const windows = new AnalysisCache<Measured>(r => r.energy.length * 64, 24 * 1024 * 1024, READ_AHEAD);
+  const levels = sourceEnergyReader(ctx);
   /** The recording's inputs and a reader of its levels, or undefined when its layout isn't one this can read. */
   async function open(projectId: string, media: MediaAsset) {
     if (media.voiceRoles || !media.transcriptId || !media.duration || (media.kind !== "audio" && !media.hasAudio)) return;
@@ -128,11 +127,11 @@ function makeReader(ctx: Ctx) {
     const signal = ctx.projectSignal(projectId);
     const info = await stat(file);
     const stamp = JSON.stringify([file, info.size, info.mtimeMs, info.ctimeMs]);
-    const read = (from: number, to: number) => windows.get(JSON.stringify([stamp, from, to]), () => readSourceEnergy(file, from, to, signal));
+    const read = (from: number, to: number) => levels.energy(file, from, to, signal);
     let inputs = inputsOf.get(stamp);
     if (!inputs) {
       inputs = (async () => {
-        if (!(await sourceLabels(file, signal)).length) return;
+        if (!(await levels.labels(file, signal)).length) return;
         const transcript = ctx.repos.transcripts.get(media.transcriptId!);
         return transcript ? recordingInputs(transcript.segments.flatMap(s => s.words), media.duration!, read) : undefined;
       })();

@@ -1,12 +1,14 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { matchedRoutes } from "hono/route";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { ZodError } from "zod/v3";
 import { OpError, TimelinePlanningError } from "@scarlet/timeline";
 import { authMiddleware, type AppEnv } from "./auth.js";
 import { createContext, noteEngineStart, type Ctx, type ServerOptions } from "./context.js";
 import { HttpError } from "./errors.js";
-import { clip, humanDuration } from "./logText.js";
+import { clip, humanDuration, requestLogId, REQUEST_ID_HEADER } from "./logText.js";
+import { startFileLog } from "./files.js";
 import { logStateChanges } from "./eventLog.js";
 import { authRoutes } from "./routes/auth.js";
 import { changeRoutes } from "./routes/changes.js";
@@ -28,7 +30,7 @@ import { taskRoutes } from "./routes/tasks.js";
 import { continueReadyRuns, recoverTasks, wireContinueWhenReady } from "./services/taskRecovery.js";
 import { sweepLeftovers } from "./services/leftovers.js";
 import { recoverSourcePreviews } from "./services/sourcePreviews.js";
-import { holdTranscriptions, recoverImportTranscriptions, recoverIngestInBackground } from "./services/ingest.js";
+import { holdTranscriptions, recoverIngestInBackground, resumeImportsInBackground } from "./services/ingest.js";
 import { timelineRoutes } from "./routes/timeline.js";
 import { perceptionRoutes } from "./routes/perception.js";
 import { foldStrandedPasses, recordLeftOutFootage, retireLeftoverPasses, wireChangeRenderCompletion } from "./services/changes.js";
@@ -50,7 +52,7 @@ const SLOW_REQUEST_MS = 30_000;
 /** A request this slow held the window back, even when it then succeeded. */
 const NOTABLE_REQUEST_MS = 1000;
 /** Writes too frequent to log one by one while they succeed quickly: a host's check-ins, and render requests, whose renders are logged as they finish. */
-const ROUTINE_WRITES = /\/hosts\/[^/]+\/(heartbeat|claim)$|\/renders$|\/renders\/[^/]+\/owners\/[^/]+$/;
+const ROUTINE_WRITES = /\/hosts\/[^/]+\/(heartbeat|claim)$|\/renders$|\/renders\/[^/]+\/owners\/[^/]+$|\/tool-diagnostic$/;
 
 /**
  * Where a request failed validation: the first field and the kind of problem, with a count of the rest.
@@ -67,7 +69,9 @@ function invalidAt(error: { code?: string; details?: unknown }): string {
 export function createApp(options: ServerOptions): ScarletApp {
   const partial = createContext(options);
   const ctx = partial as Ctx;
-  logStateChanges(ctx);
+  const projects = ctx.db.prepare(`SELECT id, head, media_paused FROM projects WHERE deleted_at IS NULL
+    ORDER BY updated_at DESC LIMIT 2000`).all() as { id: string; head: string | null; media_paused: number }[];
+  logStateChanges(ctx, projects);
   migrateGlobalSkills(ctx);
   ctx.renders = new RenderQueue(ctx);
   wireChangeRenderCompletion(ctx);
@@ -167,10 +171,7 @@ export function createApp(options: ServerOptions): ScarletApp {
   }, 30_000);
   taskRecovery.unref();
   const stopPurge = scheduleTrashPurge(ctx);
-  recoverIngestInBackground(ctx);
-  void ctx.track(recoverImportTranscriptions(ctx).catch(error => {
-    if (!ctx.shutdown.aborted) ctx.log(`[ingest] starting transcriptions left unbegun stopped part-way: ${(error as Error).message}`);
-  }));
+  resumeImportsInBackground(ctx);
   recoverSourcePreviews(ctx);
   const close = ctx.close.bind(ctx);
   ctx.close = async () => {
@@ -224,42 +225,51 @@ export function createApp(options: ServerOptions): ScarletApp {
   // Below that, every request that changed something, failed or was slow gets a line: what the window or an agent
   // asked for, whether it worked, and the engine's reason when it didn't. Quick reads and routine writes don't.
   const repeats = new Map<string, { at: number; more: number }>();
+  const inFlight = watchEventLoop(ctx);
   api.use("*", async (c, next) => {
     const started = Date.now();
-    await next();
+    const request = requestLogId(c.req.raw);
+    const route = () => matchedRoutes(c).findLast(r => /^\/api(?:\/(?:[a-z0-9.-]+|:[a-z][a-z0-9]*))+$/i.test(r.path))?.path ?? "unmatched";
+    startFileLog(c.req.raw, line => ctx.log(line), route);
+    c.header(REQUEST_ID_HEADER, request);
+    const flight = { method: c.req.method, route };
+    inFlight.add(flight);
+    try { await next(); } finally { inFlight.delete(flight); }
     const ms = Date.now() - started;
     const { method, path } = c.req;
     const status = c.res.status;
     const waited = c.req.query("wait") !== undefined;
     const gone = c.req.raw.signal?.aborted ? "; the caller had already disconnected" : "";
-    if (ms >= SLOW_REQUEST_MS && !waited) {
-      ctx.log(`[http] slow request: ${method} ${path} → ${status} after ${humanDuration(ms)}${gone}`);
-      return;
-    }
     if (method === "OPTIONS") return;
     const failed = status >= 400, writes = method !== "GET" && method !== "HEAD";
     if (!failed && ms < NOTABLE_REQUEST_MS && (!writes || ROUTINE_WRITES.test(path))) return;
+    const slow = ms >= SLOW_REQUEST_MS && !waited;
+    let code = "", reason = "";
+    if (failed && c.res.headers.get("content-type")?.includes("json")) {
+      const body = await c.res.clone().json().catch(() => undefined) as { error?: { code?: string; message?: string; details?: unknown } } | undefined;
+      if (body?.error) {
+        const error = body.error;
+        code = typeof error.code === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(error.code) ? error.code : "error";
+        reason = `: ${code}: ${clip(error.message ?? "", 200)}${invalidAt(error)}`;
+      }
+    }
     // The same request answered the same way again and again (a poll for something that isn't there) is one line
     // every ten seconds, with a count of the rest.
-    const key = `${method} ${path} ${status}`;
+    const key = `${method} ${path} ${status} ${code}`;
     const last = repeats.get(key);
     if (last && started - last.at < 10_000 && ms < NOTABLE_REQUEST_MS) { last.more++; return; }
     repeats.delete(key);
     repeats.set(key, { at: started, more: 0 });
     if (repeats.size > 500) repeats.delete(repeats.keys().next().value!);
-    let reason = "";
-    if (failed && c.res.headers.get("content-type")?.includes("json")) {
-      const body = await c.res.clone().json().catch(() => undefined) as { error?: { code?: string; message?: string; details?: unknown } } | undefined;
-      if (body?.error) reason = `: ${body.error.code ?? "error"}: ${clip(body.error.message ?? "", 200)}${invalidAt(body.error)}`;
-    }
-    ctx.log(`[http] ${method} ${path} → ${status} in ${humanDuration(ms)}${last?.more ? ` (and ${last.more} more like it)` : ""}${gone}${reason}`);
+    ctx.log(`[http] ${slow ? "slow request: " : ""}${method} ${path} → ${status} ${slow ? "after" : "in"} ${humanDuration(ms)}` +
+      ` request=${request} route=${route()}${code ? ` code=${code}` : ""}${last?.more ? ` (and ${last.more} more like it)` : ""}${gone}${reason}`);
   });
   api.use(
     "*",
     cors({
       origin: (origin) => (DEV_ORIGIN.test(origin) ? origin : null),
-      allowHeaders: ["Authorization", "Content-Type", "Range"],
-      exposeHeaders: ["Content-Range", "Accept-Ranges", "Content-Length", "Content-Disposition"],
+      allowHeaders: ["Authorization", "Content-Type", "Range", REQUEST_ID_HEADER],
+      exposeHeaders: ["Content-Range", "Accept-Ranges", "Content-Length", "Content-Disposition", REQUEST_ID_HEADER],
       allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
       credentials: true,
     }),
@@ -299,4 +309,28 @@ export function createApp(options: ServerOptions): ScarletApp {
   app.get("/health", (c) => c.json({ ok: true }));
 
   return { app, ctx };
+}
+
+/** The engine's thread held this long by one piece of work is logged: every request waits behind it. */
+const STALL_MS = 250;
+const STALL_TICK_MS = 100;
+
+/**
+ * Log each time the engine's only JavaScript thread was blocked for STALL_MS or more, with the requests that were in
+ * flight. The `[http]` timer starts when a request is picked up, so time spent queued behind a blocked thread shows
+ * nowhere else.
+ */
+function watchEventLoop(ctx: Ctx) {
+  const inFlight = new Set<{ method: string; route: () => string }>();
+  let expected = Date.now() + STALL_TICK_MS;
+  const timer = setInterval(() => {
+    const now = Date.now(), late = now - expected;
+    expected = now + STALL_TICK_MS;
+    if (late < STALL_MS) return;
+    const routes = [...inFlight].slice(0, 8).map(f => `${f.method} ${f.route()}`);
+    ctx.log(`[stall] blocked ${late} ms${routes.length ? `; in flight: ${routes.join(", ")}${inFlight.size > routes.length ? ` and ${inFlight.size - routes.length} more` : ""}` : ""}`);
+  }, STALL_TICK_MS);
+  timer.unref();
+  ctx.shutdown.addEventListener("abort", () => clearInterval(timer), { once: true });
+  return inFlight;
 }

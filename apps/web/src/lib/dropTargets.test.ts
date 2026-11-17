@@ -1,12 +1,15 @@
 // @vitest-environment happy-dom
 import { afterEach, expect, it, vi } from "vitest";
+import { startAppLog, stopAppLog } from "./appLog";
 import { desktop } from "./desktop";
 import { dropTargets, listenForFileDrops } from "./dropTargets";
 
-afterEach(() => { vi.restoreAllMocks(); document.body.replaceChildren(); });
+afterEach(() => { stopAppLog(); vi.restoreAllMocks(); document.body.replaceChildren(); });
 
 it.each(["macos", "linux", "windows"] as const)("gives a native drop on %s to the visible target in CSS coordinates", (platform) => {
   type Drop = Parameters<Parameters<typeof desktop.onDropFiles>[0]>[0];
+  const lines: string[] = [];
+  startAppLog(batch => lines.push(...batch));
   let fire!: (event: Drop) => void;
   vi.spyOn(desktop, "onDropFiles").mockImplementation(handler => { fire = handler; return Promise.resolve(() => {}); });
   document.body.innerHTML = `<div data-file-drop id="card"><p id="row">Interview</p>
@@ -33,5 +36,9 @@ it.each(["macos", "linux", "windows"] as const)("gives a native drop on %s to th
   // A zone inside the dialog still works.
   drop("#inner");
   expect(inner.drop).toHaveBeenCalledWith(["/footage/a.mov"]);
+  stopAppLog();
+  expect(lines).toEqual(["accepted", "no-target", "no-target", "accepted"].map(outcome =>
+    expect.stringContaining(`file-drop count=1 outcome=${outcome}`)));
+  expect(lines.join("\n")).not.toContain("/footage/");
   stop();
 });

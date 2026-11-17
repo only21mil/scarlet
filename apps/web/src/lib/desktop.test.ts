@@ -3,9 +3,10 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { startAppLog, stopAppLog } from "./appLog";
 import { desktop, isDesktop, markDesktop } from "./desktop";
 
+const eventListen = vi.hoisted(() => vi.fn());
 const command = vi.hoisted(() => vi.fn<(cmd: string, args?: Record<string, unknown>) => Promise<unknown>>());
 vi.mock("@tauri-apps/api/core", () => ({ invoke: command }));
-vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: eventListen }));
 
 let lines: string[], levels: string[];
 beforeEach(() => {
@@ -13,6 +14,7 @@ beforeEach(() => {
   lines = [];
   levels = [];
   command.mockReset();
+  eventListen.mockReset();
   startAppLog((batch, level) => { for (const line of batch) { lines.push(line.replace(/^(\[\w+\]) \S+ \S+ /, "$1 ")); levels.push(level); } });
 });
 afterEach(() => {
@@ -97,4 +99,13 @@ it("knows it is in the desktop app only when the shell is there, and marks the w
   } finally {
     vi.unstubAllGlobals();
   }
+});
+
+
+it("records native event registration failures even when a consumer catches them", async () => {
+  const error = new TypeError("Event bridge unavailable");
+  eventListen.mockRejectedValueOnce(error);
+  await expect(desktop.onEngineStatus(() => {})).rejects.toBe(error);
+  expect(lines).toEqual(['[error] desktop-listen event=engine-status name=TypeError error="TypeError: Event bridge unavailable"']);
+  expect(levels).toEqual(["warn"]);
 });

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { Timeline } from "@scarlet/timeline";
-import { api, errorMessage } from "../../lib/client";
+import { errorMessage } from "../../lib/client";
+import { readTimeline } from "../../lib/timelineCache";
 
 export function useReviewTimeline(projectId: string, version?: string, known?: Timeline | null) {
   const [saved, setSaved] = useState<Timeline>();
@@ -13,8 +14,8 @@ export function useReviewTimeline(projectId: string, version?: string, known?: T
     if (!version || timeline) return;
     let live = true;
     setFailed(undefined);
-    api.timeline(projectId, version).then(
-      ({ timeline }) => { if (live) setSaved(timeline); },
+    readTimeline(projectId, version).then(
+      timeline => { if (live) setSaved(timeline); },
       e => { if (live) setFailed({ projectId, version, error: errorMessage(e) }); },
     );
     return () => { live = false; };

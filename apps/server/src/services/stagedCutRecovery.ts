@@ -6,7 +6,7 @@ import type { StagedCutRevision, Task } from "@scarlet/shared";
 import { resolveTimeline } from "./timeline.js";
 
 /** The pass keeps its original slots. An individually reinspected slot can refer to a newer recording or take. */
-export function currentCutRanges(ctx: Ctx, project: Project, change: Change, review: CutReview, head: Timeline) {
+export function currentCutRanges(ctx: Ctx, project: Omit<Project, "media">, change: Change, review: CutReview, head: Timeline) {
   const mappers = new Map<string, ReturnType<typeof makeStagedCutMapper>>();
   const overrides = new Map(change.cutEdits?.map(e => [e.index, e]));
   return (index: number, replacement?: { version: string; range: TimeRange }): StagedCutMapping => {
@@ -32,7 +32,7 @@ type CutEdit = NonNullable<Change["cutEdits"]>[number];
 type RevisionPlacement = { slot: TimeRange; edit?: CutEdit; keep: boolean } | { conflict: Extract<StagedCutMapping, { kind: "conflict" }> };
 
 /** Keep review slots in their original order while attaching a recovered decision to the footage it actually uses. */
-export function placeRevision(ctx: Ctx, project: Project, change: Change, review: CutReview, index: number,
+export function placeRevision(ctx: Ctx, project: Omit<Project, "media">, change: Change, review: CutReview, index: number,
   body: StagedCutRevision, range: TimeRange, task: Task | null, scoped: boolean, inputVersion: string): RevisionPlacement {
   const old = review.cuts[index]!.removed;
   const previous = change.cutEdits?.find(e => e.index === index);
@@ -93,7 +93,7 @@ export function placeRevision(ctx: Ctx, project: Project, change: Change, review
 }
 
 /** Map only the removals the editor actually chose, in one snapshot of the current timeline. */
-export function reviewedCutsOnHead(ctx: Ctx, project: Project, change: Change, review: CutReview, head: Timeline,
+export function reviewedCutsOnHead(ctx: Ctx, project: Omit<Project, "media">, change: Change, review: CutReview, head: Timeline,
   restored: number[]): { conflict: CutConflict } | { timeline: Timeline; applied: NonNullable<Change["appliedReview"]> } {
   const keep = new Set(restored);
   if (keep.size !== restored.length || restored.some(i => !Number.isInteger(i) || i < 0 || i >= review.cuts.length))
@@ -112,7 +112,8 @@ export function reviewedCutsOnHead(ctx: Ctx, project: Project, change: Change, r
   for (const [i, { index, range }] of selected.entries()) {
     if (i && range.start < selected[i - 1]!.range.end - 1e-6)
       return { conflict: { kind: "conflict", index, range, reason: "Two proposed cuts now cover the same footage." } };
-    joins.push({ at: range.start - removed, removed: range, reviewIndex: index });
+    joins.push({ at: range.start - removed, removed: range, reviewIndex: index,
+      ...(change.timelineEdits?.length && { proposedAt: review.cuts[index]!.at }) });
     removed += range.end - range.start;
   }
   const timeline = applyReviewRemovals(head, selected.map(c => c.range), change.toVersion);

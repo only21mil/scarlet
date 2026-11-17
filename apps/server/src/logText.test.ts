@@ -51,3 +51,22 @@ it("forgets the oldest of many failing things instead of growing without end", (
   expect(lines).toHaveLength(202);
   expect(lines.at(-1)).toBe("0 failed");
 });
+
+it("keeps holding back many things that keep failing instead of forgetting them early", () => {
+  const lines: string[] = [];
+  const log = throttledLog(line => lines.push(line), 60_000, 1000);
+  for (let round = 0; round < 3; round++)
+    for (let i = 0; i < 500; i++) log(`tsk_${i}`, `${i} blocked`, round * 10_000 + i);
+  expect(lines).toHaveLength(500);
+});
+
+it("drops expired keys before live ones when full", () => {
+  const lines: string[] = [];
+  const log = throttledLog(line => lines.push(line), 60_000, 2);
+  log("old", "old failed", 0);
+  log("a", "a failed", 70_000);
+  log("b", "b failed", 70_001);
+  // "old" expired and went first, so "a" is still held back.
+  log("a", "a failed", 70_002);
+  expect(lines).toEqual(["old failed", "a failed", "b failed"]);
+});

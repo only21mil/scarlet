@@ -1,3 +1,4 @@
+import { newRequestId, REQUEST_ID_HEADER } from "@scarlet/shared";
 import { isPlayableMedia, type MediaAsset } from "@scarlet/timeline";
 import { api, IS_MOCK, mockClient } from "./client";
 import { appLog, logPath } from "./appLog";
@@ -8,12 +9,13 @@ export function reportImportCheck(importId: string, fraction: number) {
   importChecks.get(importId)?.(fraction);
 }
 
-export async function importLocalFile(projectId: string, path: string, onCheck: (fraction: number) => void, importId: string = crypto.randomUUID(), deferFormat = false) {
+export async function importLocalFile(projectId: string, path: string, onCheck: (fraction: number) => void, importId: string = crypto.randomUUID(), deferFormat = false, signal?: AbortSignal) {
   importChecks.set(importId, onCheck);
   try {
     // A link downloads; a path is copied and reports its progress.
     const source = /^https?:\/\//i.test(path) ? { url: path, importId } : { path, importId };
-    return (await api.importMedia(projectId, { ...source, ...(deferFormat && { deferFormat }) })).media;
+    const request = { ...source, ...(deferFormat && { deferFormat }) };
+    return (await (signal ? api.importMedia(projectId, request, signal) : api.importMedia(projectId, request))).media;
   } finally {
     importChecks.delete(importId);
   }
@@ -51,10 +53,11 @@ export function uploadMedia(
     fd.append("file", file, file.name);
     const url = api.url(`/projects/${projectId}/media${deferFormat ? "?deferFormat=true" : ""}`);
     // This request goes round the client, so it writes the client's `[api]` lines itself.
-    const path = logPath(url), started = performance.now();
+    const path = logPath(url), started = performance.now(), request = newRequestId();
     const log = (event: string, fields?: Record<string, unknown>, level?: "warn") =>
-      appLog("api", event, { method: "POST", path, ...fields, ms: Math.round(performance.now() - started) }, { level });
+      appLog("api", event, { method: "POST", path, request, ...fields, ms: Math.round(performance.now() - started) }, { level });
     xhr.open("POST", url);
+    xhr.setRequestHeader(REQUEST_ID_HEADER, request);
     const token = api.token;
     if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
     xhr.upload.onprogress = (e) => {
@@ -64,14 +67,14 @@ export function uploadMedia(
     xhr.onabort = () => { log("stopped"); reject(new DOMException("Upload cancelled", "AbortError")); };
     xhr.onload = () => {
       try {
-        const json = JSON.parse(xhr.responseText) as { media?: MediaAsset; error?: { message?: string } };
+        const json = JSON.parse(xhr.responseText) as { media?: MediaAsset; error?: { code?: string; message?: string } };
         if (xhr.status >= 200 && xhr.status < 300 && json.media) { log("did", { status: xhr.status }); resolve(json.media); }
         else {
-          log("failed", { status: xhr.status, reason: json.error?.message?.slice(0, 300) }, "warn");
+          log("failed", { status: xhr.status, code: json.error?.code }, "warn");
           reject(new Error(json.error?.message ?? `Upload failed (${xhr.status})`));
         }
       } catch {
-        log("failed", { status: xhr.status, reason: "unreadable answer" }, "warn");
+        log("invalid-body", { status: xhr.status }, "warn");
         reject(new Error(`Upload failed (${xhr.status})`));
       }
     };

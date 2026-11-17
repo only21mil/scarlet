@@ -114,6 +114,15 @@ it("shows a wait for the transcript as one row instead of every call that checks
     expect(runLines(running, done, runItems(running, done, []), Date.parse(at(400))).map(l => l.took)).toEqual([undefined, 341_000, 29_000]);
 });
 
+it("covers a read of several recordings with the wait for any one of them", () => {
+    const read = { mediaIds: ["mic", "cam"], from: 0, to: 60 };
+    const wait = (s: number) => log(s, "", { kind: "media_wait", wait: "transcript", mediaId: "cam" });
+    const running = { ...task, state: "running" } as Task;
+    expect(runItems(running, [tool(10, "transcript_get", read), wait(25), tool(40, "transcript_get", read)], [])).toEqual([
+      { kind: "step", at: at(10), verb: "Waiting", detail: "for the transcript", background: true },
+    ]);
+});
+
 it("gives each step the time until the next one starts, so the steps add up to the header", () => {
     const events = [
       tool(6, "project_get"),

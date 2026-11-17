@@ -1,11 +1,14 @@
 // All offsets into the file are local seconds. origin maps local zero to the
 // source or version time displayed to the editor (e.g. a rendered segment).
+import { randomUUID } from "node:crypto";
+import { readFile, rm } from "node:fs/promises";
+import { join } from "node:path";
 import type { TimeRange } from "@scarlet/timeline";
 import { escapeFilterPath } from "./effects.js";
 import { LOCAL_MEDIA_INPUT, SOURCE_AUDIO_CLOCK, failureReason, ffSeconds, resolveFfmpeg, runCapture } from "./exec.js";
 import { resolveFontFile } from "./fonts.js";
 import { isStoredAsShown } from "./probe.js";
-import { extractWaveform } from "./waveform.js";
+import { waveformFromPcm } from "./waveform.js";
 
 function input(file: string, range: TimeRange, decoder?: SheetOptions["decoder"]) {
   // CUDA frames stay on the GPU until `shrinkFirst` scales them. VideoToolbox frames come back to memory.
@@ -156,21 +159,28 @@ async function readSheet(file: string, range: TimeRange, opts: SheetOptions, ret
   }
   const times = sampleTimes(duration, opts.fps, opts.count, changes ?? scenes,
     opts.focus === undefined ? undefined : opts.focus - origin);
-  // Select the first displayed frame crossing each target and report its actual PTS.
-  const select = ["isnan(prev_t)", ...times.slice(1).map(t => {
-    const threshold = Math.max(0, t - 0.00001).toFixed(6);
-    return `lt(prev_t,${threshold})*gte(t,${threshold})`;
-  })].join("+");
-  const columns = Math.min(3, times.length);
-  const graph = [`trim=duration=${duration}`, `select='${select}'`, "settb=AVTB",
-    `setpts=PTS+${origin}/TB`, "showinfo=checksum=0", tileSheet(times.length)].join(",");
+  const graph = selectedSheet(duration, times, origin);
   const selectedInput = pictures
     ? ["-hide_banner", "-nostdin", "-nostats", "-copyts", "-color_range", "pc", "-f", "nut", "-i", "pipe:0"] : args;
   const { stdout, stderr } = await runCapture(bin, [...selectedInput, "-map", "0:v:0", "-an", "-vf", pictures ? graph : shrinkFirst(opts.decoder, sheetSize, graph),
     "-frames:v", "1", "-c:v", "mjpeg", "-q:v", "4", "-f", "image2pipe", "-"], { ...optsIO, stdin: pictures });
-  const timestamps = frameTimes(stderr);
-  if (!stdout.length || !timestamps.length) throw new Error("No video frame decoded in this window.");
-  return { timestamps, columns, changedFrames: changes?.length, jpeg: stdout.toString("base64") };
+  return { ...sheetResult(stdout, stderr, times.length), changedFrames: changes?.length };
+}
+
+/** Select the first displayed frame crossing each target and report its actual PTS. */
+function selectedSheet(duration: number, times: number[], origin: number) {
+  const select = ["isnan(prev_t)", ...times.slice(1).map(t => {
+    const threshold = Math.max(0, t - 0.00001).toFixed(6);
+    return `lt(prev_t,${threshold})*gte(t,${threshold})`;
+  })].join("+");
+  return [`trim=duration=${duration}`, `select='${select}'`, "settb=AVTB",
+    `setpts=PTS+${origin}/TB`, "showinfo=checksum=0", tileSheet(times.length)].join(",");
+}
+
+function sheetResult(picture: Buffer, log: string, count: number) {
+  const timestamps = frameTimes(log);
+  if (!picture.length || !timestamps.length) throw new Error("No video frame decoded in this window.");
+  return { timestamps, columns: Math.min(3, count), jpeg: picture.toString("base64") };
 }
 
 /** Where and when a picture changes over a window: what an activity sheet looks for, as numbers. */
@@ -256,12 +266,43 @@ export interface InspectionEvent extends TimeRange {
   deltaDb?: number;
 }
 
-export async function qualityEvents(file: string, range: TimeRange, origin: number, signal?: AbortSignal): Promise<InspectionEvent[]> {
+function readReview(file: string, range: TimeRange, signal?: AbortSignal, sheet: string[] = []) {
   const duration = range.end - range.start;
-  const start = origin + range.start;
-  const { stderr } = await runCapture(resolveFfmpeg(), [...input(file, range), "-map", "0:v:0", "-an",
+  return runCapture(resolveFfmpeg(), [...input(file, range), "-map", "0:v:0", "-an",
     "-vf", `trim=duration=${duration},scale=320:-2,blackdetect=d=0,freezedetect=n=-55dB:d=0.4,metadata=print:key=lavfi.black_start,metadata=print:key=lavfi.black_end`,
-    "-f", "null", "-"], { signal });
+    "-f", "null", "-", ...sheet, ...pcmOutput(0, SOURCE_AUDIO_CLOCK, "-")], { signal, maxStdout: sheet.length ? 1024 * 1024 : undefined });
+}
+
+export async function qualityEvents(file: string, range: TimeRange, origin: number, signal?: AbortSignal): Promise<InspectionEvent[]> {
+  const { stdout, stderr } = await readReview(file, range, signal);
+  return reviewEvents(stderr, stdout, range, origin);
+}
+
+/** Inspect one rendered cut window. Both picture filters see the same decoded frames,
+ * and the same audio decode supplies both the level measurements and the optional padded audition. */
+export async function reviewWindow(file: string, range: TimeRange,
+  opts: Pick<SheetOptions, "origin" | "fps" | "count" | "focus" | "signal"> & { includeAudio?: boolean; tempDir: string }) {
+  const duration = range.end - range.start, start = opts.origin + range.start;
+  const times = sampleTimes(duration, opts.fps, opts.count, [], opts.focus === undefined ? undefined : opts.focus - start);
+  const scratch = join(opts.tempDir, `review-${randomUUID()}`);
+  const picture = scratch + ".jpg";
+  // An audition fills the requested time with silence after a microphone ends. Level readings use the actual samples.
+  const audio = opts.includeAudio ? scratch + ".pcm" : undefined;
+  try {
+    const sheet = ["-map", "0:v:0", "-an", "-vf", selectedSheet(duration, times, start),
+      "-frames:v", "1", "-c:v", "mjpeg", "-q:v", "4", "-f", "image2", "-update", "1", picture,
+      ...(audio ? pcmOutput(0, auditionFilter(range), audio) : [])];
+    const { stdout, stderr } = await readReview(file, range, opts.signal, sheet);
+    // ffmpeg writes no picture when the window decodes no frame: sheetResult then says so instead of naming a temp file.
+    const sheetPicture = readFile(picture).catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? Buffer.alloc(0) : Promise.reject(error));
+    const [jpeg, audition] = await Promise.all([sheetPicture, audio && readFile(audio)]);
+    return { ...sheetResult(jpeg, stderr, times.length), events: reviewEvents(stderr, stdout, range, opts.origin),
+      wav: audition ? wavFromPcm(audition) : undefined };
+  } finally { await Promise.all([rm(picture, { force: true }), audio && rm(audio, { force: true })]); }
+}
+
+function reviewEvents(stderr: string, pcm: Buffer, range: TimeRange, origin: number) {
+  const duration = range.end - range.start, start = origin + range.start;
   const events: InspectionEvent[] = [];
   // An interval reaching EOF has no closing metadata frame.
   for (const kind of ["black", "freeze"] as const) {
@@ -280,7 +321,7 @@ export async function qualityEvents(file: string, range: TimeRange, origin: numb
   // Compare adjacent ~80 ms RMS windows on the rendered mix. Silence is floored
   // at -60 dBFS so tiny changes in dither do not produce warnings.
   const points = Math.max(1, Math.round(duration / 0.08));
-  const { rms } = await extractWaveform(file, { from: range.start, to: range.end, points, signal });
+  const { rms } = waveformFromPcm(pcm, duration, points);
   const db = rms.map(v => 20 * Math.log10(Math.max(0.001, v)));
   for (let i = 1; i < points; i++) {
     const delta = db[i]! - db[i - 1]!;
@@ -291,10 +332,20 @@ export async function qualityEvents(file: string, range: TimeRange, origin: numb
   return events;
 }
 
+function auditionFilter(range: TimeRange) {
+  return `${SOURCE_AUDIO_CLOCK},apad=whole_dur=${range.end - range.start}`;
+}
+
+function pcmOutput(stream: number, filter: string, output: string) {
+  return ["-vn", "-map", `0:a:${stream}`, "-af", filter, "-ac", "1", "-ar", "16000", "-f", "s16le", output];
+}
+
 export async function audition(file: string, range: TimeRange, signal?: AbortSignal, stream = 0) {
-  // A window wholly before the microphone starts or after it ends still plays for the requested duration.
-  const { stdout } = await runCapture(resolveFfmpeg(), [...input(file, range), "-vn", "-map", `0:a:${stream}`,
-    "-af", `${SOURCE_AUDIO_CLOCK},apad=whole_dur=${range.end - range.start}`, "-ac", "1", "-ar", "16000", "-f", "s16le", "-"], { signal, maxStdout: 1024 * 1024 });
+  const { stdout } = await runCapture(resolveFfmpeg(), [...input(file, range), ...pcmOutput(stream, auditionFilter(range), "-")], { signal, maxStdout: 1024 * 1024 });
+  return wavFromPcm(stdout);
+}
+
+function wavFromPcm(stdout: Buffer) {
   // Write the true length. FFmpeg cannot finalize a WAV header on a pipe.
   const h = Buffer.alloc(44);
   h.write("RIFF"); h.writeUInt32LE(36 + stdout.length, 4); h.write("WAVEfmt ", 8);

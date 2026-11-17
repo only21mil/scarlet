@@ -157,6 +157,12 @@ class ScarletLauncher {
                 } finally { update.ReleaseMutex(); }
             }
         } catch (Exception ex) {
+            try {
+                File.AppendAllText(Path.Combine(Root, "launch.log"), DateTime.UtcNow.ToString("o")
+                    + " launcher-failed mode=" + (interactive ? "interactive" : mode.TrimStart('-'))
+                    + " name=" + ex.GetType().Name + " code=" + ex.HResult.ToString() + Environment.NewLine);
+            } catch (IOException) { }
+              catch (UnauthorizedAccessException) { }
             if (interactive) MessageBox.Show(ex.Message, "Scarlet", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return 1;
         }

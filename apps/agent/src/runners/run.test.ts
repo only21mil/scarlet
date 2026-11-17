@@ -3,7 +3,8 @@ import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/pr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import type { AgentUsage } from "@scarlet/shared";
 import { windowsAclShell } from "../private-files.js";
 import { runClaude } from "./claude.js";
 import { runCodex } from "./codex.js";
@@ -13,6 +14,11 @@ import type { RunAgentFn, RunAgentOptions, RunnerEvent } from "./types.js";
 
 // A stand-in for an agent CLI: it records what it was started with, writes the lines a test gives it, and exits.
 const FAKE_CLI = `#!/bin/sh
+if [ "$1" = "app-server" ]; then
+  printf '%s' "$CODEX_HOME" > "$FAKE_DIR/app-home"
+  if [ -n "$FAKE_APP_UNSUPPORTED" ]; then exit 2; fi
+  exec "$FAKE_NODE_BIN" "$FAKE_SERVER_SCRIPT" "$@"
+fi
 printf '%s\\n' "$@" > "$FAKE_DIR/args"
 cat > "$FAKE_DIR/stdin"
 printf '%s' "$SCARLET_SERVER" > "$FAKE_DIR/server"
@@ -25,6 +31,35 @@ cat "$FAKE_DIR/out"
 if [ -n "$FAKE_ERR" ]; then echo "$FAKE_ERR" >&2; fi
 if [ -n "$FAKE_SLEEP" ]; then sleep "$FAKE_SLEEP"; fi
 exit "\${FAKE_CODE:-0}"
+`;
+
+const FAKE_SERVER = `
+const { appendFileSync, readdirSync, readFileSync, readlinkSync, writeFileSync } = require("node:fs");
+const { createInterface } = require("node:readline");
+const dir = process.env.FAKE_DIR;
+writeFileSync(dir + "/args", process.argv.slice(2).join("\\n") + "\\n");
+writeFileSync(dir + "/server", process.env.SCARLET_SERVER);
+writeFileSync(dir + "/app-home-entries", JSON.stringify(readdirSync(process.env.CODEX_HOME)));
+writeFileSync(dir + "/app-auth-target", readlinkSync(process.env.CODEX_HOME + "/auth.json"));
+writeFileSync(dir + "/app-lock-target", readlinkSync(process.env.CODEX_HOME + "/auth.lock"));
+const send = message => console.log(JSON.stringify(message));
+const emit = name => process.stdout.write(readFileSync(dir + "/" + name));
+createInterface({ input: process.stdin }).on("line", line => {
+  appendFileSync(dir + "/stdin", line + "\\n");
+  const { id, method, params } = JSON.parse(line);
+  if (method === "initialize") send({ id, result: { userAgent: "fake codex" } });
+  if (method === "thread/start") send({ id, result: { thread: { id: "t1", ephemeral: params.ephemeral }, model: params.model ?? "default-model", approvalPolicy: "never", activePermissionProfile: { id: "scarlet" } } });
+  if (method === "turn/start") {
+    if (process.env.FAKE_APP_FAIL_START) return send({ id, error: { code: -32603, message: "Turn rejected" } });
+    emit("before-start-out");
+    send({ id, result: { turn: { id: "turn1", status: "inProgress" } } });
+    emit("out");
+  }
+  if (method === "turn/interrupt") {
+    send({ id, result: {} });
+    emit("interrupt-out");
+  }
+});
 `;
 
 const mcp = { command: "node", args: ["/scarlet/mcp/cli.js"], env: { SCARLET_SERVER: "http://localhost:4000", SCARLET_TOKEN: "agent-token" } };
@@ -70,12 +105,15 @@ async function whoCanOpen(path: string): Promise<string[]> {
 
 let root: string;
 let bin: string;
+let fakeServer: string;
 const bins = new Map<unknown, string>();
 beforeAll(async () => {
   root = await mkdtemp(join(tmpdir(), "scarlet-run-"));
   bin = join(root, "fake-cli");
   await writeFile(bin, FAKE_CLI);
   await chmod(bin, 0o755);
+  fakeServer = join(root, "fake-server.cjs");
+  await writeFile(fakeServer, FAKE_SERVER);
   if (process.platform === "win32") {
     for (const [name, pkg] of Object.entries(NPM_PACKAGES)) {
       const dir = join(root, "npm", "node_modules", ...pkg.split("/"));
@@ -99,14 +137,25 @@ interface Fake {
   sleep?: number;
   /** What Codex writes to its --output-last-message file. */
   last?: string;
+  appServer?: true | "unsupported" | "reject-turn";
+  beforeStartResponse?: string[];
+  afterInterrupt?: string[];
 }
 
 let seq = 0;
 async function run(runner: RunAgentFn, fake: Fake, opts: Partial<RunAgentOptions> = {}) {
   const dir = join(root, `run-${++seq}`);
   const cwd = join(dir, "cwd");
+  const codexHome = join(dir, "codex-home");
   await mkdir(cwd, { recursive: true });
+  await mkdir(codexHome);
   await writeFile(join(dir, "out"), (fake.lines ?? []).map((line) => `${line}\n`).join(""));
+  await writeFile(join(dir, "before-start-out"), (fake.beforeStartResponse ?? []).map((line) => `${line}\n`).join(""));
+  await writeFile(join(dir, "interrupt-out"), (fake.afterInterrupt ?? []).map((line) => `${line}\n`).join(""));
+  if (fake.appServer) {
+    await writeFile(join(codexHome, "auth.json"), "fake credentials", { mode: 0o600 });
+    await writeFile(join(codexHome, "config.toml"), "[mcp_servers.unrelated]\ncommand = 'unrelated'\n");
+  }
   const events: RunnerEvent[] = [];
   const result = await runner({
     agent: "claude",
@@ -118,7 +167,12 @@ async function run(runner: RunAgentFn, fake: Fake, opts: Partial<RunAgentOptions
     onEvent: (ev) => events.push(ev),
     env: {
       PATH: process.env.PATH,
+      CODEX_HOME: codexHome,
       FAKE_DIR: dir,
+      FAKE_SERVER_SCRIPT: fakeServer,
+      ...(fake.appServer === "unsupported" ? { FAKE_APP_UNSUPPORTED: "1" } : {}),
+      ...(fake.appServer === "reject-turn" ? { FAKE_APP_FAIL_START: "1" } : {}),
+      FAKE_NODE_BIN: process.execPath,
       ...(fake.code === undefined ? {} : { FAKE_CODE: String(fake.code) }),
       ...(fake.stderr ? { FAKE_ERR: fake.stderr } : {}),
       ...(fake.sleep ? { FAKE_SLEEP: String(fake.sleep) } : {}),
@@ -127,7 +181,7 @@ async function run(runner: RunAgentFn, fake: Fake, opts: Partial<RunAgentOptions
     ...opts,
   });
   const read = (name: string) => readFile(join(dir, name), "utf8");
-  return { result, events, cwd, args: async () => (await read("args")).split("\n").slice(0, -1), stdin: () => read("stdin"), server: () => read("server") };
+  return { result, events, cwd, read, args: async () => (await read("args")).split("\n").slice(0, -1), stdin: () => read("stdin"), server: () => read("server") };
 }
 
 const claudeInit = '{"type":"system","subtype":"init","session_id":"s1","model":"claude-opus-4-1","mcp_servers":[{"name":"scarlet","status":"connected"}]}';
@@ -272,6 +326,87 @@ describe("runClaude", { timeout: 20_000 }, () => {
     await expect(runClaude({ agent: "claude", systemPrompt: "SYS", instruction: "x", cwd: empty, mcp, onEvent: () => {}, env: { PATH: empty } }))
       .rejects.toThrow("claude CLI not found on PATH");
   });
+});
+
+describe.skipIf(process.platform === "win32")("runCodex App Server", { timeout: 20_000 }, () => {
+  const message = (text: string) => JSON.stringify({ type: "item.completed", item: { id: "i1", type: "agent_message", text } });
+  const completed = '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":4,"output_tokens":5}}';
+  const notification = (method: string, params: object = {}) => JSON.stringify({ method, params: { threadId: "t1", turnId: "turn1", ...params } });
+  const count = (inputTokens: number, route?: object) => notification("thread/tokenUsage/updated", {
+    tokenUsage: { total: { inputTokens, cachedInputTokens: 4, cacheWriteInputTokens: 2, outputTokens: 5, reasoningOutputTokens: 1 },
+      last: { inputTokens: 1, outputTokens: 1 } }, ...route,
+  });
+
+  it("shows cumulative App Server counts during an ephemeral edit and keeps the final total", async () => {
+    const snapshots: AgentUsage[] = [];
+    const observed: (number | string)[] = [];
+    const { result, args, stdin, server, cwd, read } = await run(runCodex, {
+      appServer: true,
+      beforeStartResponse: [count(888, { turnId: "other" }), count(10)],
+      lines: [
+        count(10), count(999, { threadId: "other" }), count(999, { turnId: "other" }),
+        notification("item/started", { item: { type: "mcpToolCall", id: "mcp1", server: "scarlet", tool: "transcript_get" } }),
+        notification("turn/plan/updated", { plan: [{ step: "Read the transcript", status: "inProgress" }] }),
+        count(20), notification("item/completed", { item: { type: "agentMessage", id: "msg1", phase: "final_answer", text: "Cut the pause." } }),
+        notification("item/completed", { item: { type: "agentMessage", id: "msg2", phase: "commentary", text: "Saving." } }),
+        notification("turn/completed", { turn: { id: "turn1", status: "completed" } }),
+      ],
+    }, { model: "gpt-5", serviceTier: "fast", plan: true, onUsage(usage) { snapshots.push(usage); observed.push(usage.inputTokens); },
+      onEvent(event) { observed.push(event.type); } });
+    expect(observed).toEqual(["log", 4, "tool", "plan", 14, "log", "log", "result"]);
+    expect(snapshots).toEqual([4, 14].map(inputTokens => ({ model: "gpt-5", inputTokens, cacheReadTokens: 4, cacheWriteTokens: 2,
+      outputTokens: 5, reasoningTokens: 1 })));
+    expect(result).toMatchObject({ ok: true, summary: "Cut the pause.", exitCode: 0, usage: snapshots[1] });
+    expect(await readFile(join(cwd, "AGENTS.md"), "utf8")).toBe("SYS");
+    const requests = (await stdin()).trim().split("\n").map(line => JSON.parse(line));
+    expect(requests.map(r => r.method)).toEqual(["initialize", "initialized", "thread/start", "turn/start"]);
+    expect(requests[0].params.capabilities).toEqual({ experimentalApi: true, requestAttestation: false });
+    expect(requests[2].params).toEqual({ ephemeral: true, model: "gpt-5", serviceTier: "fast" });
+    expect(requests[3].params).toEqual({ threadId: "t1", input: [{ type: "text", text: "Make the first cut", text_elements: [] }] });
+    expect(await server()).toBe("http://localhost:4000");
+    expect(await args()).toEqual(expect.arrayContaining(["app-server", "project_root_markers=[]", "tools.update_plan.enabled=true", 'default_permissions="scarlet"']));
+    expect((await args()).join("\n")).not.toContain("agent-token");
+    expect(JSON.parse(await read("app-home-entries"))).toEqual(["auth.json", "auth.lock"]);
+    expect(await read("app-auth-target")).toMatch(/\/codex-home\/auth\.json$/);
+    expect(await read("app-lock-target")).toMatch(/\/codex-home\/auth\.lock$/);
+    expect(await read("app-home")).not.toBe(join(cwd, "..", "codex-home"));
+    await expect(stat(await read("app-home"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("drains the usage reported when an edit stops for a question", async () => {
+    const question = { type: "mcpToolCall", id: "q1", server: "scarlet", tool: "task_question", arguments: { text: "Keep it?" } };
+    const { result, stdin } = await run(runCodex, {
+      appServer: true,
+      lines: [notification("item/started", { item: question }), notification("item/completed", { item: { ...question, status: "completed" } })],
+      afterInterrupt: [count(10), notification("turn/completed", { turn: { id: "turn1", status: "interrupted" } })],
+    });
+    expect(result).toMatchObject({ ok: true, question: "Keep it?", questionPosted: true, usage: { inputTokens: 4, model: "default-model" } });
+    expect(await stdin()).toContain('"method":"turn/interrupt"');
+  });
+
+  it("drains the last App Server usage after the host cancels the edit", async () => {
+    const controller = new AbortController();
+    const { result, stdin } = await run(runCodex, {
+      appServer: true, lines: [count(10)],
+      afterInterrupt: [count(20), notification("turn/completed", { turn: { id: "turn1", status: "interrupted" } })],
+    }, { signal: controller.signal, onUsage: () => controller.abort() });
+    expect(result).toMatchObject({ ok: false, aborted: true, error: "cancelled", usage: { inputTokens: 14 } });
+    expect((await stdin()).match(/turn\/interrupt/g)).toHaveLength(1);
+  });
+
+  it("falls back only before an App Server turn is sent", async () => {
+    const fallback = vi.fn();
+    const old = await run(runCodex, { appServer: "unsupported", lines: [message("Old CLI finished."), completed] }, { onCodexFallback: fallback });
+    expect(old.result).toMatchObject({ ok: true, summary: "Old CLI finished." });
+    expect((await old.args())[0]).toBe("exec");
+    expect(fallback).toHaveBeenCalledExactlyOnceWith("app_server_unavailable");
+    fallback.mockClear();
+    const rejected = await run(runCodex, { appServer: "reject-turn" }, { onCodexFallback: fallback });
+    expect(rejected.result).toMatchObject({ ok: false, error: "Turn rejected" });
+    expect((await rejected.args())[0]).toBe("app-server");
+    expect(fallback).not.toHaveBeenCalled();
+  });
+
 });
 
 describe("runCodex", { timeout: 20_000 }, () => {

@@ -162,6 +162,39 @@ function makeHost(srv: Srv, runner: RunAgentFn, wsUrl?: string, options: Partial
   return { host, saved, client };
 }
 
+it("records the engine's resulting state and a question that no longer pauses the task", async () => {
+  const startedAt = "2026-11-16T16:45:00.000Z";
+  const claimed = { ...task, state: "claimed" as const, startedAt };
+  const lines: string[] = [];
+  const requests: string[] = [];
+  let completion = { ...claimed, state: "queued", changeIds: [] };
+  const client = new ScarletClient({
+    baseUrl: "https://fixture.test",
+    fetch: async input => {
+      const { pathname } = new URL(String(input));
+      requests.push(pathname);
+      if (pathname.endsWith("/prompt")) return Response.json({ systemPrompt: "SYS", instruction: "Edit this" });
+      if (pathname.endsWith("/complete")) return Response.json({ task: completion });
+      if (pathname.endsWith("/question")) return Response.json({ waiting: false });
+      return Response.json({ task: claimed, events: [] });
+    },
+  });
+  const host = (runner: RunAgentFn) => new AgentHost({
+    client, config: { server: "https://fixture.test", token: "fixture" }, workRoot,
+    mcpCliPath: "fixture-mcp", runner, log: line => lines.push(line),
+  });
+  const result = async () => ({ ok: true, summary: "Private edit" });
+  await host(result).runTask(claimed, new AbortController().signal);
+  completion = { ...completion, state: "done", startedAt: "2026-11-16T16:46:00.000Z" };
+  await host(result).runTask(claimed, new AbortController().signal);
+  await host(async () => ({ ok: true, summary: "", question: "Private question" })).runTask(claimed, new AbortController().signal);
+  expect(lines).toContainEqual(expect.stringMatching(/requested=done state=queued outcome=changed/));
+  expect(lines).toContainEqual(expect.stringMatching(/requested=done state=done outcome=superseded/));
+  expect(lines).toContain(`[host] question task=${task.id} attempt=${startedAt} outcome=not_waiting`);
+  expect(requests.filter(path => path.endsWith("/complete"))).toHaveLength(2);
+  expect(lines.join("\n")).not.toContain("Private");
+});
+
 async function startHostAndWait(host: AgentHost, ready: Promise<unknown>) {
   const started = host.start();
   onTestFinished(async () => {
@@ -250,6 +283,44 @@ describe("AgentHost", { timeout: 30_000 }, () => {
     expect(await readFile(join(run.cwd, "artifacts", "cut.otio"), "utf8")).toBe("kept");
     expect(run.mcp.args).toEqual(["C:/fake/mcp/cli.js"]);
     expect(run.mcp.env).toMatchObject({ SCARLET_SERVER: srv.server.url, SCARLET_TOKEN: "agent-token", SCARLET_PROJECT: "prj_test", SCARLET_TASK: "task_1", SCARLET_AGENT: "claude", SCARLET_MODEL: "opus" });
+  });
+
+  it("posts usage during a claim and waits for that report before persisting the final total", async ({ signal }) => {
+    const srv = await startServer();
+    const startedAt = "2026-04-01T12:00:00.000Z";
+    srv.queue[0]!.startedAt = startedAt;
+    const usage = { inputTokens: 12, outputTokens: 34, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 };
+    const finishReport = Promise.withResolvers<void>();
+    const runnerFinished = Promise.withResolvers<void>();
+    const send = srv.server.state.extra;
+    srv.server.state.extra = (req, res) => {
+      if (req.path === "/tasks/task_1/usage" && (req.body as { inputTokens: number }).inputTokens === 12) {
+        return finishReport.promise.then(() => {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end("{}");
+          return true;
+        });
+      }
+      return send?.(req, res) ?? false;
+    };
+    const runner: RunAgentFn = async (opts) => {
+      opts.onUsage?.(usage);
+      await vi.waitFor(() => expect(srv.server.requests.filter(r => r.path.endsWith("/usage"))).toHaveLength(1));
+      opts.onUsage?.({ ...usage, inputTokens: 24 });
+      runnerFinished.resolve();
+      return { ok: true, summary: "Done.", usage: { ...usage, inputTokens: 36 } };
+    };
+    const { host } = makeHost(srv, runner);
+    const complete = once(srv.events, "complete", { signal });
+    await startHostAndWait(host, runnerFinished.promise);
+    try {
+      expect(srv.completes).toHaveLength(0);
+    } finally {
+      finishReport.resolve();
+    }
+    await complete;
+    const reports = srv.server.requests.filter(r => r.path.endsWith("/usage")).map(r => r.body);
+    expect(reports).toEqual([{ ...usage, startedAt }, { ...usage, startedAt, inputTokens: 36 }]);
   });
 
   it("confirms a provider-reported question after a transient failure, and resumes with the answer", async ({ signal }) => {
@@ -708,7 +779,7 @@ describe("AgentHost when a run or the engine misbehaves", { timeout: 30_000 }, (
     expect(after).toContain("POST /tasks/task_1/complete");
     expect(after).not.toContain("GET /tasks/task_1");
     expect(srv.completes).toEqual([{ state: "done", summary: "Cut made." }]);
-    await vi.waitFor(() => expect(lines).toContainEqual(expect.stringMatching(/^task task_1 done after \d+(ms|s) \(1 changes: chg_7\)$/)));
+    await vi.waitFor(() => expect(lines).toContainEqual(expect.stringMatching(/^\[host\] completion task=task_1 attempt=unknown requested=done state=done outcome=accepted elapsedMs=\d+ changes=1$/)));
   });
 
   it("takes a completion the engine answered with nothing as landed", async ({ signal }) => {
@@ -718,7 +789,7 @@ describe("AgentHost when a run or the engine misbehaves", { timeout: 30_000 }, (
     // A reply with no body reaches the host as nothing.
     const completeTask = vi.spyOn(client, "completeTask").mockResolvedValue(undefined as never);
     await startHostAndWait(host, once(srv.events, "claim", { signal }));
-    await vi.waitFor(() => expect(lines).toContainEqual(expect.stringMatching(/^task task_1 done after \d+(ms|s)$/)), { timeout: 5_000 });
+    await vi.waitFor(() => expect(lines).toContainEqual(expect.stringMatching(/^\[host\] completion task=task_1 attempt=unknown requested=done state=unknown outcome=unconfirmed elapsedMs=\d+ changes=0$/)), { timeout: 5_000 });
     expect(completeTask).toHaveBeenCalledTimes(1);
   });
 

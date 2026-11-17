@@ -9,12 +9,12 @@
   border-right: 1px solid var(--color-line);
   background: var(--color-panel);
 }
-.simple-header { display: flex; align-items: center; gap: 8px; min-height: 54px; padding: 0 10px 0 18px; border-bottom: 1px solid var(--color-line); }
+.simple-header { position: relative; display: flex; align-items: center; gap: 8px; min-height: 54px; padding: 0 10px 0 18px; border-bottom: 1px solid var(--color-line); }
 .simple-header h1 { flex: 1; min-width: 0; font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.simple-tools { display: flex; align-items: center; gap: 2px; }
+.simple-tools { display: flex; align-self: stretch; align-items: center; gap: 2px; }
 .simple-tools .btn-quiet { font-size: 12px; }
 
-.simple-thread { flex: 1 1 0; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.simple-thread { flex: 1 1 0; min-width: 0; min-height: 0; display: flex; flex-direction: column; container-type: inline-size; }
 .simple-chat { flex: 1; min-height: 0; overflow-y: auto; padding: 16px 18px 12px; display: flex; flex-direction: column; gap: 16px; }
 /* The conversation sits at the bottom, by the message box. A request still in the queue is an empty section, so the
    space above is a spacer and not a margin on the first one. It gives back the gap after it with a margin on top,
@@ -114,6 +114,9 @@
 /* An edit that keeps its footage (a sound fix, a zoom, a title): outlined, not hatched red, since After plays it.
    Footage an edit put back is green. */
 .simple-timeline-band.is-kept { background: rgba(244, 241, 233, .06); border: 1.5px solid rgba(244, 241, 233, .55); }
+/* The passage Scarlet asks the editor to look at or hear: amber, as everything that waits on them is. */
+.simple-timeline-band.is-check { background: rgba(237, 194, 133, .10); border: 1.5px solid rgba(237, 194, 133, .75); }
+.simple-timeline-band.is-check span { color: var(--color-warn); }
 .simple-timeline-band.is-added { background: color-mix(in srgb, var(--color-ok) 14%, transparent);
   border: 1.5px solid color-mix(in srgb, var(--color-ok) 70%, transparent); }
 /* Footage another cut in the same pass took out. On After it isn't in the media, so it greys out instead of looking
@@ -132,6 +135,9 @@
 .simple-timeline-cut { position: absolute; z-index: 1; top: var(--ruler-height); bottom: 0; width: 2px; margin-left: -1px; pointer-events: none; background: rgba(255, 160, 156, .9); }
 .simple-timeline-cut span { position: absolute; left: 6px; top: 3px; padding: 1px 6px; border-radius: 4px; border: 1px solid rgba(255, 160, 156, .55);
   background: rgba(40, 22, 21, .9); font-size: 10.5px; line-height: 14px; color: var(--color-fg); white-space: nowrap; }
+/* A point that took nothing out, such as a marker left for the editor, is outlined like kept footage, not red. */
+.simple-timeline-cut.is-kept { background: rgba(244, 241, 233, .55); }
+.simple-timeline-cut.is-kept span { border-color: rgba(244, 241, 233, .35); background: rgba(12, 12, 12, .78); }
 .simple-timeline-mark { position: absolute; z-index: 1; pointer-events: none; }
 .simple-timeline-mark.is-dot { top: calc(var(--ruler-height) - 4px); width: 8px; height: 8px; margin-left: -4px; border-radius: 50%;
   background: var(--color-muted); box-shadow: 0 0 0 1px #1a1918; }
@@ -143,7 +149,9 @@
 .simple-timeline-hover { position: absolute; z-index: 2; left: 0; right: 0; top: calc(var(--ruler-height) - 12px); height: 32px; }
 /* Over a marker that opens its edit, the pointer says a press opens it instead of scrubbing. */
 .simple-timeline-hover.is-aimed { cursor: pointer; }
+.simple-timeline-mark.is-pill { z-index: 2; }
 .simple-timeline-mark.is-hot, .simple-timeline-mark.is-on { z-index: 4; }
+.simple-timeline-mark.is-on { z-index: 5; }
 /* Hovering a marker shows only the frame and its time, as anywhere on the timeline. A marker that holds a cut or an
    edit waiting on the editor adds one amber line under the time naming it: "Cut 23 needs you". */
 .simple-timeline-need { display: block; padding: 6px 10px 7px; border-top: 1px solid var(--color-line); text-align: left;
@@ -241,6 +249,14 @@
 .simple-more.needs-you::after { z-index: 1; }
 /* Caching and exporting share the same motion: a thin line under the button's word, inside its padding. */
 .simple-media, .simple-export { position: relative; }
+.media-hover { display: flex; align-self: stretch; align-items: center; }
+.media-hover-card { display: none; position: absolute; z-index: 30; top: 100%; right: 8px; padding-top: 6px; }
+.media-hover:not([data-dismissed]):is(:hover, :focus-within) .media-hover-card { display: block; }
+.media-hover-card > .card { width: min(19rem, calc(100vw - 16px)); display: flex; flex-direction: column; gap: 7px; padding: 9px 11px; font-size: 12px; box-shadow: 0 3px 12px rgb(0 0 0 / 30%); }
+.media-hover-card strong { font-weight: 600; }
+.media-hover-card .simple-link { align-self: flex-start; }
+.media-hover-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; }
+.media-hover-row progress { grid-column: 1 / -1; width: 100%; }
 .progress-line { position: absolute; left: 12px; right: 12px; bottom: 1px; height: 2px; border-radius: 1px; overflow: hidden;
   background: var(--color-line); pointer-events: none; }
 .progress-line > span { display: block; height: 100%; border-radius: 1px; background: var(--color-muted); transition: width 1s linear; }
@@ -318,8 +334,16 @@
 .simple-pass-toggle[data-so-far] { color: #eae5da; text-decoration-color: #ae9d79; }
 .simple-pass-toggle:is(:hover, :focus-visible) { text-decoration-thickness: 2px; }
 .simple-pass-toggle:focus-visible { outline: 2px solid var(--color-muted); outline-offset: 2px; border-radius: 3px; }
-/* What needs the editor is the amber link, with its rule under it wherever it sits. */
-.simple-pass-need { padding: 0; border: 0; background: none; color: var(--color-warn); font: inherit; cursor: pointer; text-decoration: underline; text-underline-offset: 3px; }
+/* What needs the editor is listed without a click. While every edit is listed instead, the amber link back to it takes
+   the place of "See all" on the line that sums up what the request made. */
+.simple-pass-need { padding: 0; border: 0; background: none; color: var(--color-warn); font: inherit; font-weight: 600; cursor: pointer; white-space: nowrap;
+  text-decoration: underline; text-underline-offset: 3px; }
+.simple-pass-need:is(:hover, :focus-visible) { text-decoration-thickness: 2px; }
+/* While the editor can switch between them, a dim label over the rows says which list they are. */
+.simple-list-head { margin: 4px 0 2px; font-size: 11.5px; letter-spacing: .02em; color: var(--color-dim); }
+/* Over the rows that need the editor it is "N need you", and opens the first of them: dim, ruled only under the pointer. */
+button.simple-list-head { display: block; padding: 0; font-weight: 400; text-decoration: none; color: var(--color-dim); }
+button.simple-list-head:is(:hover, :focus-visible) { color: var(--color-muted); text-decoration: underline; text-decoration-thickness: 1px; }
 .simple-pass-ok { color: var(--color-ok); }
 /* Keep offscreen rows' absolute screen-reader labels in the list's scroll area. */
 .simple-pass-list { position: relative; max-height: 320px; overflow-y: auto; margin: 0 4px 4px; border-top: 1px solid var(--color-line); }
@@ -369,7 +393,7 @@
 .edit-card .review-actions .btn-ghost[data-key="R"] { border-color: transparent; background: none; color: var(--color-muted); }
 .edit-card .review-actions .btn-ghost[data-key="R"]:enabled:hover { color: var(--color-fg); }
 .edit-card-bar .review-actions { margin-left: auto; }
-/* An applied edit's Undo edit is a small icon ahead of Revise, with its decisions at the row's end. */
+/* An applied edit's decisions are at the row's end, after any small icon such as Save as template. */
 .edit-card-acts { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; }
 .edit-card-acts .review-actions { margin-left: 0; }
 /* The cut's words open under the card's row and scroll inside it, so a long passage never pushes the timeline away. */
@@ -404,6 +428,10 @@ button.edit-passage-cut:hover, button.edit-passage-cut[aria-expanded="true"] { b
 .edit-passage .edit-passage-cut .review-removed { padding: 0; background: none; }
 .edit-card-length.is-kind { background: rgba(244, 241, 233, .08); color: var(--color-muted); }
 .edit-card-length.is-added { background: color-mix(in srgb, var(--color-ok) 15%, transparent); color: var(--color-ok); }
+/* Where Scarlet asks for a look: the same pill, amber, and a press plays that part. */
+.edit-card-length.is-check { flex: none; border: 0; background: rgba(237, 194, 133, .14); color: var(--color-warn); font-family: inherit; cursor: pointer; }
+.edit-card-length.is-check:hover { background: rgba(237, 194, 133, .24); }
+.edit-card-length.is-check:focus-visible { outline: 2px solid var(--color-warn); outline-offset: 1px; }
 /* A call hasn't come out yet, so its mark and words are amber, not red. */
 .thread-passage.is-call .edit-passage-cut { background: rgba(237, 194, 133, .12); color: var(--color-warn); }
 .thread-passage.is-call button.edit-passage-cut:hover, .thread-passage.is-call button.edit-passage-cut[aria-expanded="true"] { background: rgba(237, 194, 133, .2); }
@@ -433,47 +461,46 @@ button.edit-passage-cut:hover, button.edit-passage-cut[aria-expanded="true"] { b
   border-top: 1px solid var(--color-line); border-bottom: 1px solid var(--color-line); background: rgba(255, 255, 255, .04); }
 .unit > .req { padding-top: 6px; }
 /* A request that applied edits puts them on the timeline when its band is pressed. The band whose edits are marked is
-   deep violet, its words brighter, with a brighter violet rule at its left. Its finished edit link is teal. */
+   deep violet, its words brighter, with a brighter violet rule at its left. */
 .unit > .unit-msg.is-markable { cursor: pointer; }
 .unit > .unit-msg.is-markable:hover { background: rgba(255, 255, 255, .06); }
 .unit > .unit-msg.is-marked, .unit > .unit-msg.is-marked:hover { background: #2a2236; border-color: #3a3048; box-shadow: inset 3px 0 0 #b48ae6; }
-.unit:has(> .unit-msg.is-marked) .simple-pass-toggle:not([data-so-far]) { color: #7fd6c6; text-decoration-color: rgb(127 214 198 / 50%); }
 .unit > .unit-msg.is-marked p { color: var(--color-fg); }
-/* Where the request stands: a dot while Scarlet asks, a word once it stopped early or left a suggestion. A finished
-   request has nothing here. While Scarlet has the request, Stop follows as the heading's last word. */
+/* Where the request stands: a dot while Scarlet asks, a word once it stopped early or left a suggestion. */
 .unit-state { flex: none; align-self: center; display: inline-flex; align-items: center; font-size: 12.5px; line-height: 19px; color: var(--color-muted); white-space: nowrap; }
 .unit-state:empty { display: none; }
 .unit-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--color-warn); }
-/* What needs the editor takes that place: "N need you" sits at the band's right, on its first line, and the band's
-   words keep clear of it. It is drawn by the rows that count it, so it is placed from here. */
-.unit:has(> .unit-msg) .simple-pass-need { position: absolute; top: 9px; right: 0; z-index: 1; font-size: 12.5px; line-height: 19px;
-  text-decoration: underline; text-underline-offset: 3px; white-space: nowrap; }
-/* While it lists just the ones that need the editor it reads heavier, with a thicker rule under it, so the list under
-   the sentence reads as its own. It stays a link: the editor turned down a pill here. */
-.unit:has(> .unit-msg) .simple-pass-need[aria-pressed="true"] { font-weight: 600; text-decoration-thickness: 2px; }
-.unit:has(.simple-pass-need) > .unit-msg { padding-right: calc(var(--chat-gutter, 18px) + 96px); }
-/* It takes the dot's place. A word for how the run ended stays, before it: with calls or edits still waiting, the
+/* What needs the editor, listed under the band, takes the dot's place. A word for how the run ended stays, before it: with calls or edits still waiting, the
    action under them ("Resume") would otherwise have nothing that says the run stopped. */
-.unit:has(.simple-pass-need) > .unit-msg > .unit-state:has(> .unit-dot) { display: none; }
-/* Stop is the heading's last word while Scarlet has the request, where its ring was. "N need you" sits before it. */
+.unit:has(.simple-pass-need, .simple-list-head) > .unit-msg > .unit-state:has(> .unit-dot) { display: none; }
+/* The active request's action follows its metrics. */
 .unit-stop { flex: none; align-self: center; font-size: 12.5px; line-height: 19px; }
 .unit-state:not(:empty) + .unit-stop { margin-left: -2px; }
+.unit-actions { flex: none; align-self: flex-start; display: inline-flex; align-items: center; height: 19px; }
+.unit-actions-icon { display: inline-grid; place-items: center; width: 24px; height: 22px; color: var(--color-muted); }
+.unit-actions button:is(:hover, :focus-visible, [aria-expanded="true"]) .unit-actions-icon { color: var(--color-fg); }
 .unit-tokens { flex: none; align-self: baseline; font-size: 12.5px; line-height: 19px; white-space: nowrap; }
+.unit-metrics-dot { color: var(--color-dim); }
 /* A request's tokens open every part of the count on hover, in a note above the count at its right edge. It's fixed
    to the window (its place set when it opens) so the pinned request's scrolling box doesn't clip it. The empty title
    keeps the heading's own (the editor's whole message) from showing over it. */
-.run-tokens { position: relative; cursor: default; outline: none; }
+.run-tokens { position: relative; padding: 0; background: transparent; border: 0; cursor: pointer; text-align: inherit; }
 .run-tokens:hover, .run-tokens:focus-visible { color: var(--color-muted); }
 .tokens-tip { position: fixed; z-index: 40; display: flex; flex-direction: column; gap: 3px; width: max-content; min-width: 11rem;
+  max-width: min(320px, calc(100vw - 16px));
   padding: 7px 10px; border: 1px solid var(--color-line); border-radius: 6px; background: var(--color-panel); box-shadow: 0 3px 12px rgb(0 0 0 / 35%);
   font-size: 12px; line-height: 1.35; font-weight: 400; color: var(--color-muted); text-align: left; white-space: nowrap; pointer-events: none; }
 .tokens-tip > span { display: flex; justify-content: space-between; gap: 16px; }
-.tokens-tip b { font-weight: 500; color: var(--color-fg); font-variant-numeric: tabular-nums; }
+.tokens-tip b { font-weight: 500; color: var(--color-fg); font-variant-numeric: tabular-nums; text-align: right;
+  white-space: normal; overflow-wrap: anywhere; }
 .tokens-tip > .tokens-tip-total { margin-top: 3px; padding-top: 4px; border-top: 1px solid var(--color-line); color: var(--color-fg); }
 .tokens-tip > .tokens-tip-total b { font-weight: 600; }
-.unit:has(> .unit-msg > .unit-stop) .simple-pass-need { right: 42px; }
-.unit:has(.simple-pass-need):has(> .unit-msg > .unit-stop) > .unit-msg { padding-right: var(--chat-gutter, 18px); }
-.unit:has(.simple-pass-need) > .unit-msg > .unit-stop { margin-left: 96px; }
+@container (max-width: 400px) {
+  .unit-msg:has(.unit-tokens), .subunit-msg:has(.unit-tokens) { column-gap: 7px; }
+}
+@container (max-width: 350px) {
+  .unit-token-word { display: none; }
+}
 /* Stop, or the word for where it stands, sits on the first line of the editor's words, on their baseline, however
    many lines they take: level with "N need you". A dot has no baseline of its own, so it sits in the middle of that
    line, beside the Stop after it. */
@@ -533,7 +560,6 @@ button.edit-passage-cut:hover, button.edit-passage-cut[aria-expanded="true"] { b
 .simple-pin > .simple-msg { padding: 2px 0 10px; }
 /* Why Stop, Resume or Retry failed, as the last line of the request it was pressed on. */
 .unit-error { margin: 0; padding: 2px 0 8px; }
-.simple-pin > .unit:has(> .unit-msg) .simple-pass-need { top: 8px; }
 /* With nothing under way and no pass waiting on the editor, nothing is fixed here. */
 .simple-pin:not(:has(> .unit:not([hidden]))) { display: none; }
 .simple-pin:has(> .unit:not([hidden])) + .composer-dock { border-top: 0; padding-top: 9px; }
@@ -666,16 +692,22 @@ button.req-summary:hover > span { text-decoration: underline; text-decoration-co
 .queue-tray { min-width: 0; margin-bottom: calc(-1 * var(--model-row-gap, 9px)); padding: 2px 4px; border: 1px solid var(--color-line); border-bottom: 0;
   border-radius: 10px 10px 0 0; background: rgba(255, 255, 255, .03); font-size: 12.5px; color: var(--color-muted); }
 .queue-tray + .composer-box { border-top-left-radius: 0; border-top-right-radius: 0; }
-.queue-head, .queue-row { display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0; min-height: 30px; padding: 0 4px 0 6px; border: 0; border-radius: 6px;
+.queue-head, .queue-row, .queue-editing-status { display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0; min-height: 30px; padding: 0 4px 0 6px; border: 0; border-radius: 6px;
   background: none; color: inherit; font: inherit; text-align: left; }
 button.queue-head { cursor: pointer; }
 button.queue-head:hover { color: var(--color-fg); }
 /* The heading fills the tray from edge to edge, so the keyboard's ring sits inside it, as on a list's row. */
 .queue-head:focus-visible { outline-offset: -2px; }
-.queue-tray.is-open .queue-head { justify-content: space-between; }
+.queue-tray.is-open .queue-head, .queue-footer .queue-head[aria-expanded] { justify-content: space-between; }
+.queue-footer { display: flex; align-items: center; gap: 4px; padding-right: 4px; }
+.queue-footer :is(.queue-head, .queue-row) { gap: 4px; }
+.queue-editing-action { flex: none; display: inline-flex; align-items: center; justify-content: end; gap: 7px; min-width: 82px; min-height: 30px;
+  padding: 0 4px; border: 0; background: none; color: var(--color-muted); font: inherit; font-weight: 500; white-space: nowrap; cursor: pointer; }
+.queue-editing-action:is(:hover, :focus-visible) { color: var(--color-fg); }
+.queue-editing-action[aria-disabled="true"] { opacity: .55; cursor: default; }
 .queue-next { flex: none; width: 30px; color: var(--color-dim); }
 .queue-next.is-waiting { width: auto; white-space: nowrap; }
-.queue-next.is-waiting, .queue-waits { color: var(--color-warn); }
+.queue-next.is-waiting, .queue-waits, .queue-paused { color: var(--color-warn); }
 /* On a line too tight for all of it, the tag and the words give way together, each cut short with an ellipsis, so the
    words keep a share beside a long tag. Next, or what the request waits for, stays whole, and nothing pushes the count,
    the chevron, the pencil or the × out of the tray. */
@@ -686,7 +718,7 @@ button.queue-head:hover { color: var(--color-fg); }
 .queue-chevron { flex: none; display: inline-grid; place-items: center; width: 22px; height: 22px; color: var(--color-dim); transform: rotate(90deg); }
 .queue-tray.is-open .queue-chevron { transform: rotate(-90deg); }
 /* A long queue scrolls inside the tray, so it never pushes the message box out of the window. */
-.queue-list { max-height: min(40vh, 248px); overflow-y: auto; margin: 2px -4px 0; padding: 3px 4px 2px; border-top: 1px solid var(--color-line); }
+.queue-list { max-height: min(40vh, 248px); overflow-y: auto; margin: 0 -4px 2px; padding: 2px 4px 3px; border-bottom: 1px solid var(--color-line); }
 .queue-row:hover, .queue-row:focus-within { background: var(--color-raised); color: var(--color-fg); }
 .queue-remove, .queue-reword, .queue-start { flex: none; display: inline-grid; place-items: center; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 5px; background: none;
   color: var(--color-dim); cursor: pointer; }

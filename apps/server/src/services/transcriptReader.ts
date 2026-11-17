@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { flattenWords, indexTranscriptWords, type TranscriptSearchResult } from "@scarlet/shared";
 import { Transcript, type DialogueVoiceRoles } from "@scarlet/timeline";
 import type { Ctx } from "../context.js";
@@ -46,8 +47,9 @@ export function transcriptLanguage(ctx: Ctx, projectId: string, media: { id: str
 export function transcriptReader(ctx: Ctx) {
   const documents = new Map<string, { id: string; revision: string | null; doc: TranscriptDocument }>();
   let bytes = 0;
-  const budget = 32 * 1024 * 1024;
-  const searches = new WeakMap<Transcript, { words: number; find: ReturnType<typeof indexTranscriptWords> }>();
+  // Room for two transcripts of a three-hour recording, as estimated below: each is read whole on every page of a pass.
+  const budget = 96 * 1024 * 1024;
+  const searches = new WeakMap<Transcript, { words: ReturnType<typeof flattenWords>; find: ReturnType<typeof indexTranscriptWords>; snapshotId?: string }>();
   return {
     read(media: MediaWithStatus & { projectId: string }, from: number | null, to: number | null, omitWords: boolean) {
       const cached = documents.get(media.id);
@@ -76,14 +78,19 @@ export function transcriptReader(ctx: Ctx) {
       }
       return entry.doc.page(from, to, omitWords, media.voiceRoles);
     },
-    search(transcript: Transcript, query: string, contextWords: number): TranscriptSearchResult {
+    search(transcript: Transcript, query: string, contextWords: number, knownWordSnapshot?: string): TranscriptSearchResult {
       let index = searches.get(transcript);
       if (!index) {
         const words = flattenWords(transcript);
-        index = { words: words.length, find: indexTranscriptWords(words) };
+        index = { words, find: indexTranscriptWords(words) };
         searches.set(transcript, index);
       }
-      return { segmentCount: transcript.segments.length, wordCount: index.words, matches: index.find(query, contextWords) };
+      const result: TranscriptSearchResult = { segmentCount: transcript.segments.length, wordCount: index.words.length, matches: index.find(query, contextWords) };
+      if (knownWordSnapshot !== undefined) {
+        const id = index.snapshotId ??= randomUUID();
+        result.wordSnapshot = knownWordSnapshot === id ? { id } : { id, texts: index.words.map(w => w.text) };
+      }
+      return result;
     },
   };
 }

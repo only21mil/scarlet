@@ -10,17 +10,19 @@ export type CliAgent = "claude" | "codex" | "gemini";
 export const MODEL_ID = /^[a-z0-9][a-z0-9._:/@+\[\]-]*$/i;
 type Catalog = Pick<AgentAvailability, "models" | "model" | "modelLabels" | "modelOptions">;
 
-const claudeResponse = z.object({
+const claudeEnvelope = z.object({
   type: z.literal("control_response"),
   response: z.object({
     request_id: z.literal("catalog"),
-    response: z.object({ models: z.array(z.object({
-      value: z.string(), displayName: z.string(),
-      supportsEffort: z.boolean().optional(), supportedEffortLevels: z.array(z.string()).optional(),
-      supportsFastMode: z.boolean().optional(),
-    })) }),
+    subtype: z.string().optional(),
+    response: z.unknown(),
   }),
 });
+const claudeCatalog = z.object({ models: z.array(z.object({
+  value: z.string(), displayName: z.string(),
+  supportsEffort: z.boolean().optional(), supportedEffortLevels: z.array(z.string()).optional(),
+  supportsFastMode: z.boolean().optional(),
+})) });
 const codexPage = z.object({
   data: z.array(z.object({
     model: z.string(), displayName: z.string(), isDefault: z.boolean().optional(),
@@ -35,6 +37,14 @@ const geminiSession = z.object({
   models: z.object({ currentModelId: z.string().optional(), availableModels: z.array(z.object({ modelId: z.string(), name: z.string() })) }),
 });
 const rpcResponse = z.object({ id: z.number(), result: z.unknown().optional(), error: z.unknown().optional() });
+
+type ProbeFailure = "initialize_failed" | "request_failed" | "invalid_response" | "repeated_cursor" | "timed_out" | "process_failed" | "incomplete_response";
+
+export class ModelCatalogError extends Error {
+  constructor(readonly reason: ProbeFailure) {
+    super(reason);
+  }
+}
 
 /** Ask the installed CLI for its picker catalog without sending a user turn. */
 export async function discoverModels(agent: CliAgent, file: string, env: NodeJS.ProcessEnv): Promise<Catalog | undefined> {
@@ -60,15 +70,24 @@ export async function discoverModels(agent: CliAgent, file: string, env: NodeJS.
   };
   let requestId = 1;
   let complete = false;
+  let failure: ProbeFailure | undefined;
   const cursors = new Set<string>();
   try {
+    const fail = (reason: ProbeFailure) => {
+      failure = reason;
+      proc.kill();
+    };
     const proc = spawnLines(file, args[agent], { cwd, env, timeoutMs: 8000, interactive: true, onLine(line) {
+      if (complete || failure) return;
       let msg: unknown;
       try { msg = JSON.parse(line); } catch { return; }
       if (agent === "claude") {
-        const response = claudeResponse.safeParse(msg);
-        if (!response.success) return;
-        for (const m of response.data.response.response.models) {
+        const envelope = claudeEnvelope.safeParse(msg);
+        if (!envelope.success) return;
+        if (envelope.data.response.subtype === "error") return fail("initialize_failed");
+        const catalog = claudeCatalog.safeParse(envelope.data.response.response);
+        if (!catalog.success) return fail("invalid_response");
+        for (const m of catalog.data.models) {
           if (!m.value) continue;
           // Claude's default alias means omitting --model, and has its own capabilities.
           add(m.value === "default" ? "" : m.value, m.displayName, {
@@ -79,7 +98,7 @@ export async function discoverModels(agent: CliAgent, file: string, env: NodeJS.
       } else {
         const rpc = rpcResponse.safeParse(msg);
         if (!rpc.success || rpc.data.id !== requestId) return;
-        if (rpc.data.error || !rpc.data.result) return proc.kill();
+        if (rpc.data.error || !rpc.data.result) return fail(requestId === 1 ? "initialize_failed" : "request_failed");
         if (requestId === 1) {
           if (agent === "codex") send({ method: "initialized" });
           // Codex leaves some models out of its own picker. Scarlet lists every model the CLI offers.
@@ -88,12 +107,12 @@ export async function discoverModels(agent: CliAgent, file: string, env: NodeJS.
         }
         if (agent === "gemini") {
           const session = geminiSession.safeParse(rpc.data.result);
-          if (!session.success) return proc.kill();
+          if (!session.success) return fail("invalid_response");
           for (const m of session.data.models.availableModels) if (m.modelId) add(m.modelId, m.name);
           defaultModel = session.data.models.currentModelId;
         } else {
           const page = codexPage.safeParse(rpc.data.result);
-          if (!page.success) return proc.kill();
+          if (!page.success) return fail("invalid_response");
           for (const m of page.data.data) {
             if (!m.model) continue;
             add(m.model, m.displayName, {
@@ -106,7 +125,7 @@ export async function discoverModels(agent: CliAgent, file: string, env: NodeJS.
           }
           const cursor = page.data.nextCursor;
           if (cursor) {
-            if (cursors.has(cursor)) return proc.kill();
+            if (cursors.has(cursor)) return fail("repeated_cursor");
             cursors.add(cursor);
             request("model/list", { cursor, includeHidden: true });
             return;
@@ -129,8 +148,9 @@ export async function discoverModels(agent: CliAgent, file: string, env: NodeJS.
         : { protocolVersion: 1, clientCapabilities: {} };
       send({ id: requestId, method: "initialize", params });
     }
-    await proc.done;
-    if (complete) return {
+    const outcome = await proc.done;
+    if (!complete) throw new ModelCatalogError(failure ?? (outcome?.timedOut ? "timed_out" : outcome?.code !== 0 ? "process_failed" : "incomplete_response"));
+    return {
       models: [...names.keys()].filter(Boolean), modelLabels: Object.fromEntries(names), modelOptions: Object.fromEntries(modelOptions),
       ...(defaultModel && names.has(defaultModel) ? { model: defaultModel } : {}),
     };

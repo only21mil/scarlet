@@ -7,6 +7,8 @@ pub mod engine;
 pub mod host;
 pub mod util;
 mod crisper;
+#[cfg(windows)]
+mod find_shortcut;
 mod updates;
 mod release_updates;
 mod storage;
@@ -127,6 +129,7 @@ pub fn run() {
             commands::pick_files,
             commands::desktop_log,
             commands::desktop_info,
+            commands::save_editor_model,
             logs::export_logs,
             storage::measure_project_storage,
             storage::developer_storage,
@@ -137,6 +140,9 @@ pub fn run() {
             updates::restart_for_update,
         ])
         .setup(|app| {
+            #[cfg(windows)]
+            find_shortcut::forward_to_renderer(app.handle());
+
             // Read the login shell's PATH off the main thread before anything needs it.
             #[cfg(target_os = "macos")]
             std::thread::spawn(|| {

@@ -14,7 +14,7 @@ import type { CaptionClip, Clip, ColorClip, MediaAsset, MediaClip, Project, Time
 import { RenderColor, Timeline as TimelineSchema } from "./schema.js";
 import { makeMediaClip } from "./builders.js";
 import { newId } from "./ids.js";
-import { firstIndex } from "./intervals.js";
+import { firstIndex, intervalCandidates } from "./intervals.js";
 import { makeTimeMap, type TimeMap } from "./rebase.js";
 import { clipEnd, MAX_TIMELINE_SECONDS, timelinePlanningIssue } from "./time.js";
 
@@ -108,7 +108,8 @@ function speedOf(clip: Json): number {
 /** Index once for a round trip. Resolve can drop IDs, repeat names or split a
  * take, so source overlap and unused-clip tie breaks still apply. */
 function indexBaseClips(base: Timeline) {
-  type Source = { clips: MediaClip[]; ids: Map<string, MediaClip>; names: Map<string, MediaClip[]> };
+  type Takes = { clips: MediaClip[]; inRange?: ReturnType<typeof intervalCandidates<MediaClip>> };
+  type Source = Takes & { ids: Map<string, MediaClip>; names: Map<string, Takes> };
   const sources = new Map<string, Source>();
   const colorsById = new Map<string, ColorClip>();
   const colorsByName = new Map<string, ColorClip | null>();
@@ -130,8 +131,8 @@ function indexBaseClips(base: Timeline) {
       source.clips.push(clip);
       if (!source.ids.has(clip.id)) source.ids.set(clip.id, clip);
       const named = source.names.get(name);
-      if (named) named.push(clip);
-      else source.names.set(name, [clip]);
+      if (named) named.clips.push(clip);
+      else source.names.set(name, { clips: [clip] });
     }
   }
   return { sources, colorsById, colorsByName };
@@ -144,11 +145,15 @@ function matchBase(sources: ReturnType<typeof indexBaseClips>["sources"], used: 
   const exact = imported.scarletId && source.ids.get(imported.scarletId);
   if (exact) return exact;
   const named = source.names.get(imported.name);
-  if (named?.length === 1) return named[0];
+  if (named?.clips.length === 1) return named.clips[0];
+  // Resolve can rename every shot to its recording. Look up the overlapping takes
+  // in original stacking order, building the index only when names or IDs cannot settle the match.
+  const takes = named ?? source;
+  const inRange = takes.inRange ??= intervalCandidates(takes.clips, c => c.sourceIn, c => c.sourceOut);
   let best: MediaClip | undefined;
   let bestOverlap = 0;
   let bestRank = -1;
-  for (const clip of named ?? source.clips) {
+  for (const clip of inRange(imported.sourceIn, imported.sourceOut)) {
     const overlap = Math.min(clip.sourceOut, imported.sourceOut) - Math.max(clip.sourceIn, imported.sourceIn);
     if (overlap <= 0) continue;
     // A linked camera twin may share both its name and its start with a
@@ -162,7 +167,7 @@ function matchBase(sources: ReturnType<typeof indexBaseClips>["sources"], used: 
       best = clip;
     }
   }
-  return best ?? named?.find(clip => !used.has(clip.id)) ?? named?.[0];
+  return best ?? named?.clips.find(clip => !used.has(clip.id)) ?? named?.clips[0];
 }
 
 /** Map each stretch of a caption through its footage. A reordered shot, or a newly inserted gap,
@@ -366,11 +371,12 @@ export function fromOtio(otio: unknown, project: Project, base: Timeline): Timel
   // track. In Scarlet a video clip carries its own sound, so drop those twins.
   const videoClips = tracks.filter((t) => t.kind === "video" && !t.muted).flatMap((t) => t.clips.filter((c): c is MediaClip => c.kind === "media" && c.volume > 0));
   const halfFrame = 0.5 / project.settings.fps;
+  const pictureStarts = intervalCandidates(videoClips, v => v.timelineIn, v => v.timelineIn);
   for (const t of tracks) {
     if (t.kind !== "audio") continue;
     t.clips = t.clips.filter((c) => {
       if (c.kind !== "media" || independentAudio.has(c.id)) return true;
-      return !videoClips.some(v => v.mediaId === c.mediaId && v.speed === c.speed &&
+      return !pictureStarts(c.timelineIn - halfFrame, c.timelineIn + halfFrame).some(v => v.mediaId === c.mediaId && v.speed === c.speed &&
         Math.abs(v.timelineIn - c.timelineIn) < halfFrame && Math.abs(v.sourceIn - c.sourceIn) < halfFrame &&
         Math.abs(v.sourceOut - c.sourceOut) < halfFrame);
     });
@@ -378,15 +384,16 @@ export function fromOtio(otio: unknown, project: Project, base: Timeline): Timel
   const audioTracks = tracks.filter((t) => t.kind !== "audio" || t.clips.length || base.tracks.some((b) => b.id === t.id));
 
   // Captions and markers ride along from the exported version, re-timed through the footage.
-  const draft = TimelineSchema.parse({ ...base, tracks: audioTracks, markers: [] });
+  const draft = TimelineSchema.parse({ ...base, version: "draft", parent: base.version, tracks: audioTracks, markers: [] });
   const issue = timelinePlanningIssue(draft);
   if (issue) throw new OtioImportError(issue);
+  const captions = base.tracks.filter(t => t.kind === "caption");
+  if (!captions.length && !base.markers.length) return draft;
   const map = makeTimeMap(base, draft, project.settings.fps);
   let captionRange: ReturnType<typeof captionRangeMap> | undefined;
   // Shorter than a frame of this project can't show. Mapping can leave an exact frame a few ulps short.
   const frame = 1 / project.settings.fps - 1e-6;
-  const captionTracks: Track[] = base.tracks
-    .filter((t) => t.kind === "caption")
+  const captionTracks: Track[] = captions
     .map((t) => ({
       ...t,
       clips: t.clips.flatMap(c => {
@@ -400,5 +407,5 @@ export function fromOtio(otio: unknown, project: Project, base: Timeline): Timel
     return time === null ? [] : [{ ...m, time, end: m.end !== undefined ? (map(m.end) ?? undefined) : undefined }];
   });
 
-  return TimelineSchema.parse({ ...base, version: "draft", parent: base.version, tracks: [...audioTracks, ...captionTracks], markers });
+  return TimelineSchema.parse({ ...draft, tracks: [...audioTracks, ...captionTracks], markers });
 }

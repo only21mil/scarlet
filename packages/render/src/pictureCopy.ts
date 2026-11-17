@@ -19,7 +19,7 @@ export async function wholeOriginalPicture(project: Project, picture: Timeline, 
   size: { width: number; height: number }, opts: RenderOptions): Promise<OriginalPicture | undefined> {
   const clips = picture.tracks.flatMap(t => t.clips);
   const clip = clips[0];
-  if (clips.length !== 1 || clip?.kind !== "media" || clip.timelineIn !== 0 || clip.sourceIn !== 0 ||
+  if (clips.length !== 1 || clip?.kind !== "media" || clip.transitionIn?.type === "dip" || clip.timelineIn !== 0 || clip.sourceIn !== 0 ||
       Math.abs(clip.sourceOut - duration) > 1e-6) return;
   const asset = project.media.find(m => m.id === clip.mediaId);
   if (!asset || asset.kind !== "video") return;

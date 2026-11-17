@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Transcript, TranscriptWord } from "@scarlet/timeline";
-import { flattenWords, fuzzySearchTranscript, indexTranscriptWords, normalizeTranscriptToken, sameToken, searchTranscript, sequenceSimilarity, tokenSimilarity } from "./transcriptSearch.js";
+import { flattenWords, fuzzySearchTranscript, indexTranscriptWords, normalizeTranscriptToken, sameToken, searchTranscript, sequenceSimilarity, tokenSimilarity, transcriptSequenceMatcher } from "./transcriptSearch.js";
 
 describe("sameToken", () => {
   it("agrees with tokenSimilarity >= 0.8", () => {
@@ -72,6 +72,15 @@ describe("phrase search", () => {
 });
 
 describe("sequenceSimilarity", () => {
+  it("scores a restarted take's prefix in both directions and resets the score between takes", () => {
+    const short = ["let", "the", "camera", "roll"], long = [...short, "again", "today"];
+    const compare = transcriptSequenceMatcher(short);
+    expect(compare(long)).toEqual({ score: 0.8, prefix: 1 });
+    expect(compare(["start", "again"])).toEqual({ score: 0, prefix: 0 });
+    expect(transcriptSequenceMatcher(long)(short)).toEqual({ score: 0.8, prefix: 1 });
+    expect(compare(["start", "again", ...short])).toEqual({ score: 0.8, prefix: 0.5 });
+  });
+
   it("is 1 for the same words, 0 for none shared or nothing to compare, and counts near-spellings as the same", () => {
     expect(sequenceSimilarity(["we", "should", "go"], ["we", "should", "go"])).toBe(1);
     expect(sequenceSimilarity(["we", "should", "go"], ["they", "left"])).toBe(0);

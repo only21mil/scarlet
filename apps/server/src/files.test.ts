@@ -1,9 +1,9 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeAll, expect, it } from "vitest";
+import { afterAll, beforeAll, expect, it, vi } from "vitest";
 import { HttpError } from "./errors.js";
-import { contentTypeFor, originalPlaybackType, serveFile, serveOriginal } from "./files.js";
+import { contentTypeFor, originalPlaybackType, serveFile, serveOriginal, startFileLog } from "./files.js";
 
 let directory: string;
 let file: string;
@@ -68,6 +68,29 @@ it("streams a large file whole, for a save as for playback", async () => {
     expect(res.headers.get("Content-Length")).toBe(String(bytes.length));
     expect(Buffer.from(await res.arrayBuffer()).equals(bytes)).toBe(true);
   }
+});
+
+it("correlates a download with its actual disk read and never logs the source path", async () => {
+  const log = vi.fn();
+  const id = "d494d68b-c81e-40ee-9bea-b2f89239eaa5";
+  const request = get("bytes=2-5", { headers: { "x-scarlet-download": "1", "x-scarlet-request-id": id } });
+  startFileLog(request, log, () => "/api/renders/:renderId/file");
+  const response = serveFile(request, file, { renderId: "rnd_123456789abc" });
+  expect(await response.text()).toBe("2345");
+  await vi.waitFor(() => expect(log).toHaveBeenCalledOnce());
+  expect(log.mock.calls[0]?.[0]).toMatch(new RegExp(`^\\[transfer\\] file-read request=${id} route=/api/renders/:renderId/file status=206 outcome=finished startByte=2 endByte=5 readBytes=4 expectedBytes=4 elapsedMs=\\d+ render=rnd_123456789abc$`));
+});
+
+it("reports a file that became short after the headers were built", async () => {
+  const shortened = join(directory, "shortened.mp4");
+  writeFileSync(shortened, "1234567890");
+  const request = get();
+  const log = vi.fn();
+  startFileLog(request, log, () => "/api/media/:mediaId/file");
+  const response = serveFile(request, shortened);
+  writeFileSync(shortened, "1234");
+  expect(await response.text()).toBe("1234");
+  await vi.waitFor(() => expect(log).toHaveBeenCalledWith(expect.stringContaining("outcome=truncated startByte=0 endByte=9 readBytes=4 expectedBytes=10")));
 });
 
 it("answers 404 for a file that isn't there, and for a folder", () => {

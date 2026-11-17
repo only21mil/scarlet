@@ -96,7 +96,7 @@ pub fn exit_error(cli: &str, outcome: &SpawnOutcome) -> String {
     format!("{cli} exited with code {}{}", outcome.code.map(|c| c.to_string()).unwrap_or("null".into()), stderr_tail(&outcome.stderr))
 }
 
-fn stderr_tail(stderr: &str) -> String {
+pub(super) fn stderr_tail(stderr: &str) -> String {
     let t = stderr.trim();
     if t.is_empty() {
         String::new()

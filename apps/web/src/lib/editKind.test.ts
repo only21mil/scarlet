@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ThreadEdit } from "@scarlet/shared";
+import { REVISED_CHECK, type ThreadEdit } from "@scarlet/shared";
 import { editFocus, editKindWord, editNote } from "./editKind";
 
 const edit = (extra: Partial<ThreadEdit>): ThreadEdit => ({ changeId: "c", spot: 0, label: "An edit", range: { start: 27, end: 200 }, previous: [], ...extra });
@@ -35,6 +35,12 @@ describe("drawing an applied edit on the timeline", () => {
 });
 
 describe("the note on an applied edit's card", () => {
+  it("shows the reason with a review cue, separately from the summary", () => {
+    const reason = "The restart carries the full score.";
+    const edited = { label: "Mute the false start", summary: "Muted 0.1 seconds.", reason };
+    expect(editNote(edited)).toBe(reason);
+    expect(editNote({ ...edited, check: "Listen for the full score" })).toBe(`${reason} Listen for the full score`);
+  });
   it("is Scarlet's summary of the edit and nothing else, flagged or not", () => {
     const summary = "Muted the call audio and the screen recording's demo sound, leaving only the camera mic";
     expect(editNote(edit({ label: "Use camera mic, mute call audio", check: "Screen recording's demo sound is muted too", summary }))).toBe(summary);
@@ -42,6 +48,32 @@ describe("the note on an applied edit's card", () => {
     // A doubt a later request raised about it follows the sentence written when it was made.
     expect(editNote({ ...edit({ label: "Carry the quotation", summary: "Kept the quotation into the reaction", check: "Black gap and overlapping lines" }),
       recheck: "2026-11-14T17:52:00.000Z" })).toBe("Kept the quotation into the reaction. Black gap and overlapping lines.");
+  });
+
+  it("leads a marker's note with what it asks of the editor, said once", () => {
+    const marked = "Marked “throw it on the screen now” where the boat comparison belongs.";
+    expect(editNote(edit({ label: "Boat comparison footage", check: "Add the other boat renders", summary: marked, marker: true })))
+      .toBe("Add the other boat renders. Marked “throw it on the screen now” where the boat comparison belongs.");
+    expect(editNote(edit({ label: "Boat comparison footage", check: "Add the other boat renders", reason: "You asked for it on screen here.", marker: true })))
+      .toBe("Add the other boat renders. You asked for it on screen here.");
+    // Said already, it isn't said twice.
+    const asked = "Marked where the boat comparison belongs: add the other boat renders.";
+    expect(editNote(edit({ label: "Boat comparison footage", check: "Add the other boat renders", summary: asked, marker: true }))).toBe(asked);
+  });
+
+  it("keeps leading a revised marker's note with what it asks, not with the word for the revision", () => {
+    const why = "Moved to where you say the boat line.";
+    expect(editNote(edit({ label: "Boat comparison footage", check: REVISED_CHECK, todo: "Add the other boat renders", summary: why, marker: true })))
+      .toBe("Add the other boat renders. Moved to where you say the boat line.");
+    // A marker the model gave no reason to look asks what the marker itself says.
+    expect(editNote(edit({ label: "Boat comparison footage", check: "Comparison footage needed", todo: "Comparison footage needed", marker: true })))
+      .toBe("Comparison footage needed");
+  });
+
+  it("draws a marker at a point as a plain line, not a red cut", () => {
+    const focus = editFocus(edit({ kind: "other", marker: true, at: 144, range: { start: 142.5, end: 145.5 } }), 3000);
+    expect(focus).toMatchObject({ band: { start: 144, end: 144 }, tone: "kept" });
+    expect(focus?.bandLabel).toBeUndefined();
   });
 
   it("reads an edit saved without a summary as its title, then its reason to look", () => {

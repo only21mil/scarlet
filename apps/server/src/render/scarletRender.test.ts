@@ -2,14 +2,39 @@ import { mkdtemp, mkdir, rm, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it, vi } from "vitest";
-import { hashFile, renderPlaybackSegment, runCapture } from "@scarlet/render";
-import { createProject, sha256, timelineFromKeepRanges, type MediaClip } from "@scarlet/timeline";
+import { hashFile, renderFullCached, renderPlaybackSegment, runCapture } from "@scarlet/render";
+import { createProject, makeMediaClip, sha256, timelineFromKeepRanges, type MediaClip } from "@scarlet/timeline";
 import { scarletRenderAdapter } from "./scarletRender.js";
 
-// The real renderer, with a playback section that one test can answer for.
+// Use the real renderer unless a test is inspecting the adapter's handoff.
 vi.mock("@scarlet/render", async original => {
   const real = await original<typeof import("@scarlet/render")>();
-  return { ...real, renderPlaybackSegment: vi.fn(real.renderPlaybackSegment) };
+  return { ...real, renderFullCached: vi.fn(real.renderFullCached), renderPlaybackSegment: vi.fn(real.renderPlaybackSegment) };
+});
+
+it("rechecks the inputs of a range export and keeps the other sources' metadata for segment planning", async () => {
+  const root = await mkdtemp(join(tmpdir(), "scarlet-export-scope-"));
+  try {
+    const project = createProject("Excerpt");
+    project.media.push(
+      { id: "picture", kind: "video", name: "Picture", path: "picture.mp4", duration: 4, hash: "unverified" },
+      { id: "sound", kind: "audio", name: "Sound", path: "sound.wav", hash: "outside" },
+      { id: "incoming", kind: "video", name: "Incoming", path: "incoming.mp4", duration: 4, hash: "unverified" },
+    );
+    const timeline = timelineFromKeepRanges(project.id, "picture", [{ start: 0, end: 1 }]);
+    // The incoming transition borrows picture from a clip whose ordinary start is after the excerpt.
+    timeline.tracks[0]!.clips.push(makeMediaClip("incoming", 1, 2, 1, { transitionIn: { type: "dissolve", duration: 1, direction: "left" } }));
+    timeline.tracks[1]!.clips.push(makeMediaClip("sound", 0, 1, 2));
+    const render = vi.mocked(renderFullCached);
+    const output = join(root, "out.mp4");
+    render.mockResolvedValueOnce({ output, duration: 1, segments: [], rendered: 0, reused: 0, encoder: "libx264", warnings: [] });
+    await scarletRenderAdapter.renderFullCached(project, timeline, root, output,
+      { mediaRoot: root, quality: "delivery", exportRange: { start: 0.6, end: 0.9 } });
+    const { media } = render.mock.lastCall![0];
+    expect(media[0]!.hash).not.toBe("unverified");
+    expect(media[1]).toEqual(project.media[1]);
+    expect(media[2]!.hash).not.toBe("unverified");
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 it("uses verified proxy picture for playback and full preview while keeping original audio and delivery", async () => {

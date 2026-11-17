@@ -4,7 +4,8 @@ import { mergeRanges, type Change, type TimeRange } from "@scarlet/timeline";
 import { processIsAlive, type Ctx } from "../context.js";
 import { now } from "../db.js";
 import { conflict, notFound } from "../errors.js";
-import { appendTaskEvent, createTask, FINISHED_TASK, hasTranscript, RESUMABLE, returnRulesLeftWithQuestions, saveTask } from "./tasks.js";
+import { logId } from "../logText.js";
+import { appendTaskEvent, cancelTask, createTask, FINISHED_TASK, hasTranscript, PROJECT_EDIT_KINDS, recordWorkThrough, RESUMABLE, returnRulesLeftWithQuestions, saveTask } from "./tasks.js";
 import { recordTaskFinished } from "../telemetry/events.js";
 import { prepareCutReview } from "./changes.js";
 import { skillEditEnded, startLearningCheck } from "./learnings.js";
@@ -28,14 +29,14 @@ const LOST_WORKER_ATTEMPTS = 3;
  * `quit`: Scarlet closed or was found closed. Otherwise the worker went missing while Scarlet stayed open, which
  * can repeat, so those are counted.
  */
-function reconcileTask(ctx: Ctx, task: Task, unstarted: boolean, quit: boolean): Task {
-  let saved = settleTask(ctx, task, unstarted);
-  ctx.log(`[task] ${task.id} recovered after its worker stopped: ${task.state} → ${saved.state}${saved.error ? ` (${saved.error})` : ""}`);
+function reconcileTask(ctx: Ctx, task: Task, unstarted: boolean, quit: boolean, lastSeen?: string | null): Task {
+  let saved = settleTask(ctx, task, unstarted, lastSeen);
   const attempts = runAttempts(task.projectId, runRoot(task));
   // Only the attempts that lost their worker count. A pass that came through three quits, or that the editor resumed
   // by hand, still carries on by itself the first time its worker goes missing.
   if (!quit && saved.state === "failed" && saved.interrupted) saved = saveTask(ctx, { ...saved, lostWorker: true });
-  const again = quit || ctx.repos.tasks.count(`${attempts.where} AND json_extract(json, '$.lostWorker') = 1`, attempts.params) < LOST_WORKER_ATTEMPTS;
+  const lost = quit ? 0 : ctx.repos.tasks.count(`${attempts.where} AND json_extract(json, '$.lostWorker') = 1`, attempts.params);
+  const again = quit || lost < LOST_WORKER_ATTEMPTS;
   let carriesOn = false;
   // A learning check cut short isn't run again: its request has moved on, and the next message is read anyway.
   if (again && saved.state === "failed" && saved.interrupted && saved.kind !== "transcribe" && saved.kind !== "learning_check") {
@@ -61,12 +62,58 @@ function reconcileTask(ctx: Ctx, task: Task, unstarted: boolean, quit: boolean):
   // A rule the editor approved was being saved by this run. An attempt that carries on is still saving it, so the
   // rule stays with that attempt and the skill's next rule waits for it: a skill's edits run one at a time.
   if (!carriesOn) skillEditEnded(ctx, saved);
+  const outcome = carriesOn ? "resumed" : saved.retryTaskId ? "retried" : !again ? "retry_limit" : saved.state;
+  ctx.db.afterCommit(() => ctx.log(`[task] recovery task=${logId(task.id)} project=${logId(task.projectId)} ` +
+    `state=${saved.state} outcome=${outcome} reason=${quit ? "engine_stopped" : "worker_lost"} attempts=${lost}`));
   return saved;
 }
 
-function settleTask(ctx: Ctx, task: Task, unstarted: boolean): Task {
+/** Retire the workers' attempts and leave their requests at the front of the project's held queue. */
+export function holdProjectEditing(ctx: Ctx, projectId: string) {
+  return ctx.db.transaction(() => ctx.bus.asSaved(() => {
+    const previous = ctx.repos.projects.header(projectId);
+    if (!previous) throw notFound("project");
+    ctx.repos.projects.setEditingPaused(projectId, true);
+    const project = ctx.repos.projects.get(projectId)!;
+    if (!previous.editingPaused) ctx.bus.publish({ type: "project.updated", projectId, project });
+
+    // Only a run at work is retired. One waiting on the editor's answer, or back in line after it, holds no worker:
+    // it keeps its question, its answer and its CLI session, and the paused queue keeps it from starting.
+    const active = ctx.repos.tasks.select(`project_id = ? AND kind IN ${PROJECT_EDIT_KINDS} AND state IN ('claimed','running')`,
+      [projectId], "created_at, rowid");
+    const tasks = active.flatMap(task => {
+      const next = resumeTask(ctx, task, {}, true);
+      return [ctx.repos.tasks.get(task.id)!, next];
+    });
+    return { project, tasks };
+  }), "immediate")();
+}
+
+/** Release the queue under the same lock as claims. */
+export function resumeProjectEditing(ctx: Ctx, projectId: string) {
+  return ctx.db.transaction(() => {
+    const previous = ctx.repos.projects.header(projectId);
+    if (!previous) throw notFound("project");
+    ctx.repos.projects.setEditingPaused(projectId, false);
+    const project = ctx.repos.projects.get(projectId)!;
+    if (!previous.editingPaused) return { project, tasks: [] };
+    ctx.bus.publish({ type: "project.updated", projectId, project });
+    const waiting = ctx.repos.tasks.select(`project_id = ? AND state = 'queued' AND kind IN ${PROJECT_EDIT_KINDS}`, [projectId]);
+    const held = waiting.filter(task => task.resumesAfterProjectStop && !task.startedAt);
+    const tasks = held.map(task => {
+      const [previousAttempt] = ctx.repos.tasks.select("project_id = ? AND json_extract(json, '$.retryTaskId') = ?", [projectId, task.id]);
+      // The editor may have made decisions while editing was stopped.
+      return saveTask(ctx, { ...task, instruction: recoveryInstruction(ctx, previousAttempt ?? task, task.resumeRootId) });
+    });
+    if (waiting[0]) ctx.bus.taskQueued({ taskId: waiting[0].id, projectId });
+    return { project, tasks };
+  }, "immediate")();
+}
+
+function settleTask(ctx: Ctx, task: Task, unstarted: boolean, lastSeen?: string | null): Task {
+  const finishedAt = now();
   const finish = (saved: Partial<Task>) => {
-    const finished = saveTask(ctx, { ...task, hostId: null, finishedAt: now(), ...saved });
+    const finished = saveTask(ctx, { ...task, hostId: null, finishedAt, ...saved });
     recordTaskFinished(ctx, finished);
     return finished;
   };
@@ -90,16 +137,21 @@ function settleTask(ctx: Ctx, task: Task, unstarted: boolean): Task {
   }
 
   const changeIds = savedChanges(ctx, [task]).map(c => c.id);
-  if (task.resultSkillId) return finish({ state: "done", changeIds, summary: "The skill was saved before the interruption." });
   const lastEvent = ctx.db.prepare(`SELECT json_extract(json, '$.type') AS type, json_extract(json, '$.text') AS text, at
     FROM task_events WHERE task_id = ? ORDER BY at DESC, rowid DESC LIMIT 1`)
     .get(task.id) as { type: string; text: string; at: string } | undefined;
-  if (lastEvent?.type === "question") return saveTask(ctx, { ...task, changeIds, state: "waiting_for_user", question: lastEvent.text, hostId: null });
+  // An interrupt reported by a live worker stops now. A lost worker is measured through its latest activity.
+  const observed = [task.startedAt, lastSeen, lastEvent?.at].filter((at): at is string => !!at && at <= finishedAt).sort().at(-1);
+  const { workedMs } = recordWorkThrough(task, lastSeen === undefined ? finishedAt : observed ?? finishedAt);
+  if (task.resultSkillId) return finish({ state: "done", changeIds, workedMs, summary: "The skill was saved before the interruption." });
+  if (lastEvent?.type === "question") return saveTask(ctx, { ...recordWorkThrough(task, lastEvent.at),
+    changeIds, state: "waiting_for_user", question: lastEvent.text, hostId: null });
   // Preserve the answer and task workspace of requests stranded by the old host protocol.
-  if ((unstarted && !changeIds.length) || (task.state === "running" && lastEvent?.type === "answer" && lastEvent.at >= (task.startedAt ?? ""))) {
-    return saveTask(ctx, { ...task, changeIds, state: "queued", hostId: null, question: null });
+  const pendingAnswer = task.state === "running" && lastEvent?.type === "answer" && lastEvent.at >= (task.startedAt ?? "");
+  if ((unstarted && !changeIds.length) || pendingAnswer) {
+    return saveTask(ctx, { ...task, workedMs: pendingAnswer ? task.workedMs : workedMs, changeIds, state: "queued", hostId: null, question: null });
   }
-  return finish({ state: "failed", interrupted: true, changeIds, error: changeIds.length
+  return finish({ state: "failed", interrupted: true, changeIds, workedMs, error: changeIds.length
     ? "The agent was interrupted after saving changes." : "The editing request was interrupted before a result was saved." });
 }
 
@@ -147,7 +199,7 @@ export function recoverTasks(ctx: Ctx, starting = false): void {
         ctx.db.savepoint(() => {
           const task = ctx.repos.tasks.get(id)!;
           // Found dead at startup: Scarlet was closed or crashed mid-run.
-          reconcileTask(ctx, task, pid !== null && !alive && task.state === "claimed", starting);
+          reconcileTask(ctx, task, pid !== null && !alive && task.state === "claimed", starting, seen);
           ctx.bus.taskQueued({ taskId: id, projectId: task.projectId });
         });
       } catch (err) {
@@ -169,16 +221,33 @@ export function recoverTasks(ctx: Ctx, starting = false): void {
   }
 }
 
+/** A worker still stopping keeps its claim until cleanup. Check its transcription again then. */
+export function resumeProjectTranscriptions(ctx: Ctx, projectId: string): void {
+  const running = ctx.repos.tasks.select("project_id = ? AND kind = 'transcribe' AND state = 'running'", [projectId]);
+  for (const task of running) {
+    const worker = ctx.transcriptions.get(task.id);
+    const mediaId = task.context.mediaId;
+    if (!worker?.controller.signal.aborted || !mediaId) continue;
+    void ctx.track(worker.done.catch(() => {
+      if (!ctx.shutdown.aborted) resumeTranscriptions(ctx, projectId, mediaId);
+    }).catch(err => {
+      ctx.log(`[task] ${task.id} couldn’t check whether its transcription should start again: ${(err as Error).message}`);
+    }), projectId);
+  }
+  resumeTranscriptions(ctx, projectId);
+}
+
 /**
  * A transcription runs inside the engine, so quitting Scarlet stops it. Continue from its last committed audio chunk or alignment turn
  * when the engine is back, or when the project's media processing resumes. Only an interruption restarts:
  * a transcription that failed by itself waits for the editor.
  */
-function resumeTranscriptions(ctx: Ctx): void {
+function resumeTranscriptions(ctx: Ctx, projectId?: string, mediaId?: string): void {
   const interrupted = ctx.repos.tasks.select(`kind = 'transcribe' AND state = 'failed' AND json_extract(json, '$.interrupted') = 1
+    AND (? IS NULL OR project_id = ?) AND (? IS NULL OR json_extract(json, '$.context.mediaId') = ?)
     AND NOT EXISTS (SELECT 1 FROM tasks later WHERE later.kind = 'transcribe' AND later.project_id = tasks.project_id
       AND json_extract(later.json, '$.context.mediaId') = json_extract(tasks.json, '$.context.mediaId')
-      AND (later.created_at, later.rowid) > (tasks.created_at, tasks.rowid))`, [], "created_at, rowid");
+      AND (later.created_at, later.rowid) > (tasks.created_at, tasks.rowid))`, [projectId ?? null, projectId ?? null, mediaId ?? null, mediaId ?? null], "created_at, rowid");
   for (const task of interrupted) {
     try {
       const media = task.context.mediaId && ctx.repos.projects.getMedia(task.context.mediaId);
@@ -208,7 +277,7 @@ function resumeTranscriptions(ctx: Ctx): void {
         AND json_extract(json, '$.speakerAnalysis') IS NULL AND json_extract(json, '$.aligning') IS NULL LIMIT 1`)
         .get(media.id, task.projectId, task.createdAt ?? "")) continue;
       const { task: restarted, done } = startTranscription(ctx, task.projectId, media, chosen, "interrupt", { interrupted: task });
-      ctx.track(done.catch(() => null));
+      ctx.track(done.catch(() => null), task.projectId);
       ctx.log(`[task] ${task.id} was interrupted; continuing transcription of ${media.id} as ${restarted.id}`);
     } catch (err) {
       ctx.log(`[task] ${task.id} couldn’t restart its transcription: ${(err as Error).message}`);
@@ -291,20 +360,24 @@ export function retryTask(ctx: Ctx, id: string, choice: RunChoice = {}): Task {
 }
 
 /** Called with the write lock held. */
-function resumeTask(ctx: Ctx, task: Task, choice: RunChoice = {}): Task {
+function resumeTask(ctx: Ctx, task: Task, choice: RunChoice = {}, afterProjectStop = false): Task {
   const id = task.id;
   if (task.retryTaskId) return ctx.repos.tasks.get(task.retryTaskId)!;
-  const action = taskRecoveryAction(task, savedChanges(ctx, [task]).length > 0);
+  const action = afterProjectStop ? "resume" : taskRecoveryAction(task, savedChanges(ctx, [task]).length > 0);
   if (!action) throw conflict("not_retryable", "This request cannot be retried.");
   const resumeRootId = action === "resume" ? task.resumeRootId ?? id : undefined;
   // A new id fences off late events, proposals and completions from the previous worker.
   const run = choice.agent ? { agent: choice.agent, model: choice.model, effort: choice.effort, fast: choice.fast, serviceTier: choice.serviceTier } : {};
   let retry = createTask(ctx, {
     ...task, ...run, state: "queued", instruction: recoveryInstruction(ctx, task, resumeRootId), resumeRootId,
+    resumesAfterProjectStop: afterProjectStop || undefined,
     context: { ...task.context, threadId: task.context.threadId ?? id, message: task.context.message ?? task.instruction },
   });
   // A request the editor started ahead of their calls was at work: it isn't put behind those calls again.
-  if (task.startsBeforeCalls) retry = saveTask(ctx, { ...retry, startsBeforeCalls: true });
+  if (task.startsBeforeCalls || (afterProjectStop && (task.repeatAudit || task.reply))) {
+    retry = saveTask(ctx, { ...retry, startsBeforeCalls: task.startsBeforeCalls,
+      ...(afterProjectStop && { repeatAudit: task.repeatAudit, reply: task.reply }) });
+  }
   const proposal = task.kind === "revise" && task.context.changeId && ctx.repos.changes.get(task.context.changeId);
   // The revision begins again on the proposal it names while that one stands. A pass a later revision has replaced stays
   // put away: marked as revising it would read as the pass this request revises, and its cut would be moved there
@@ -313,12 +386,15 @@ function resumeTask(ctx: Ctx, task: Task, choice: RunChoice = {}): Task {
     const change = ctx.repos.changes.put({ ...beginRevision(proposal, retry), updatedAt: now() });
     ctx.bus.publish({ type: "change.updated", projectId: change.projectId, change });
   }
-  saveTask(ctx, { ...task, retryTaskId: retry.id });
+  const prior = { ...task, retryTaskId: retry.id };
+  if (afterProjectStop) cancelTask(ctx, prior);
+  else saveTask(ctx, prior);
   ctx.log(`[task] ${id} ${action === "resume" ? "resumed" : "retried"} as ${retry.id}`);
   // A run its host cut short kept its CLI session, so the next attempt on the same model carries on in it instead of
   // starting cold. On another model it starts a session of its own.
   const sameModel = retry.agent === task.agent && retry.model === task.model;
-  if (action === "resume" && task.interrupted && task.session && RESUMABLE.has(task.agent) && sameModel) {
+  // Project Stop ends the run's session with it: it isn't one Scarlet closed on.
+  if (action === "resume" && !afterProjectStop && task.interrupted && task.session && RESUMABLE.has(task.agent) && sameModel) {
     const resumed = saveTask(ctx, { ...retry, session: task.session });
     // The session still holds the plan it was working to, and reports it again only when a step changes. Until then
     // the plan stands as it was left, so the editor sees it where it stopped (2026-11-09: a plan of four steps was

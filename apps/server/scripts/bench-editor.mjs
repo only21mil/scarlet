@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import { ATTEMPT_HEADER, TASK_HEADER } from "@scarlet/shared";
 import { createProject, makeTrack, timelineFromKeepRanges } from "@scarlet/timeline";
 import { createApp } from "../dist/app.js";
 import { localUser } from "../dist/auth.js";
@@ -111,9 +112,9 @@ async function initializeTools(ready, projectId) {
       child.stdin.write(JSON.stringify({jsonrpc: "2.0", method: "notifications/initialized"}) + "\n");
       const call = (name, args) => time(name, () => rpc("tools/call", { name, arguments: args }));
       await call("project_get", {});
-      await call("timeline_summary", {});
+      await call("timeline_get", { format: "summary" });
       await call("transcript_search", {mediaId: "camera", query: "milestone"});
-      const result = await call("captions_generate", {mediaId: "camera", intent: "suggestion"});
+      const result = await call("captions_generate", {mediaId: "camera", intent: "suggestion", reason: "Keep the interview readable with short captions."});
       assert.match(result.content[0].text, /[1-9]\d* caption clip/);
     }
   } finally {
@@ -138,16 +139,16 @@ async function run(dir, { id, version }) {
     assert(ready, "Engine exited before readiness");
     if (!times.has("engineReady")) times.set("engineReady", []);
     times.get("engineReady").push(performance.now() - start);
-    async function request(path, body) {
+    async function request(path, body, headers) {
       const response = await fetch(ready.url + "/api" + path, {
         method: body === undefined ? "GET" : "POST",
-        headers: { Authorization: "Bearer " + ready.token, "Content-Type": "application/json" }, body: JSON.stringify(body),
+        headers: { Authorization: "Bearer " + ready.token, "Content-Type": "application/json", ...headers }, body: JSON.stringify(body),
       });
       if (!response.ok) throw Error(path + " returned " + response.status + ": " + await response.text());
       return response;
     }
-    async function api(path, body) {
-      return (await request(path, body)).json();
+    async function api(path, body, headers) {
+      return (await request(path, body, headers)).json();
     }
     const project = "/projects/" + id, workspace = project + "?view=workspace";
     await time("auth", () => api("/auth/me"));
@@ -189,11 +190,13 @@ async function run(dir, { id, version }) {
     const {task} = await time("queueFirstCut", () => api(project + "/tasks", {
       kind: "edit", agent: "codex", instruction: "Make first cut", context: {message: "Make first cut"},
     }));
-    const claimed = await time("claimFirstCut", () => api("/hosts/" + host.id + "/claim", {}));
+    const claimed = await time("claimFirstCut", () => api("/hosts/" + host.id + "/claim", { taskId: task.id }));
     assert.equal(claimed.task.id, task.id);
     const step = Math.floor(clips / cuts) * 5;
     const ranges = Array.from({length: cuts}, (_, i) => ({start: i * step + 1, end: i * step + 2, review: true, reason: "Pause"}));
-    const batch = await time("dialogueProposal", () => api(project + "/dialogue-cuts", {fromVersion: version, taskId: task.id, description: "Trim pauses", cuts: ranges}));
+    const batch = await time("dialogueProposal", () => api(project + "/dialogue-cuts",
+      { fromVersion: version, taskId: task.id, description: "Trim pauses", cuts: ranges },
+      { [TASK_HEADER]: task.id, [ATTEMPT_HEADER]: claimed.task.startedAt }));
     const change = "/changes/" + batch.changes[0].id;
     const detail = await time("openDiffAfterProposal", () => api(change));
     assert.equal(detail.change.ranges.length, cuts);

@@ -30,6 +30,8 @@ describe("working row activity", () => {
     expect(taskActivityLabel(read, pendingMediaWaits([waiting, ready]))).toBe("Reading transcript 0:00–57:47");
     // Another recording's transcript isn't the one being waited for.
     expect(taskActivityLabel({ ...read, data: { ...read.data, input: { mediaId: "screen", from: 0 } } }, pendingMediaWaits([waiting]))).toBe("Reading transcript at 0:00");
+    // A read of several recordings waits while any of them is being prepared.
+    expect(taskActivityLabel({ ...read, data: { ...read.data, input: { mediaIds: ["screen", "cam"], from: 0 } } }, pendingMediaWaits([waiting]))).toBe("Waiting for the transcript");
   });
 
   it("names the cuts a multi-cut inspection checks", () => {

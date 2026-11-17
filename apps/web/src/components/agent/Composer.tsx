@@ -7,7 +7,7 @@ import { messageTimestamps, type MessageClock } from "../../lib/messageTimestamp
 import { dropTargets, fileDropZone } from "../../lib/dropTargets";
 import { useAttachmentsStore, type PendingAttachment } from "../../stores/attachments";
 import { isComposing } from "../../lib/hotkeys";
-import { clock, clockRange, lengthLabel, playbackClock } from "../../lib/format";
+import { clock, clockRange, playbackClock } from "../../lib/format";
 import type { RecorderResult } from "../../lib/recorder";
 import { useSpeech } from "../../lib/speech";
 import type { Thread } from "../../lib/threads";
@@ -127,14 +127,17 @@ function ComposerBox({ project, thread, onCreated, onSent, selectedEdit, onClear
   const value = rewording ? rewording.text : draft;
   // The queued request a recording was begun for. What is said belongs to the box as it was when the microphone opened.
   const voiceReword = useRef<typeof rewordSession>(undefined);
-  const saveWords = async (request: Rewording, text: string) => {
+  const saveWords = async (session: typeof rewordSession, text: string) => {
+    const request = session.request;
+    if (!request) return;
     setError("");
     setBusy(true);
     try {
-      // The new words run the skills their /commands name, as they would if sent so, and no longer the old words' skills.
-      await request.onSave(text, await commandSkillIds(text));
+      const skillIds = await commandSkillIds(text);
+      // The library may finish loading after this rewording has closed.
+      if (session.request) await request.onSave(text, skillIds);
     } catch (e) {
-      setError(errorMessage(e));
+      if (session.request) setError(errorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -226,7 +229,7 @@ function ComposerBox({ project, thread, onCreated, onSent, selectedEdit, onClear
   const submitText = async () => {
     if (rewording) {
       const words = rewording.text.trim();
-      if (words && !busy && !speech.busy) await saveWords(rewording, words);
+      if (words && !busy && !speech.busy) await saveWords(rewordSession, words);
       return;
     }
     const text = draft.trim();
@@ -260,7 +263,7 @@ function ComposerBox({ project, thread, onCreated, onSent, selectedEdit, onClear
   const speech = useSpeech(async (text) => {
     // Said while the box held a queued request's words: what was said takes their place. Words the editor put back
     // meanwhile stay as they were, and what was said for them is not sent as a new request.
-    if (voiceReword.current) return voiceReword.current.request?.onSave(text);
+    if (voiceReword.current) return saveWords(voiceReword.current, text);
     const anchor = voiceAnchor.current === undefined ? displayAnchor : voiceAnchor.current;
     try {
       const { files, done } = await filesFor();
@@ -328,9 +331,8 @@ function ComposerBox({ project, thread, onCreated, onSent, selectedEdit, onClear
   const tag = rewording ? undefined : targetTag;
   // A stretch marked on the timeline's ruler rides with the message, beside the tag of the cut or edit it is aimed at.
   const marked = rewording ? undefined : markedRangeOf(context);
-  const markedWords = marked && clockRange(marked.start, marked.end);
-  // "Answer" and "Reply" say in words who the message goes to. Anything with a place (a cut, an edit, a moment, a
-  // marked stretch) folds into the edit-point icon, which keeps one size however much it holds.
+  const markedWords = marked ? clockRange(marked.start, marked.end) : "";
+  // "Answer" and "Reply" name who the message goes to. The target label shows the place it is about.
   const wordTag = tag === "Answer" || tag === "Reply" ? tag : undefined;
   const placeTag = wordTag ? undefined : tag;
   const takeOffTarget = () => {
@@ -338,17 +340,19 @@ function ComposerBox({ project, thread, onCreated, onSent, selectedEdit, onClear
     inputRef.current?.focus();
   };
   const aimItems: AimItem[] = [
-    ...placeTag ? [{ key: `target:${placeTag}`, kind: "target" as const, name: placeTag,
-      detail: targetIsPoint ? "the moment you picked" : /^cut\b/i.test(placeTag) ? "the cut that’s open" : /^edit\b/i.test(placeTag) ? "the edit that’s open" : "what you’re revising",
+    ...placeTag ? [{ key: `target:${placeTag}`, name: placeTag,
+      displayName: placeTag.replace(/^(?:Cut|Edit) at /, ""),
       clearLabel: targetIsPoint ? `Take “${placeTag}” off: the message is about the whole video` : `Start a new edit instead of ${tagAct!.charAt(0).toLowerCase()}${tagAct!.slice(1)}`,
       onClear: takeOffTarget }] : [],
-    ...marked ? [{ key: `range:${marked.start}/${marked.end}`, kind: "range" as const, name: markedWords!, detail: `${lengthLabel(marked.end - marked.start)} you marked`,
+    ...marked ? [{ key: `range:${marked.start}/${marked.end}`, name: `Range ${markedWords}`,
+      displayName: markedWords.replace(" – ", "–"),
       clearLabel: `Take the marked range ${markedWords} off the message`, onClear: () => {
         const was = context && context !== "whole" ? context : undefined;
         setContext(withMarkedRange(context, undefined), was?.changeId ? was : undefined);
         inputRef.current?.focus();
       } }] : [],
   ];
+  const [primaryAim, ...additionalAims] = aimItems;
   const saveLabel = rewording ? "Save the new words" : sendLabel;
   function changeText(text: string) {
     dismissFirstEditHint();
@@ -401,8 +405,8 @@ function ComposerBox({ project, thread, onCreated, onSent, selectedEdit, onClear
         }}>
         <label htmlFor={inputId} className="composer-destination sr-only">{rewording ? "Changing the words of a queued request" : <>{mode}{editTitle && ` ${editTitle}`}</>}</label>
         <div className="composer-row">
-          {/* Mounted with nothing aimed too, so the first thing added to an empty box arrives: it draws nothing until then. */}
-          {!rewording && <ComposerAim items={aimItems}disabled={recording || heard} disabledReason="Waits until what you’re saying is sent" />}
+          {primaryAim && <ComposerAim items={[primaryAim, ...additionalAims]}
+            disabled={recording || heard} disabledReason="Waits until what you’re saying is sent" />}
           {wordTag && <span className="composer-tag" title={tagAct}>
             <span className="composer-tag-name">{wordTag}</span>
             {/* A spoken message stays where it was said until it is out: aiming the box elsewhere would drop it. */}
@@ -422,7 +426,7 @@ function ComposerBox({ project, thread, onCreated, onSent, selectedEdit, onClear
           }} onRecording={setRecording} onError={setError} followHold disabled={unavailable || busy || speech.busy} disabledReason={unavailable ? unavailableReason : undefined} label="Talk to Scarlet" />
           {(busy || speech.busy) && <Spinner className="size-3.5 shrink-0" />}
           {/* Shown once there's something to send (Enter sends too). Stopping an edit is on its card, where its progress is. */}
-          {value.trim() && <button type="button" className={rewording ? "btn-primary composer-send is-save shrink-0" : "btn-primary composer-send shrink-0"} aria-label={saveLabel} title={saveLabel}
+          {value.trim() && <button type="button" className={rewording ? "btn-primary composer-send is-save shrink-0" : "btn-primary composer-send shrink-0"} data-log-control={rewording ? "save-queued-request" : "send-request"} aria-label={saveLabel} title={saveLabel}
             disabled={busy || speech.busy || (!rewording && (draft.trim() === "/" || unavailable))} onClick={() => void submitText()}>
             <Icon name={rewording ? "check" : "arrow"} size={15} />
           </button>}

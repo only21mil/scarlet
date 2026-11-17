@@ -190,9 +190,13 @@ async function mcpTools(engine, env, ready, projectId, mediaId, changeId) {
   const mcp = spawn(engine, ["mcp", "--server", ready.url, "--project", projectId],
     { env: { ...env, SCARLET_TOKEN: ready.token, SCARLET_AGENT_CAPS: JSON.stringify({ audio: true }) }, stdio: ["pipe", "pipe", "inherit"] });
   const send = (msg) => mcp.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", ...msg })}\n`);
+  let retry;
   try {
     return await new Promise((res, rej) => {
-      const timer = setTimeout(() => rej(new Error("MCP server did not answer within 30 s")), 30_000);
+      let timer = setTimeout(() => rej(new Error("MCP server did not answer within 30 s")), 30_000);
+      let auditionId = 3;
+      const requestAudition = () => send({ id: ++auditionId, method: "tools/call",
+        params: { name: "change_review_cut", arguments: { changeId, includeAudio: true } } });
       let tools;
       createInterface({ input: mcp.stdout }).on("line", (line) => {
         let msg;
@@ -212,11 +216,20 @@ async function mcpTools(engine, env, ready, projectId, mediaId, changeId) {
             clearTimeout(timer);
             return rej(new Error("Bundled MCP contact sheet returned no image"));
           }
-          send({ id: 4, method: "tools/call", params: { name: "change_review_cut", arguments: { changeId, includeAudio: true } } });
-        } else if (msg.id === 4) {
           clearTimeout(timer);
-          if (!msg.result?.content?.some(block => block.type === "audio" && block.data.length > 100)) {
-            return rej(new Error("Bundled MCP cut review returned no audition: " + (msg.result?.content?.find(b => b.type === "text")?.text ?? "missing result")));
+          timer = setTimeout(() => rej(new Error("Bundled MCP cut review did not return an audition within 120 s")), 120_000);
+          requestAudition();
+        } else if (msg.id === auditionId && auditionId > 3) {
+          const content = msg.result?.content;
+          const text = content?.find(b => b.type === "text")?.text;
+          // A cold inspection can outlast the tool's own wait. Poll until it returns the packaged review audio.
+          if (!msg.result?.isError && text?.startsWith("Scarlet is preparing the inspection windows.")) {
+            retry = setTimeout(requestAudition, 500);
+            return;
+          }
+          clearTimeout(timer);
+          if (msg.result?.isError || !content?.some(block => block.type === "audio" && block.data.length > 100)) {
+            return rej(new Error("Bundled MCP cut review returned no audition: " + (text ?? "missing result")));
           }
           res(tools);
         }
@@ -224,6 +237,7 @@ async function mcpTools(engine, env, ready, projectId, mediaId, changeId) {
       send({ id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "scarlet-smoke", version: "0" } } });
     });
   } finally {
+    clearTimeout(retry);
     mcp.kill();
   }
 }

@@ -27,6 +27,8 @@ export interface TransitionMotion {
 export interface TransitionJoin {
   /** The incoming clip. */
   clipId: string;
+  /** The clip ending at the join, when there is one. */
+  outgoingClipId?: string;
   trackId: string;
   /** The join, in timeline seconds. */
   at: number;
@@ -108,7 +110,7 @@ export function planTransitions(timeline: Timeline, media: ReadonlyMap<string, T
       const color = t.color ?? "#000000";
       const direction = t.direction ?? "left";
       const outgoing = endingAt(at, clip);
-      const join = { clipId: clip.id, trackId: track.id, at, transition: t };
+      const join = { clipId: clip.id, ...(outgoing && { outgoingClipId: outgoing.id }), trackId: track.id, at, transition: t };
       const half = t.duration / 2;
       if (t.type === "dip") {
         // A dip needs no footage beyond the clips: each half fades within its own clip.

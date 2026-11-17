@@ -4,12 +4,13 @@ import type { Ctx } from "../context.js";
 import { now } from "../db.js";
 import { conflict, notFound } from "../errors.js";
 import { actorFor, logActivity } from "./activity.js";
-import { ensureHead, resolveTimeline, storeVersion } from "./timeline.js";
+import { ensureProjectHead, resolveTimeline, storeVersion } from "./timeline.js";
 
 export function recordHistoryEdit(ctx: Ctx, user: User, projectId: string, target: string,
   action: "revert" | "restore", expectedHead: string, branch: string) {
   return ctx.db.transaction(() => {
-    const { project, head, timeline } = ensureHead(ctx, projectId);
+    const project = ensureProjectHead(ctx, projectId);
+    const { head } = project, timeline = resolveTimeline(ctx, project);
     if (head !== expectedHead || project.branch !== branch) throw conflict("cut_changed", "The video changed. Try again.");
     const selected = ctx.repos.versions.get(projectId, target);
     if (!selected) throw notFound("version");

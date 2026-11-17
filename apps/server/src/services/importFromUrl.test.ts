@@ -158,6 +158,22 @@ it.each(["deadline", "client"] as const)("discards a partial response when the %
   expect(stored()).toEqual([]);
 });
 
+it("cancels a finished transfer before its file can be added to the project", async () => {
+  const stop = new AbortController();
+  const probe = vi.mocked(workspace.ctx.render.probeMedia);
+  probe.mockImplementationOnce(async () => {
+    expect(stored()).toHaveLength(1);
+    stop.abort();
+    return { duration: 0, hasAudio: false, kind: "image" };
+  });
+  answers();
+  const imported = await importUrl("https://media.example/clip.png", undefined, stop.signal);
+  expect(imported).toMatchObject({ status: 408, body: { error: { code: "download_cancelled" } } });
+  expect(probe).toHaveBeenCalledOnce();
+  expect(stored()).toEqual([]);
+  expect(workspace.ctx.repos.projects.listMedia(project.id)).toEqual([]);
+});
+
 it("restarts a resumed download when the original window disconnects while both requests are waiting", async () => {
   const stop = new AbortController();
   vi.mocked(downloadImport).mockImplementationOnce((_url, signal) => new Promise((_resolve, reject) => {

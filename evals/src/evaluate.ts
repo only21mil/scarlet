@@ -24,7 +24,7 @@ export interface Artifacts {
   plans?: SubmittedPlan[];
   reviewExport?: ReviewChangeExport;
   reviewSource: "engine" | "local" | "none";
-  versions: { source: string; applied: string; proposed: string };
+  versions: { source: string; applied: string; proposed: string; final?: string };
   timelines: Map<string, Timeline>;
 }
 
@@ -56,7 +56,19 @@ async function assemble(task: TaskRecord, events: EventLike[], changes: Change[]
   }
   const applied = parts[0];
   // A staged version from an earlier head would also undo the later changes in a proposed score.
-  const review = reviews.filter(c => c.fromVersion === appliedVersion).at(-1);
+  // One staged on an earlier part is applied onto the head the pass had reached by then.
+  const review = reviews.filter(c => c.fromVersion === appliedVersion || (c.state === "approved" && c.appliedOnto === appliedVersion)).at(-1);
+  // What the task left playing: every change of its own that landed, in order, the staged cuts it applied with its picks
+  // and the closing check's repairs among them. A pass applied eleven held cuts and made six repairs after the version
+  // scored as applied, and its restarts and silences were counted as if it had done neither (2026-11-16).
+  let finalVersion = appliedVersion;
+  const landed = owned.filter(c => c.state === "approved" && (c.appliedVersion ?? (c.intent === "requested" ? c.toVersion : undefined)));
+  for (const seen = new Set<string>();;) {
+    const next = landed.find(c => !seen.has(c.id) && (c.appliedOnto ?? c.fromVersion) === finalVersion);
+    if (!next) break;
+    seen.add(next.id);
+    finalVersion = next.appliedVersion ?? next.toVersion;
+  }
   // The last submission on each version of the chain is the plan that version's part applied.
   const chain = [source, ...parts.map(p => p.appliedVersion ?? p.toVersion)];
   const plans = chain.flatMap(v => submitted.filter(p => p.version === v).slice(-1));
@@ -69,7 +81,7 @@ async function assemble(task: TaskRecord, events: EventLike[], changes: Change[]
     timelines.set(v, tl);
     return tl;
   };
-  for (const v of new Set([source, appliedVersion, proposed, review?.fromVersion, ...chain, ...parts.map(p => p.fromVersion), ...plans.map(p => p.version)].filter((v): v is string => !!v))) {
+  for (const v of new Set([source, appliedVersion, proposed, finalVersion, review?.fromVersion, ...chain, ...parts.map(p => p.fromVersion), ...plans.map(p => p.version)].filter((v): v is string => !!v))) {
     if (partial) await timeline(v).catch(() => undefined);
     else await timeline(v);
   }
@@ -84,7 +96,7 @@ async function assemble(task: TaskRecord, events: EventLike[], changes: Change[]
     reviewSource = reviewExport ? result.source : "none";
   }
   return { task, events, projectId: project.id, fps: project.fps, media: project.media, changes, applied, parts, review, plan, plans, reviewExport, reviewSource,
-    versions: { source, applied: appliedVersion, proposed }, timelines };
+    versions: { source, applied: appliedVersion, proposed, ...(finalVersion !== appliedVersion && { final: finalVersion }) }, timelines };
 }
 
 /** Everything a finished task produced, read from the engine. */
@@ -169,7 +181,8 @@ function evaluateArtifacts(a: Artifacts, evidence: ReadonlyMap<string, MediaEvid
   const score = scoreRun({
     media: a.media,
     timelines: { source: a.timelines.get(a.versions.source)!, applied: a.timelines.get(a.versions.applied)!, proposed: a.timelines.get(a.versions.proposed)!,
-      reviewBase: a.review ? a.timelines.get(a.review.fromVersion) : undefined, plan: a.plan ? a.timelines.get(a.plan.version) : undefined },
+      reviewBase: a.review ? a.timelines.get(a.review.fromVersion) : undefined, plan: a.plan ? a.timelines.get(a.plan.version) : undefined,
+      final: a.versions.final ? a.timelines.get(a.versions.final) : undefined },
     appliedChange: a.applied, reviewChange: a.review, review: a.reviewExport, plan: a.plan,
     appliedParts: a.parts?.map(change => ({ change, from: a.timelines.get(change.fromVersion)! })),
     plans: a.plans?.map(plan => ({ plan, timeline: a.timelines.get(plan.version)! })),

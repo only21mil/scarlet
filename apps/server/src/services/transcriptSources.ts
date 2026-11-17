@@ -1,10 +1,6 @@
-import { stat } from "node:fs/promises";
-import { fileInDirectory, LOCAL_MEDIA_INPUT } from "@scarlet/render";
-import type { DialogueVoiceRoles, MediaAsset, Transcript } from "@scarlet/timeline";
-import type { Ctx } from "../context.js";
+import { LOCAL_MEDIA_INPUT } from "@scarlet/render";
+import type { DialogueVoiceRoles, Transcript } from "@scarlet/timeline";
 import { ffmpeg, ffmpegPosition, FFPROBE, run } from "../render/ffmpeg.js";
-import { clip, throttledLog } from "../logText.js";
-import { AnalysisCache } from "./analysisCache.js";
 
 const rate = 8000;
 const block = 160; // 20 ms
@@ -75,50 +71,4 @@ export async function readSourceEnergy(file: string, from: number, to: number, s
   const pcm = await ffmpeg(["-ss", ffmpegPosition(from), ...LOCAL_MEDIA_INPUT, "-i", file, "-t", String(to - from),
     "-filter_complex", filter, "-map", "[out]", "-c:a", "pcm_s16le", "-f", "s16le", "pipe:1"], { signal });
   return measureSources(pcm);
-}
-
-/** Read-only annotation for short transcript pages. A verified mix must equal
- * the two independent inputs, including passages where each input plays alone.
- * A page is read because someone asked for it, a running edit among them, so a pause of the project's media work
- * doesn't stop the read. Trash and a quit do. */
-export function transcriptSourceReader(ctx: Ctx) {
-  const streams = new AnalysisCache<string[]>(r => r.length * 100, 64 * 1024);
-  const windows = new AnalysisCache<ReturnType<typeof measureSources>>(r => r.energy.length * 64, 12 * 1024 * 1024);
-  const layouts = new Map<string, number>();
-  // Asked for with each page of a transcript, so a recording that can't be read is logged once a minute.
-  const failed = throttledLog(line => ctx.log(line));
-  return async (projectId: string, media: MediaAsset, transcript: Transcript, from: number, to: number) => {
-    const end = Math.min(to, media.duration ?? to);
-    if (from < 0 || end <= from || end - from > 60.001 || !transcript.segments.length) return transcript;
-    try {
-      const file = fileInDirectory(ctx.paths.media(projectId), media.path);
-      if (!file) return transcript;
-      const info = await stat(file);
-      const key = JSON.stringify([file, info.size, info.ctimeMs, info.mtimeMs]);
-      const labels = await streams.get(key, async () => {
-        return sourceLabels(file, ctx.projectSignal(projectId));
-      });
-      if (!labels.length) return transcript;
-      const result = await windows.get(JSON.stringify([key, from, end]), async () => {
-        return readSourceEnergy(file, from, end, ctx.projectSignal(projectId));
-      });
-      if (result.mix !== undefined) {
-        if (layouts.size >= 64 && !layouts.has(key)) layouts.delete(layouts.keys().next().value!);
-        layouts.set(key, result.mix);
-      }
-      const roles = media.voiceRoles;
-      const confirmedMix = roles && 3 - (roles.me - 1) - (roles.other - 1);
-      const mix = result.mix ?? layouts.get(key) ?? confirmedMix;
-      if (mix === undefined) return transcript;
-      return { ...transcript, segments: transcript.segments.map(s => ({ ...s, words: s.words.map(w => {
-        const input = wordSource(result.energy, from, mix, w.start, w.end);
-        return input === undefined ? w : { ...w, audioSource: mix === confirmedMix && input + 1 === roles?.me ? "me" : mix === confirmedMix && input + 1 === roles?.other ? "other voices" : labels[input] };
-      }) })) };
-    } catch (error) {
-      if (!ctx.projectSignal(projectId).aborted) {
-        failed(media.id, `[media] ${media.id} couldn’t tell which input each word came from: ${clip((error as Error).message, 300)}`);
-      }
-      return transcript;
-    }
-  };
 }

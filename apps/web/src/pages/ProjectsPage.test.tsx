@@ -266,7 +266,7 @@ it("manages a project from either library layout", async () => {
   const previous = useProjectStore.getState();
   const db = buildDb();
   const project = db.projects.find(p => p.id === PRJ)!;
-  const summary = { ...db.summaries[PRJ]!, name: "Interview" };
+  const summary = { ...db.summaries[PRJ]!, name: "Interview", poster: null };
   vi.spyOn(api, "projects").mockResolvedValue({ projects: [summary] });
   useProjectStore.setState({ list: [summary], listStatus: "ready", current: null });
   vi.spyOn(api, "settings").mockResolvedValue({ settings: db.settings });
@@ -287,7 +287,16 @@ it("manages a project from either library layout", async () => {
   try {
     await act(async () => root.render(<MemoryRouter><ProjectsPage /></MemoryRouter>));
     expect(container.querySelector(".library-count")).toBeNull();
+    await actions();
+    expect(textButton("Pause")?.title).toBe("Pause media processing");
+    await tap(textButton("Pause"));
+    expect(update).toHaveBeenLastCalledWith(PRJ, { mediaPaused: true });
+    expect(useProjectStore.getState().list[0]?.mediaPaused).toBe(true);
     await tap(container.querySelector('[aria-label="Grid view"]'));
+    await actions();
+    expect(textButton("Resume")?.title).toBe("Resume media processing");
+    await tap(textButton("Resume"));
+    expect(update).toHaveBeenLastCalledWith(PRJ, { mediaPaused: false });
     await actions(); await tap(textButton("Archive"));
     expect(update).toHaveBeenLastCalledWith(PRJ, { archived: true });
     expect(container.querySelector(".project-link")).toBeNull();
@@ -628,7 +637,7 @@ it("queues a link on Enter and closes its dialog at once, while the link still d
     await enter();
     // The link joined the project's queue, remembered like a file until it is in. The dialog didn't wait for it:
     // it closed with the field empty, and nothing in it spins or is switched off.
-    expect(imports).toHaveBeenCalledExactlyOnceWith(PRJ, { url: link, importId: pendingImports(PRJ)[0]?.importId });
+    expect(imports).toHaveBeenCalledExactlyOnceWith(PRJ, { url: link, importId: pendingImports(PRJ)[0]?.importId }, expect.any(AbortSignal));
     expect(pendingImports(PRJ).map(i => i.source)).toEqual([link]);
     expect(onClose).toHaveBeenCalledOnce();
     expect(field.value).toBe("");

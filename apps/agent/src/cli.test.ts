@@ -51,7 +51,9 @@ case "$*" in
   --version) echo "2.1.0 (Claude Code)" ;;
   "auth status") echo '{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max"}' ;;
   "auth login --claudeai") exit "\${FAKE_CLAUDE_LOGIN:-0}" ;;
-  *--input-format*) cat > /dev/null ;;
+  *--input-format*)
+    cat > /dev/null
+    echo '{"type":"control_response","response":{"subtype":"success","request_id":"catalog","response":{"models":[{"value":"opus","displayName":"Opus"}]}}}' ;;
   *)
     cat > /dev/null
     echo '{"type":"system","subtype":"init","session_id":"s1","mcp_servers":[{"name":"scarlet","status":"connected"}]}'

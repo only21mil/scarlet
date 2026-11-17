@@ -11,5 +11,7 @@ export * from "./threadTimeline.js";
 export * from "./revisionState.js";
 export * from "./transcriptSearch.js";
 export * from "./adjacentRepeats.js";
+export * from "./restarts.js";
+export * from "./joinFragments.js";
 export * from "./capabilities.js";
 export * from "./editKind.js";

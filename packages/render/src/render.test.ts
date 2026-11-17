@@ -4,7 +4,7 @@ import syncFs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { applyOps, createProject, makeMediaClip, planPlaybackSegments, planSegments, timelineFromKeepRanges } from "@scarlet/timeline";
+import { applyOps, createProject, makeMediaClip, planPlaybackSegments, planSegments, spanningSections, timelineFromKeepRanges } from "@scarlet/timeline";
 import type { MediaClip, Project, Timeline } from "@scarlet/timeline";
 import * as ffmpeg from "./exec.js";
 import {
@@ -41,6 +41,7 @@ import {
   segmentKey,
   snapRange,
   spawnStats,
+  timelinePreviewDecoder,
   usesRevisedProxyClock,
   waveformFromCache,
   wrapText,
@@ -419,6 +420,21 @@ it("keeps a delayed microphone aligned with the picture in a preview and a deliv
   }
 });
 
+it("handles cancellation while FFmpeg is writing a proxy checkpoint", async () => {
+  const input = path.join(dir, "cancel-proxy-source.mp4");
+  const output = path.join(dir, "cancel-proxy-output.mp4");
+  const checkpointDir = path.join(dir, "cancel-proxy-parts");
+  await runCapture("ffmpeg", ["-v", "error", "-f", "lavfi", "-i", "testsrc2=s=32x32:r=30:d=32",
+    "-c:v", "libx264", input]);
+  const controller = new AbortController();
+  // The first progress report comes from FFmpeg, before the checkpoint is published.
+  await expect(makeProxy(input, output, { height: 32, checkpointDir, signal: controller.signal,
+    onProgress: () => controller.abort(),
+  })).rejects.toMatchObject({ name: "AbortError" });
+  expect(await fs.readdir(path.join(checkpointDir, "libx264-32"))).toEqual([]);
+  expect(syncFs.existsSync(output)).toBe(false);
+});
+
 it("reuses the last completed proxy section after interruption and preserves the audio clock", async () => {
   const input = path.join(dir, "long.mp4"), output = path.join(dir, "preview.mp4");
   await runCapture("ffmpeg", ["-v", "error", "-f", "lavfi", "-i", "testsrc2=s=32x32:r=30000/1001:d=32",
@@ -781,6 +797,13 @@ describe("render", () => {
     expect(fallback?.exact).not.toBe(true);
     if (fallback) expect(await fs.realpath(fallback.file)).not.toBe(await fs.realpath(outside));
     expect(resolveFontFile("Inter", { fontFile: outside })).toEqual({ file: outside, exact: true });
+  });
+
+  it("uses threaded AVC for automatic timeline previews on supported Macs and honors explicit decoders", () => {
+    expect(timelinePreviewDecoder("auto", "videotoolbox")).toBe(ffmpeg.threadedAvcPreview ? "videotoolbox-hevc" : "videotoolbox");
+    expect(timelinePreviewDecoder("videotoolbox", "videotoolbox")).toBe("videotoolbox");
+    expect(timelinePreviewDecoder("auto", "cuda")).toBe("cuda");
+    expect(timelinePreviewDecoder("none", undefined)).toBeUndefined();
   });
 
   it("uses the probed playback codec for hardware decoding older imports", async () => {
@@ -2165,3 +2188,43 @@ it("expands quiet dialogue downward while leaving a loud passage at unity", asyn
   expect(stdout.readFloatLE(24000 * 4)).toBeCloseTo(0.001 * 10 ** (-12 / 20), 5);
   expect(stdout.readFloatLE(72000 * 4)).toBeCloseTo(0.5, 4);
 });
+
+it("assembles a cut's preview window from cached playback sections and encodes only the sections a cut changed", async () => {
+  const project = createProject("Windows", { width: 320, height: 180, fps: 30, aspect: "custom" });
+  // A source with its content hash, as an imported recording has: its sections are keyed by footage, not placement.
+  project.media.push({ id: "m1", kind: "video", name: "src.mp4", path: "src.mp4", hash: "window-source", duration: 10, fps: 30, width: 320, height: 180, hasAudio: true });
+  const before = timelineFromKeepRanges(project.id, "m1", [{ start: 0, end: 10 }, { start: 0, end: 10 }]);
+  // One second out of the second take, 15–16 s into the video.
+  const after = timelineFromKeepRanges(project.id, "m1", [{ start: 0, end: 10 }, { start: 0, end: 5 }, { start: 6, end: 10 }]);
+  const cache = path.join(dir, "window-cache");
+  const opts = { mediaRoot: dir, quality: "preview" as const, height: 180 };
+  const window = (timeline: Timeline, start: number, end: number) => spanningSections(planPlaybackSegments(project, timeline), { start, end })!;
+  const render = (timeline: Timeline, range: { start: number; end: number }, name: string) =>
+    renderFullCached(project, timeline, cache, path.join(dir, name), { ...opts, exportRange: range });
+
+  const first = window(before, 5, 9);
+  expect(first).toEqual({ start: 4, end: 14 });
+  const played = await render(before, first, "window-1.mp4");
+  expect([played.rendered, played.reused]).toEqual([2, 0]);
+  // The next window shares a section with the one before it.
+  const next = await render(before, window(before, 9, 16), "window-2.mp4");
+  expect([next.rendered, next.reused]).toEqual([1, 1]);
+  // After the cut, the section before the join covers the same footage and is copied. Only the join's is encoded.
+  const join = window(after, 12, 16);
+  expect(join).toEqual({ start: 8, end: 19 });
+  const cut = await render(after, join, "window-3.mp4");
+  expect([cut.rendered, cut.reused]).toEqual([1, 1]);
+  const file = path.join(dir, "window-3.mp4");
+  const frames = Number((await runCapture("ffprobe", ["-v", "error", "-count_frames", "-select_streams", "v:0",
+    "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", file])).stdout.toString().trim());
+  expect(frames).toBe(11 * 30);
+  // The sound runs the length of the window across the copied and the encoded section: the file says so, and decoding
+  // it gives the whole window and no more than its packets hold. How much of each section's encoder lead-in a decode
+  // drops differs between ffmpeg builds (1,792 samples over on one, 2,432 on another), so the count isn't held to a tolerance.
+  const audio = JSON.parse((await runCapture("ffprobe", ["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=duration,nb_frames",
+    "-of", "json", file])).stdout.toString()).streams[0] as { duration: string; nb_frames: string };
+  expect(Number(audio.duration)).toBeCloseTo(11, 2);
+  const sound = await runCapture("ffmpeg", ["-v", "error", "-i", file, "-vn", "-ac", "1", "-ar", "48000", "-f", "s16le", "-"]);
+  expect(sound.stdout.length / 2).toBeGreaterThanOrEqual(11 * 48000 - 1024);
+  expect(sound.stdout.length / 2).toBeLessThanOrEqual(Number(audio.nb_frames) * 1024);
+}, 60_000);

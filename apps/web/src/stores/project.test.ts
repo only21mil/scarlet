@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { fullRenderContext, type Learning, type ProjectDetail, type TaskEvent } from "@scarlet/shared";
+import { fullRenderContext, type ActivityEntry, type Learning, type ProjectDetail, type TaskEvent } from "@scarlet/shared";
 import { api } from "../lib/client";
 import { leaveProject, startRealtime } from "../lib/realtime";
 import { buildDb, PRJ } from "../lib/mock/fixtures";
@@ -79,7 +79,7 @@ it("opens the monitor from one snapshot while preserving edits and imports that 
   expect(reread).not.toHaveBeenCalled();
 });
 
-it("resnapshots after subscribing when the socket connects during a first project read", async () => {
+it("resnapshots after subscribing when the socket connects during a first project read made without one", async () => {
   let socket!: TestSocket;
   class TestSocket {
     static OPEN = 1;
@@ -99,9 +99,10 @@ it("resnapshots after subscribing when the socket connects during a first projec
   vi.spyOn(api, "changes").mockResolvedValue({ changes: [] });
   vi.spyOn(api, "notes").mockResolvedValue({ notes: [] });
   vi.spyOn(api, "tasks").mockResolvedValue({ tasks: [] });
+  // The read begins before there is any connection to wait for.
+  const first = initial.load(PRJ);
   const stop = startRealtime();
   try {
-    const first = initial.load(PRJ);
     socket.readyState = TestSocket.OPEN;
     socket.onopen!();
     finishOld({ project, timeline: null });
@@ -111,6 +112,46 @@ it("resnapshots after subscribing when the socket connects during a first projec
     socket.onmessage!({ data: JSON.stringify({ type: "project.subscribed", projectId: PRJ, found: true }) });
     await vi.waitFor(() => expect(useProjectStore.getState().current?.project.name).toBe("After reconnect"));
     expect(read).toHaveBeenCalledTimes(2);
+  } finally {
+    leaveProject(PRJ);
+    stop();
+    vi.unstubAllGlobals();
+  }
+});
+
+it("reads a project opened while the socket connects once, after the engine confirms it is listening", async () => {
+  let socket!: TestSocket;
+  class TestSocket {
+    static OPEN = 1;
+    readyState = 0;
+    onopen?: () => void;
+    onmessage?: (event: { data: string }) => void;
+    send = vi.fn();
+    close = vi.fn();
+    constructor() { socket = this; }
+  }
+  vi.stubGlobal("WebSocket", TestSocket);
+  const db = buildDb();
+  const project = db.projects.find(p => p.id === PRJ)!;
+  const read = vi.spyOn(api, "workspace").mockResolvedValue({ project, timeline: null });
+  vi.spyOn(api, "changes").mockResolvedValue({ changes: [] });
+  vi.spyOn(api, "notes").mockResolvedValue({ notes: [] });
+  vi.spyOn(api, "tasks").mockResolvedValue({ tasks: [] });
+  const stop = startRealtime();
+  try {
+    const first = initial.load(PRJ);
+    await Promise.resolve();
+    // Nothing is read until the connection opens and the engine says it is listening.
+    expect(read).not.toHaveBeenCalled();
+    socket.readyState = TestSocket.OPEN;
+    socket.onopen!();
+    expect(socket.send).toHaveBeenCalledExactlyOnceWith(JSON.stringify({ type: "subscribe", projectId: PRJ }));
+    expect(read).not.toHaveBeenCalled();
+    socket.onmessage!({ data: JSON.stringify({ type: "project.subscribed", projectId: PRJ, found: true }) });
+    await first;
+    expect(useProjectStore.getState().current?.project).toEqual(project);
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(api.changes).toHaveBeenCalledTimes(1);
   } finally {
     leaveProject(PRJ);
     stop();
@@ -147,6 +188,200 @@ it("keeps the last opened project when an earlier load or head refresh finishes 
   for (const resolve of release) resolve(detail);
   await Promise.all([refresh, reload]);
   expect(useProjectStore.getState().current).toMatchObject({ id: other.project.id, project: other.project });
+});
+
+it("keeps a newer project update when the timeline refresh for its head finishes", async () => {
+  const { current, project } = open();
+  const moved = { ...project, head: "next", mediaPaused: false };
+  const timeline = { ...current.timeline!, version: "next" };
+  let release!: (detail: Pick<ProjectDetail, "project" | "timeline">) => void;
+  const read = vi.spyOn(api, "workspace").mockImplementation(() => new Promise(resolve => { release = resolve; }));
+  initial.applyEvent({ type: "project.updated", projectId: PRJ, project: moved });
+  expect(read).toHaveBeenCalledExactlyOnceWith(PRJ);
+
+  const paused = { ...moved, mediaPaused: true };
+  vi.spyOn(api, "updateProject").mockImplementation(async () => {
+    initial.applyEvent({ type: "project.updated", projectId: PRJ, project: paused });
+    return { project: paused };
+  });
+  await initial.updateProject({ mediaPaused: true });
+  release({ project: moved, timeline });
+
+  await vi.waitFor(() => expect(store().timeline).toBe(timeline));
+  expect(store().project).toEqual(paused);
+});
+
+it("reads a burst of new working cuts once more after the read that is out, not once each", async () => {
+  const { current, project } = open();
+  const release: Array<(detail: Pick<ProjectDetail, "project" | "timeline">) => void> = [];
+  const read = vi.spyOn(api, "workspace").mockImplementation(() => new Promise(resolve => release.push(resolve)));
+  for (const head of ["h1", "h2", "h3"]) initial.applyEvent({ type: "project.updated", projectId: PRJ, project: { ...project, head } });
+  const asked = initial.refreshHead(PRJ);
+  expect(read).toHaveBeenCalledTimes(1);
+  release[0]!({ project: { ...project, head: "h1" }, timeline: { ...current.timeline!, version: "h1" } });
+  await vi.waitFor(() => expect(read).toHaveBeenCalledTimes(2));
+  const last = { ...current.timeline!, version: "h3" };
+  release[1]!({ project: { ...project, head: "h3" }, timeline: last });
+  // Every caller waits for the read that began after it asked.
+  await asked;
+  expect(store().timeline).toBe(last);
+  expect(read).toHaveBeenCalledTimes(2);
+  // The burst is over: the next new working cut is read at once.
+  initial.applyEvent({ type: "project.updated", projectId: PRJ, project: { ...project, head: "h4" } });
+  expect(read).toHaveBeenCalledTimes(3);
+  release[2]!({ project: { ...project, head: "h4" }, timeline: { ...current.timeline!, version: "h4" } });
+  await vi.waitFor(() => expect(store().timeline?.version).toBe("h4"));
+});
+
+it.each([2, 3, 4])("uses the latest authoritative project when the head refresh returns revision %s", async rowRevision => {
+  const { current, project } = open();
+  const original = { ...project, rowRevision: 1 };
+  useProjectStore.setState({ current: { ...current, project: original } });
+  const read = { ...original, rowRevision, mediaPaused: rowRevision >= 3,
+    settings: { ...project.settings, fps: rowRevision === 4 ? 24 : 30 } };
+  const paused = { ...original, rowRevision: 3, mediaPaused: true };
+  let release!: (detail: Pick<ProjectDetail, "project" | "timeline">) => void;
+  vi.spyOn(api, "workspace").mockImplementation(() => new Promise(resolve => { release = resolve; }));
+  const refresh = initial.refreshHead();
+  initial.applyEvent({ type: "project.updated", projectId: PRJ, project: paused });
+  release({ project: read, timeline: current.timeline });
+  await refresh;
+
+  const expected = rowRevision === 4 ? read : paused;
+  expect(store().project).toEqual(expected);
+  // A queued socket event can describe an earlier project than the GET already showed.
+  initial.applyEvent({ type: "project.updated", projectId: PRJ, project: { ...original, rowRevision: 2 } });
+  expect(store().project).toEqual(expected);
+});
+
+it.each([true, false])("keeps both fetched settings and a concurrent filing decision (%s)", async done => {
+  const { current, project } = open();
+  const before: ProjectData["project"] = { ...project, completedThreads: done ? {} : { thread_a: "old revision" } };
+  useProjectStore.setState({ current: { ...current, project: before } });
+  const fetched = { ...before, settings: { ...project.settings, fps: 24 },
+    completedThreads: { ...before.completedThreads, other_thread: "new revision" } };
+  let release!: (detail: Pick<ProjectDetail, "project" | "timeline">) => void;
+  vi.spyOn(api, "workspace").mockImplementation(() => new Promise(resolve => { release = resolve; }));
+  vi.spyOn(api, "setThreadDone").mockResolvedValue({ completedThreads: done ? { thread_a: "filed revision" } : {} });
+  const refresh = initial.refreshHead();
+  await initial.setThreadDone("thread_a", done, "filed revision");
+  release({ project: fetched, timeline: current.timeline });
+  await refresh;
+
+  expect(store().project.settings).toEqual(fetched.settings);
+  expect(store().project.completedThreads).toEqual({ other_thread: "new revision", ...(done && { thread_a: "filed revision" }) });
+});
+
+it("uses a newer workspace snapshot when a full filing event arrives during the read", async () => {
+  const { current, project } = open();
+  const before = { ...project, rowRevision: 1, completedThreads: {} };
+  useProjectStore.setState({ current: { ...current, project: before } });
+  const filed = { ...before, rowRevision: 2, completedThreads: { thread_a: "filed revision" } };
+  const fetched = { ...before, rowRevision: 3, settings: { ...project.settings, fps: 24 } };
+  let release!: (detail: Pick<ProjectDetail, "project" | "timeline">) => void;
+  vi.spyOn(api, "workspace").mockImplementation(() => new Promise(resolve => { release = resolve; }));
+  const refresh = initial.refreshHead();
+  initial.applyEvent({ type: "project.updated", projectId: PRJ, project: filed });
+  release({ project: fetched, timeline: current.timeline });
+  await refresh;
+
+  expect(store().project).toEqual(fetched);
+});
+
+it.each([2, 4])("uses the newest project after a filing response carrying revision %s", async rowRevision => {
+  const { current, project } = open();
+  const before = { ...project, rowRevision: 1, completedThreads: {} };
+  useProjectStore.setState({ current: { ...current, project: before } });
+  const intermediate = { ...before, rowRevision: 3, mediaPaused: true };
+  const filed = { ...before, rowRevision, completedThreads: { thread_a: "filed revision" },
+    settings: { ...before.settings, fps: 24 } };
+  let release!: (response: { completedThreads: Record<string, string>; project: ProjectData["project"] }) => void;
+  vi.spyOn(api, "setThreadDone").mockImplementation(() => new Promise(resolve => { release = resolve; }));
+  const filing = initial.setThreadDone("thread_a", true, "filed revision");
+  initial.applyEvent({ type: "project.updated", projectId: PRJ, project: intermediate });
+  release({ project: filed, completedThreads: filed.completedThreads });
+  await filing;
+
+  expect(store().project).toEqual(rowRevision === 4 ? filed : intermediate);
+});
+
+it("keeps live media when a filing response carries an older copy of it", async () => {
+  const { current, project } = open();
+  const media = current.media[0]!;
+  const before = { ...project, rowRevision: 1, media: [media] };
+  useProjectStore.setState({ current: { ...current, project: before, media: [media] } });
+  const filed = { ...before, rowRevision: 2, completedThreads: { thread_a: "filed revision" } };
+  let release!: (response: { completedThreads: Record<string, string>; project: ProjectData["project"] }) => void;
+  vi.spyOn(api, "setThreadDone").mockImplementation(() => new Promise(resolve => { release = resolve; }));
+  const filing = initial.setThreadDone("thread_a", true, "filed revision");
+  const transcribed = { ...media, transcriptId: "trs_new" };
+  initial.applyEvent({ type: "media.updated", projectId: PRJ, media: transcribed });
+  release({ project: filed, completedThreads: filed.completedThreads });
+  await filing;
+
+  expect(store().project).toMatchObject({ ...filed, media: [transcribed] });
+  expect(store().media).toEqual([transcribed]);
+});
+
+it.each(["rename fails before refresh", "refresh finishes before rename fails"])("keeps a format read during a refused rename when %s", async order => {
+  const { current, project } = open();
+  const engine = { ...project, settings: { ...project.settings, fps: 24 },
+    updatedAt: new Date(Date.parse(project.updatedAt!) + 1000).toISOString() };
+  let release!: (detail: Pick<ProjectDetail, "project" | "timeline">) => void;
+  vi.spyOn(api, "workspace").mockImplementation(() => new Promise(resolve => { release = resolve; }));
+  let reject!: (err: Error) => void;
+  vi.spyOn(api, "updateProject").mockImplementation(() => new Promise((_resolve, fail) => { reject = fail; }));
+  const refresh = initial.refreshHead();
+  const renaming = initial.updateProject({ name: "Pending name" });
+  expect(store().project.name).toBe("Pending name");
+  const refuse = async () => {
+    reject(new Error("Rename failed"));
+    await expect(renaming).rejects.toThrow("Rename failed");
+  };
+  if (order === "rename fails before refresh") await refuse();
+  release({ project: engine, timeline: current.timeline });
+  await refresh;
+  if (order === "refresh finishes before rename fails") {
+    expect(store().project.name).toBe("Pending name");
+    await refuse();
+  }
+  expect(store().project).toEqual(engine);
+});
+
+it.each(["an undo", "an approval"] as const)("keeps a rename still being saved over the project %s brings, and lets it go if refused", async action => {
+  const { db, project } = open();
+  const prior = { ...db.changes.find(c => c.state === "ready")!, projectId: PRJ };
+  useProjectStore.setState({ current: { ...store(), changes: [prior] } });
+  const moved = { ...project, head: "v_moved" };
+  vi.spyOn(api, "workspace").mockImplementation(async () => ({ project: moved, timeline: null }));
+  vi.spyOn(api, "historyEdit").mockResolvedValue({ project: moved, change: { ...prior, toVersion: "v_moved" } });
+  vi.spyOn(api, "approveChange").mockResolvedValue({ change: { ...prior, state: "approved" }, project: moved, outcome: "applied" });
+  let refuse!: (err: Error) => void;
+  vi.spyOn(api, "updateProject").mockImplementation(() => new Promise((_resolve, fail) => { refuse = fail; }));
+  const renaming = initial.updateProject({ name: "Pending name" });
+  if (action === "an undo") await initial.historyEdit("v_old", "revert");
+  else await initial.approve(prior.id);
+  expect(store().project).toEqual({ ...moved, name: "Pending name" });
+  // Refused, the name the engine has comes back, on the project as it is now.
+  refuse(new Error("Rename failed"));
+  await expect(renaming).rejects.toThrow("Rename failed");
+  expect(store().project).toEqual(moved);
+});
+
+it("keeps a filing an older engine confirmed over the project an undo read before it", async () => {
+  const { db, project } = open();
+  const change = { ...db.changes[0]!, projectId: PRJ, toVersion: "v_moved" };
+  const moved = { ...project, head: "v_moved", completedThreads: {} };
+  let read!: (detail: Pick<ProjectDetail, "project" | "timeline">) => void;
+  vi.spyOn(api, "historyEdit").mockResolvedValue({ project: moved, change });
+  vi.spyOn(api, "workspace").mockImplementation(() => new Promise(resolve => { read = resolve; }));
+  vi.spyOn(api, "setThreadDone").mockResolvedValue({ completedThreads: { thread_a: "filed revision" } });
+  const undoing = initial.historyEdit("v_old", "revert");
+  await vi.waitFor(() => expect(api.workspace).toHaveBeenCalled());
+  await initial.setThreadDone("thread_a", true, "filed revision");
+  read({ project: moved, timeline: null });
+  await undoing;
+  expect(store().project).toEqual({ ...moved, completedThreads: { thread_a: "filed revision" } });
 });
 
 it("preserves a ready media event that beats the import response", () => {
@@ -679,6 +914,32 @@ it("leaves the activity log alone until it has been opened", () => {
   expect(store().activity).toBeUndefined();
 });
 
+it("merges activity received during the first history read without duplicates or reordering", async () => {
+  open();
+  const entry = (id: string, second: number): ActivityEntry => ({ id, projectId: PRJ, actor: { type: "scarlet", name: "Scarlet" },
+    type: "change.approved", summary: id, data: {}, createdAt: new Date(second * 1000).toISOString() });
+  const activity = Array.from({ length: 200 }, (_, index) => entry(`page_${String(200 - index).padStart(3, "0")}`, 1));
+  const newest = entry("newest", 2), earlier = entry("new_earlier", 1);
+  const repeated = activity[1]!;
+  let release!: (response: { activity: ActivityEntry[] }) => void;
+  const read = vi.spyOn(api, "activity").mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+  const reading = initial.loadActivity();
+  for (const value of [earlier, newest, repeated, newest]) initial.applyEvent({ type: "activity.added", projectId: PRJ, entry: value });
+  expect(store().activity).toBeUndefined();
+  release({ activity });
+
+  await reading;
+  expect(store().activity).toEqual([newest, ...activity, earlier]);
+  expect(store().activityComplete).toBe(false);
+  // One live event sorts below the page's last ID but must not skip the same-timestamp IDs before it.
+  const between = entry("order", 1), old = entry("old", 0);
+  read.mockResolvedValueOnce({ activity: [between, earlier, old] });
+  await initial.loadActivity(true);
+  expect(read).toHaveBeenLastCalledWith(PRJ, { before: activity.at(-1)!.createdAt, beforeId: activity.at(-1)!.id, limit: 200 });
+  expect(store().activity).toEqual([newest, ...activity, between, earlier, old]);
+  expect(store().activityComplete).toBe(true);
+});
+
 it("keeps a speaker's progress as it was when the engine repeats it, so its clock isn't restarted", () => {
   open();
   vi.spyOn(Date, "now").mockReturnValue(1000);
@@ -1018,6 +1279,85 @@ it("reads the library again when a project was made while a read was out, so the
   await loading;
   expect(read).toHaveBeenCalledTimes(2);
   expect(useProjectStore.getState().list.map(p => p.id)).toEqual(["prj_new", PRJ]);
+});
+
+it("discards a Projects read from before Stop finished, even after leaving the editor", async () => {
+  const { db, project } = open();
+  const task = { ...db.tasks.find(t => t.kind === "edit")!, state: "cancelled" as const };
+  const summary = db.summaries[PRJ]!;
+  const transcribing = { kind: "transcribing" as const, count: 1 };
+  const editing = { ...summary, activity: [{ kind: "editing" as const, count: 1 }, transcribing] };
+  const afterStop = { ...summary, activity: [transcribing] };
+  let finishStop!: (response: Awaited<ReturnType<typeof api.stopEditing>>) => void;
+  let finishRead!: (response: { projects: typeof editing[] }) => void;
+  vi.spyOn(api, "stopEditing").mockImplementation(() => new Promise(resolve => { finishStop = resolve; }));
+  const read = vi.spyOn(api, "projects").mockImplementationOnce(() => new Promise(resolve => { finishRead = resolve; }))
+    .mockResolvedValue({ projects: [afterStop] });
+
+  const stop = initial.stopEditing(PRJ);
+  useProjectStore.setState({ current: null });
+  const loading = initial.loadList();
+  finishStop({ project: { ...project, editingPaused: true }, tasks: [task] });
+  await stop;
+  const published = vi.fn();
+  const unsubscribe = useProjectStore.subscribe(state => published(state.list));
+  try {
+    finishRead({ projects: [editing] });
+    await loading;
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(published).toHaveBeenCalledExactlyOnceWith([afterStop]);
+    expect(useProjectStore.getState().list).toEqual([afterStop]);
+  } finally {
+    unsubscribe();
+  }
+});
+
+it("releases the queue after Stop settles and keeps newer project details", async () => {
+  const { db, project } = open();
+  const running = { ...db.tasks.find(t => t.kind === "edit")!, projectId: PRJ, state: "running" as const };
+  const cancelled = { ...running, state: "cancelled" as const };
+  const queued = { ...running, id: "tsk_waiting", state: "queued" as const };
+  useProjectStore.setState({ current: { ...store(), tasks: [running, queued] } });
+  let finishStop!: (response: Awaited<ReturnType<typeof api.stopEditing>>) => void;
+  const paused = { ...project, editingPaused: true, rowRevision: 1 };
+  vi.spyOn(api, "stopEditing").mockImplementation(() => new Promise(resolve => { finishStop = resolve; }));
+  const sendResume = vi.spyOn(api, "resumeEditing").mockResolvedValue({ project: { ...project, name: "Renamed meanwhile", rowRevision: 3, editingPaused: false }, tasks: [] });
+  const stop = initial.stopEditing(PRJ);
+  // The engine can publish the pause before it answers the Stop request, already showing Continue.
+  initial.applyEvent({ type: "project.updated", projectId: PRJ, project: { ...paused, name: "Renamed meanwhile", rowRevision: 2 } });
+  const resume = initial.resumeEditing(PRJ);
+  expect(sendResume).not.toHaveBeenCalled();
+  finishStop({ project: paused, tasks: [cancelled] });
+  await Promise.all([stop, resume]);
+  expect(sendResume).toHaveBeenCalledExactlyOnceWith(PRJ);
+  expect(store().project).toMatchObject({ editingPaused: false, name: "Renamed meanwhile" });
+  expect(store().tasks).toEqual([cancelled, queued]);
+});
+
+it("keeps the pause when a timeline read that began before Stop finishes late", async () => {
+  const { project, current } = open();
+  let finishRead!: (response: Awaited<ReturnType<typeof api.workspace>>) => void;
+  vi.spyOn(api, "workspace").mockImplementation(() => new Promise(resolve => { finishRead = resolve; }));
+  vi.spyOn(api, "stopEditing").mockResolvedValue({ project: { ...project, editingPaused: true }, tasks: [] });
+  const read = initial.refreshHead(PRJ);
+  await initial.stopEditing(PRJ);
+  finishRead({ project: { ...project, editingPaused: false }, timeline: current.timeline });
+  await read;
+  expect(store().project.editingPaused).toBe(true);
+});
+
+it("keeps the continuation's newer socket state when the Stop response arrives", async () => {
+  const { db, project } = open();
+  const running = { ...db.tasks.find(t => t.kind === "edit")!, projectId: PRJ, state: "running" as const };
+  const held = { ...running, id: "tsk_held", state: "queued" as const, resumeRootId: running.id, resumesAfterProjectStop: true };
+  useProjectStore.setState({ current: { ...store(), tasks: [running] } });
+  let finishStop!: (response: Awaited<ReturnType<typeof api.stopEditing>>) => void;
+  vi.spyOn(api, "stopEditing").mockImplementation(() => new Promise(resolve => { finishStop = resolve; }));
+  const stop = initial.stopEditing(PRJ);
+  initial.applyEvent({ type: "task.updated", projectId: PRJ, task: { ...held, state: "cancelled" } });
+  finishStop({ project: { ...project, editingPaused: true }, tasks: [{ ...running, state: "cancelled", retryTaskId: held.id }, held] });
+  await stop;
+  expect(store().tasks).toEqual([{ ...running, state: "cancelled", retryTaskId: held.id }, { ...held, state: "cancelled" }]);
 });
 
 it("says a project is in the trash when it can't be opened because it was deleted", async () => {

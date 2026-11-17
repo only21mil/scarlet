@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { Change, makeMediaClip, makeTrack, timelineFromKeepRanges, type Timeline } from "@scarlet/timeline";
-import { editKinds } from "./editKind.js";
+import { classifyEdits, editKinds } from "./editKind.js";
 
 const base = timelineFromKeepRanges("project", "interview", [{ start: 0, end: 120 }]);
 const picture = base.tracks.find(t => t.kind === "video")!;
@@ -119,6 +119,17 @@ describe("telling what an applied edit did", () => {
       { before: base, after: shorter })).toEqual(["cut", "cut"]);
   });
 
+  it("doesn't give the length a whole-video save changed to an edit it named where nothing changed", () => {
+    // Matt's pass lengthened a pickup at 9:05 and named "Pricing and model names" at 18:00, which it left as it was.
+    const longer = after(t => { t.tracks.find(k => k.kind === "video")!.clips[0]!.sourceOut = 121; });
+    const saved = { ...change([]), ranges: [{ start: 544.9, end: 546 }] };
+    expect(editKinds(saved, [{ start: 536, end: 547 }, { start: 1083, end: 1146 }], { before: base, after: longer, media: [] }, []))
+      .toEqual(["restore", "other"]);
+    // With no record of where it changed, both still go by the length.
+    expect(editKinds({ ...saved, ranges: [] }, [{ start: 536, end: 547 }, { start: 1083, end: 1146 }], { before: base, after: longer, media: [] }, []))
+      .toEqual(["restore", "restore"]);
+  });
+
   it("matches the first clip in track order when a batch edits an older timeline with duplicate ids", () => {
     const historical = after(t => {
       t.tracks[0]!.clips = [makeMediaClip("interview", 0, 2, 1, { id: "duplicate" })];
@@ -133,5 +144,48 @@ describe("telling what an applied edit did", () => {
     ]);
     expect(editKinds(batch, [1, 10, 20].map(start => ({ start, end: start + 1 })), { after: historical }))
       .toEqual(["zoom", "other", "audio"]);
+  });
+});
+
+describe("telling an edit that only left a marker for the editor", () => {
+  const todo = (time: number, text = "Add the other boat renders") => ({ op: "addMarker", marker: { id: `mk${time}`, time, kind: "todo", text } });
+  const caption = { kind: "caption", id: "t", timelineIn: 10, timelineOut: 14, text: "Hi" };
+  const captioned = after(t => { t.tracks.push(makeTrack("caption", "Captions", "cap")); });
+
+  it("calls an edit a marker only when markers are all that land on it", () => {
+    const only = classifyEdits(change([todo(12)]), [one]);
+    expect(only).toEqual({ kinds: ["other"], markers: [true], asks: ["Add the other boat renders"], restated: [true] });
+    // Text and a zoom with a marker beside them changed the video: it is a mix of edits, not a to-do.
+    const mixed = change([todo(12), { op: "addClip", trackId: "cap", clip: caption },
+      { op: "updateClip", clipId: shot.id, patch: { transform: { scale: 1.3 } } }]);
+    expect(classifyEdits(mixed, [one], { before: captioned, after: captioned })).toMatchObject({ kinds: ["other"], markers: [false] });
+    // Footage placed on the main picture builds the cut, whatever marker sits there.
+    const placed = change([todo(12), { op: "addClip", trackId: picture.id, clip: makeMediaClip("cam", 0, 10, 10) }]);
+    expect(classifyEdits(placed, [one], { before: base, after: base }).markers).toEqual([false]);
+  });
+
+  it("keeps a marker's spot a marker when a step that can't be placed did something else", () => {
+    const muted = change([todo(12), todo(60), { op: "updateTrack", trackId: "a1", patch: { muted: true } }]);
+    expect(classifyEdits(muted, [one, { start: 59.5, end: 60.5 }, { start: 100, end: 101 }]))
+      .toMatchObject({ kinds: ["other", "other", "audio"], markers: [true, true, false] });
+  });
+
+  it("knows a marker moved or rewritten, or replaced by a new one, and that one marked resolved asks nothing", () => {
+    const marked = after(t => { t.markers = [{ id: "mk", time: 12, kind: "todo", text: "Add the boat renders", resolved: false }]; });
+    const moved = after(t => { t.markers = [{ id: "mk", time: 14, kind: "todo", text: "Add the boat renders", resolved: false }]; });
+    expect(classifyEdits(change([{ op: "updateMarker", markerId: "mk", patch: { time: 14 } }]), [one], { before: marked, after: moved }))
+      .toEqual({ kinds: ["other"], markers: [true], asks: ["Add the boat renders"], restated: [false] });
+    expect(classifyEdits(change([{ op: "updateMarker", markerId: "mk", patch: { text: "Add both renders" } }]), [one], { before: marked, after: marked }))
+      .toMatchObject({ asks: ["Add both renders"], restated: [true] });
+    expect(classifyEdits(change([{ op: "removeMarker", markerId: "mk" }, todo(13, "Add both renders")]), [one]))
+      .toEqual({ kinds: ["other"], markers: [true], asks: ["Add both renders"], restated: [true] });
+    expect(classifyEdits(change([{ op: "updateMarker", markerId: "mk", patch: { resolved: true } }]), [one]).markers).toEqual([false]);
+    expect(classifyEdits(change([{ op: "removeMarker", markerId: "mk" }]), [one]).markers).toEqual([false]);
+  });
+
+  it("reads a marker beside a dialogue pass's known joins, without the joins' steps", () => {
+    const pass = change([{ op: "rippleDelete", start: 30, end: 31 }, todo(80)]);
+    expect(classifyEdits(pass, [{ start: 30, end: 30 }, { start: 80, end: 80 }], {}, [{ range: { start: 30, end: 30 } }]))
+      .toMatchObject({ kinds: ["cut", "other"], markers: [false, true] });
   });
 });

@@ -8,9 +8,11 @@ import { accessToken } from "./auth.js";
 import { createApp, type ScarletApp } from "./app.js";
 import type { Ctx } from "./context.js";
 import { logStateChanges } from "./eventLog.js";
+import { REQUEST_ID_HEADER } from "./logText.js";
 
 let dir: string, workspace: ScarletApp, api: ScarletClient;
 const lines: string[] = [];
+const withoutCorrelation = (line: string) => line.replace(/ request=[a-f0-9-]+ route=[^\s;]+(?: code=[a-z0-9_]+)?/i, "");
 
 beforeAll(async () => {
   dir = await mkdtemp(join(tmpdir(), "scarlet-event-log-"));
@@ -30,14 +32,45 @@ it("logs each request that changes something, and not a quick read", async () =>
   await api.project(project.id);
   const http = lines.filter(line => line.startsWith("[http]"));
   expect(http).toHaveLength(1);
-  expect(http[0]).toMatch(/^\[http\] POST \/api\/projects → 20\d in \d+ms$/);
+  expect(withoutCorrelation(http[0]!)).toMatch(/^\[http\] POST \/api\/projects → 20\d in \d+ms$/);
 });
 
 it("logs a request that failed with the engine's reason, and repeats of it once", async () => {
   for (let i = 0; i < 3; i++) await api.project("prj_missing").catch(() => {});
   const http = lines.filter(line => line.startsWith("[http]"));
   expect(http).toHaveLength(1);
-  expect(http[0]).toMatch(/^\[http\] GET \/api\/projects\/prj_missing → 404 in \d+ms: not_found: /);
+  expect(withoutCorrelation(http[0]!)).toMatch(/^\[http\] GET \/api\/projects\/prj_missing → 404 in \d+ms: not_found: /);
+});
+
+it("logs a tool result for its claim after it ended, without writing a task event or logging stale claims", async () => {
+  const { project } = await api.createProject({ name: "Tool diagnostics" });
+  const startedAt = "2026-11-16T16:45:00.000Z";
+  const { task } = await api.createTask(project.id, { kind: "edit", agent: "codex", instruction: "Private request" });
+  workspace.ctx.repos.tasks.put({ ...task, state: "waiting_for_user", startedAt });
+  const scoped = api.forProject(project.id, { taskId: task.id, startedAt });
+  const diagnostic = { tool: "task_question", outcome: "ok", elapsedMs: 18, evidenceMisses: 0 };
+  const path = `/projects/${project.id}/tasks/${task.id}/tool-diagnostic`;
+  await scoped.post(path, diagnostic);
+  await api.forProject(project.id, { taskId: task.id, startedAt: "2026-11-16T16:44:00.000Z" }).post(path, diagnostic);
+  expect(workspace.ctx.repos.taskEvents.list(task.id)).toEqual([]);
+  expect(lines.filter(line => line.startsWith("[mcp]"))).toEqual([
+    `[mcp] tool-finished task=${task.id} attempt=${startedAt} tool=task_question outcome=ok elapsedMs=18 evidenceMisses=0`,
+  ]);
+  // A tool that says how much it gave back has that logged too, as sizes.
+  await scoped.post(path, { ...diagnostic, tool: "transcript_get", resultChars: 48210, resultMedia: 2 });
+  expect(lines.filter(line => line.startsWith("[mcp]")).at(-1)).toBe(
+    `[mcp] tool-finished task=${task.id} attempt=${startedAt} tool=transcript_get outcome=ok elapsedMs=18 evidenceMisses=0 resultChars=48210 resultMedia=2`);
+  await expect(scoped.post(path, { ...diagnostic, tool: "Private result" })).rejects.toMatchObject({ status: 400 });
+  expect(lines.join("\n")).not.toContain("Private");
+});
+
+it("logs each usage report a run makes, so the log shows its context growing between tool results", async () => {
+  const { project } = await api.createProject({ name: "Usage" });
+  const { task } = await api.createTask(project.id, { kind: "edit", agent: "codex", instruction: "Private request" });
+  await api.recordTaskUsage(task.id, { model: "halo-alpha", inputTokens: 1200, cacheReadTokens: 480000, outputTokens: 90 });
+  expect(lines.filter(line => line.startsWith("[task] usage"))).toEqual([
+    `[task] usage task=${task.id} model=halo-alpha input=1200 cacheRead=480000 cacheWrite=0 output=90 reasoning=0`]);
+  expect(lines.join("\n")).not.toContain("Private");
 });
 
 it("logs an edit, a render and the working edit only when their state changes", () => {
@@ -63,17 +96,17 @@ it("logs an edit, a render and the working edit only when their state changes", 
   ]);
 });
 
-const http = () => lines.filter(line => line.startsWith("[http]"));
+const http = () => lines.filter(line => line.startsWith("[http]")).map(withoutCorrelation);
 function request(method: string, path: string, body?: string, init: RequestInit = {}) {
   return workspace.app.request("/api" + path, { method, body, ...init,
-    headers: { Authorization: `Bearer ${accessToken(workspace.ctx)}`, ...(body !== undefined && { "Content-Type": "application/json" }) } });
+    headers: { Authorization: `Bearer ${accessToken(workspace.ctx)}`, ...(body !== undefined && { "Content-Type": "application/json" }), ...init.headers } });
 }
 
 it("answers a body that isn't JSON with 400 and says so in the log, without the body", async () => {
   const res = await request("POST", "/projects", "{\"name\": \"Unfinished secret");
   expect(res.status).toBe(400);
   expect(await res.json()).toEqual({ error: { code: "bad_json", message: "request body is not valid JSON" } });
-  expect(lines).toEqual([expect.stringMatching(/^\[http\] POST \/api\/projects → 400 in \d+ms: bad_json: request body is not valid JSON$/)]);
+  expect(lines.map(withoutCorrelation)).toEqual([expect.stringMatching(/^\[http\] POST \/api\/projects → 400 in \d+ms: bad_json: request body is not valid JSON$/)]);
 });
 
 it("logs where a request failed validation, and never the value that was sent", async () => {
@@ -93,7 +126,7 @@ it("answers an engine fault with 500 and writes where it threw to the log", asyn
   const res = await request("POST", "/projects", JSON.stringify({ name: "Unsaved" }));
   expect(res.status).toBe(500);
   expect(await res.json()).toEqual({ error: { code: "internal_error", message: "disk I/O error" } });
-  expect(lines).toEqual([
+  expect(lines.map(withoutCorrelation)).toEqual([
     expect.stringMatching(/^\[error\] POST \/api\/projects: Error: disk I\/O error\n\s+at .*brokenInsert/),
     expect.stringMatching(/^\[http\] POST \/api\/projects → 500 in \d+ms: internal_error: disk I\/O error$/),
   ]);
@@ -116,7 +149,9 @@ it("answers work its caller cancelled with 499, and doesn't log it as an engine 
   });
   const res = await request("POST", `/projects/${project.id}/media/import-frame`, JSON.stringify({ path: import.meta.filename }), { signal: caller.signal });
   expect(res.status).toBe(499);
-  expect(lines).toEqual([expect.stringMatching(/^\[http\] POST \/api\/projects\/prj_\w+\/media\/import-frame → 499 in \d+ms; the caller had already disconnected$/)]);
+  // Only what the request itself logged: a slow runner also notes that the engine was held up meanwhile ([stall]).
+  expect(http()).toEqual([expect.stringMatching(/^\[http\] POST \/api\/projects\/prj_\w+\/media\/import-frame → 499 in \d+ms; the caller had already disconnected$/)]);
+  expect(lines.filter(line => line.startsWith("[error]"))).toEqual([]);
   // A fault that only happens to follow a disconnect is still a fault.
   vi.spyOn(workspace.ctx.render, "extractFrame").mockImplementationOnce(async function brokenDecode() { throw new Error("no decoder"); });
   expect((await request("POST", `/projects/${project.id}/media/import-frame`, JSON.stringify({ path: import.meta.filename }), { signal: AbortSignal.abort() })).status).toBe(500);
@@ -156,7 +191,7 @@ it("logs a request that held its caller for half a minute, and whether the calle
   await request("GET", `/projects/${project.id}`);
   held(200);
   await request("GET", `/projects/${project.id}`);
-  expect(lines).toEqual([
+  expect(lines.map(withoutCorrelation)).toEqual([
     `[http] slow request: GET /api/projects/${project.id} → 200 after 31s`,
     `[http] slow request: GET /api/projects/${project.id} → 200 after 45s; the caller had already disconnected`,
     `[http] GET /api/projects/${project.id} → 200 in 31s`,
@@ -164,13 +199,38 @@ it("logs a request that held its caller for half a minute, and whether the calle
   ]);
 });
 
+it("correlates a slow expected failure with its operation and refuses an untrusted request ID", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.spyOn(workspace.ctx.repos.projects, "get").mockImplementationOnce(() => {
+    vi.setSystemTime(Date.now() + 31_000);
+    return null;
+  });
+  const requestId = "daa59954-6ed7-4dc2-8faa-557c8e262d44";
+  const missing = await request("GET", "/projects/prj_slow_missing", undefined, { headers: { [REQUEST_ID_HEADER]: requestId } });
+  expect(missing.status).toBe(404);
+  expect(missing.headers.get(REQUEST_ID_HEADER)).toBe(requestId);
+  expect(lines).toEqual([expect.stringContaining(`after 31s request=${requestId} route=/api/projects/:id code=not_found`)]);
+
+  const untrusted = await request("GET", "/projects/prj_other_missing", undefined, { headers: { [REQUEST_ID_HEADER]: "private-edit-name" } });
+  const replacement = untrusted.headers.get(REQUEST_ID_HEADER);
+  expect(replacement).toMatch(/^[a-f0-9-]{36}$/);
+  expect(lines.at(-1)).toContain(`request=${replacement} route=/api/projects/:id code=not_found`);
+  expect(lines.join("\n")).not.toContain("private-edit-name");
+});
+
 /** A log listening to a bus of its own, and a way to publish to it. */
-function listening() {
+function listening(projects?: Parameters<typeof logStateChanges>[1]) {
   const bus = new EventEmitter();
   const said: string[] = [];
-  const stop = logStateChanges({ bus, log: (line: string) => said.push(line) } as unknown as Ctx);
+  const stop = logStateChanges({ bus, log: (line: string) => said.push(line) } as unknown as Ctx, projects);
   return { said, stop, publish: (event: unknown) => bus.emit("ws", event as WsEvent) };
 }
+
+it("logs the first change to a project that was already present when the engine started", () => {
+  const { said, publish } = listening([{ id: "prj_1", head: "v1", media_paused: 0 }]);
+  publish({ type: "project.updated", projectId: "prj_1", project: { id: "prj_1", head: "v2", mediaPaused: true } });
+  expect(said).toEqual(["[project] prj_1 working edit v1 → v2", "[project] prj_1 media processing paused"]);
+});
 
 it("logs footage becoming ready or failing with its reason, and not progress or a change of preview", () => {
   const { said, publish } = listening();

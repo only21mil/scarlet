@@ -280,6 +280,9 @@ describe("scarlet server", () => {
     const r = await api<{ change: Change; timeline: Timeline }>("POST", `/projects/${project.id}/changes`, {
       body: {
         description: "Lay the whole clip on V1",
+        reason: "The full clip gives the editor an untrimmed starting point.",
+        timelineEdits: [{ label: "Place the original clip", range: { start: 0, end: 6 },
+          summary: "Placed the whole clip on V1.", reason: "The full clip gives the editor an untrimmed starting point." }],
         ops: [
           {
             op: "addClip",
@@ -291,6 +294,8 @@ describe("scarlet server", () => {
     });
     expect(r.status).toBe(201);
     firstChange = r.json.change;
+    expect(firstChange.reason).toBe("The full clip gives the editor an untrimmed starting point.");
+    expect(firstChange.timelineEdits?.[0]).toMatchObject({ summary: "Placed the whole clip on V1.", reason: firstChange.reason });
     expect(firstChange.state).toBe("ready");
     expect(firstChange.ranges).toEqual([{ start: 0, end: 6 }]);
     expect(firstChange.renders).toHaveLength(1);
@@ -331,6 +336,8 @@ describe("scarlet server", () => {
     expect(await jobs()).toHaveLength(1);
     expect(approved.json.change.state).toBe("approved");
     expect(approved.json.project.head).toBe(firstChange.toVersion);
+    expect(approved.json.change.reason).toBe(firstChange.reason);
+    expect(approved.json.change.timelineEdits).toEqual(firstChange.timelineEdits);
     const versions = await api<{ versions: Array<{ version: string; isHead: boolean; duration: number }> }>("GET", `/projects/${project.id}/versions`);
     expect(versions.json.versions.find((v) => v.isHead)?.version).toBe(firstChange.toVersion);
     expect(versions.json.versions.find((v) => v.isHead)?.duration).toBe(6);

@@ -29,6 +29,18 @@ const P = "prj";
 /** One 20 s take laid end to end on V1 (and its audio comes with it). */
 const take = (): Timeline => timelineFromKeepRanges(P, "m1", [{ start: 0, end: 20 }]);
 
+it("maps later markers through both a skipped cut and the cuts already on the timeline", () => {
+  const base = take();
+  const head = applyOps(base, [{ op: "rippleDelete", start: 1, end: 3 }]);
+  const marker = (id: string, time: number): TimelineOp => ({
+    op: "addMarker", marker: { id, time, kind: "note", text: id, resolved: false },
+  });
+  const ops: TimelineOp[] = [marker("first", 5), { op: "rippleDelete", start: 6, end: 9 }, marker("second", 10)];
+  const replayed = replayOps(base, ops, head, i => i !== 1);
+  expect(replayed.markers.map(m => [m.id, m.time])).toEqual([["first", 3], ["second", 11]]);
+  expect(head.markers).toEqual([]);
+});
+
 it("preserves unrelated marker fields and refuses stale changes to the same field", () => {
   const base = take();
   base.markers.push({ id: "beat", time: 12, text: "First", kind: "note", resolved: false });

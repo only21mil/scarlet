@@ -1,18 +1,29 @@
 import { Hono } from "hono";
 import { checkAttachments } from "../services/graphics.js";
 import { z } from "zod/v3";
-import { CompleteTaskRequest, CreateTaskRequest, queueWait, RecordTaskUsageRequest, RepeatAuditRequest, RewordTaskRequest, RunChoice, TaskEvent, TaskState, UsageGroupBy, type Task } from "@scarlet/shared";
+import { CompleteTaskRequest, CreateTaskRequest, EDITING_TOOL_GROUPS, queueWaits, RecordTaskUsageRequest, RepeatAuditRequest, RewordTaskRequest, RunChoice, TaskEvent, TaskState, UsageGroupBy, type Task } from "@scarlet/shared";
 import type { AppEnv } from "../auth.js";
 import type { Ctx } from "../context.js";
 import { badRequest, conflict, notFound } from "../errors.js";
 import { waitFor } from "../events.js";
-import { aboutStagedCut, appendTaskEvent, cancelTask, completeTask, createTask, followUpInstruction, holdForRewording, rewordTask, saveTask, startBeforeCalls, taskPrompt } from "../services/tasks.js";
+import { aboutStagedCut, appendTaskEvent, cancelTask, completeTask, createTask, FINISHED_TASK, followUpInstruction, holdForRewording, PROJECT_EDIT_KINDS, rewordTask, saveTask, startBeforeCalls, taskPrompt } from "../services/tasks.js";
 import { readPassRepeats } from "../services/passRepeats.js";
 import { callSentBack } from "../services/changes.js";
 import { jsonBody, requireProjectHeader } from "./util.js";
 import { actorFor, agentName, logActivity, quote } from "../services/activity.js";
 import { continueWhenReady, interruptTask, retryTask } from "../services/taskRecovery.js";
 import { requestAttempt, requireActiveAttempt } from "../services/taskAttempt.js";
+
+const diagnosticTools = new Set<string>(EDITING_TOOL_GROUPS.flatMap(group => [...group.tools]));
+const ToolDiagnostic = z.object({
+  tool: z.string().refine(name => diagnosticTools.has(name)),
+  outcome: z.enum(["ok", "failed", "refused", "preparing", "degraded"]),
+  elapsedMs: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  evidenceMisses: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  // How much the tool gave back to the model: the characters of its text and how many pictures or sounds. Never the content.
+  resultChars: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+  resultMedia: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+}).strict();
 
 function usageGroupBy(value: string | undefined, fallback: UsageGroupBy): UsageGroupBy {
   if (value === undefined || value === "") return fallback;
@@ -107,7 +118,9 @@ export function taskRoutes(ctx: Ctx) {
       }
       return c.json({ task });
     }
-    return c.json({ task, checksTaskAttempts: true, events: ctx.repos.taskEvents.list(task.id, c.req.query("events") === "conversation" ? "conversation" : "all") });
+    const view = c.req.query("events");
+    const events = view === "none" ? [] : ctx.repos.taskEvents.list(task.id, view === "conversation" ? "conversation" : "all");
+    return c.json({ task, checksTaskAttempts: true, events });
   });
 
   // Called by agent hosts before each run. workDir is the task artifact directory on the host; timeLimit is the run's limit in minutes.
@@ -119,7 +132,13 @@ export function taskRoutes(ctx: Ctx) {
   });
 
   r.post("/tasks/:taskId/cancel", (c) => {
-    return c.json(ctx.db.transaction(() => ({ task: cancelTask(ctx, requireTask(c.req.param("taskId"))) }), "immediate")());
+    return c.json(ctx.db.transaction(() => {
+      const task = requireTask(c.req.param("taskId"));
+      if (c.req.query("queuedOnly") === "1" && !FINISHED_TASK.has(task.state) && (task.state !== "queued" || task.startedAt || (task.resumeRootId && !task.resumesAfterProjectStop))) {
+        throw conflict("already_started", "Scarlet has already started on this request.");
+      }
+      return { task: cancelTask(ctx, task) };
+    }, "immediate")());
   });
 
   // The editor is changing the words of a request still waiting its turn: it doesn't start until they're saved.
@@ -189,11 +208,27 @@ export function taskRoutes(ctx: Ctx) {
     return c.json({});
   });
 
+  // Diagnostics can arrive after the tool asked a question or the host ended its claim. Match the
+  // claim identity without reopening the task or writing a conversation event.
+  r.post("/projects/:projectId/tasks/:taskId/tool-diagnostic", async c => {
+    const body = await jsonBody(c, ToolDiagnostic, 1024);
+    const task = requireTask(c.req.param("taskId"), c.req.param("projectId"));
+    const attempt = requestAttempt(c.req.raw);
+    if (!attempt?.startedAt || attempt.taskId !== task.id || attempt.startedAt !== task.startedAt) return c.body(null, 204);
+    ctx.log(`[mcp] tool-finished task=${task.id} attempt=${attempt.startedAt} tool=${body.tool} outcome=${body.outcome} elapsedMs=${body.elapsedMs} evidenceMisses=${body.evidenceMisses}` +
+      (body.resultChars === undefined ? "" : ` resultChars=${body.resultChars}`) + (body.resultMedia ? ` resultMedia=${body.resultMedia}` : ""));
+    return c.body(null, 204);
+  });
+
   // Reported once per run, whatever its outcome, so pauses for a question and failures still count.
   r.on("POST", ["/tasks/:taskId/usage", "/projects/:projectId/tasks/:taskId/usage"], async (c) => {
     const { startedAt, ...usage } = await jsonBody(c, RecordTaskUsageRequest);
     const task = requireTask(c.req.param("taskId"), c.req.param("projectId"));
     ctx.repos.usage.record(task, usage, startedAt);
+    // A run reports its totals as it goes. Each report is logged, so the log shows how its context grew between the
+    // tool results around it: a pass that read 53.7 million cached tokens left one total and no way to say on what (2026-11-16).
+    ctx.log(`[task] usage task=${task.id} model=${usage.model ?? "unknown"} input=${usage.inputTokens} cacheRead=${usage.cacheReadTokens} ` +
+      `cacheWrite=${usage.cacheWriteTokens} output=${usage.outputTokens} reasoning=${usage.reasoningTokens}`);
     ctx.bus.publish({ type: "task.usage", projectId: task.projectId, taskId: task.id, usage: ctx.repos.usage.taskTotals(task.id) });
     return c.json({});
   });
@@ -216,17 +251,18 @@ export function taskRoutes(ctx: Ctx) {
   r.get("/under-way", (c) => {
     const count = (sql: string) => (ctx.db.prepare(sql).get() as { n: number }).n;
     const live = "project_id IN (SELECT id FROM projects WHERE deleted_at IS NULL)";
-    const requests = `kind IN ('edit','note','revise') AND ${live}`;
+    const requests = `kind IN ${PROJECT_EDIT_KINDS} AND project_id IN (SELECT id FROM projects WHERE deleted_at IS NULL AND editing_paused = 0)`;
     // Quitting stops a skill Scarlet writes or revises too, and it carries on at the next launch as a request does.
     // A learning check isn't run again, and the request it reads is counted already.
     const runs = `kind IN ('edit','note','revise','skill_edit','skill_from_change') AND ${live}`;
-    // A request held for the editor's answer or calls waits on them, not on Scarlet, so quitting holds up nothing of it.
+    // A request held for Continue, an answer or calls will wait for the editor after a quit too.
     const queued = ctx.repos.tasks.select(`state = 'queued' AND ${requests}`);
     let waiting = 0;
     for (const projectId of new Set(queued.map(t => t.projectId))) {
       const tasks = ctx.repos.tasks.select("project_id = ?", [projectId], "created_at, rowid");
       const changes = ctx.repos.changes.select("project_id = ?", [projectId]);
-      waiting += queued.filter(t => t.projectId === projectId && !["question", "review"].includes(queueWait(t, tasks, changes)?.kind ?? "")).length;
+      const wait = queueWaits(tasks, changes);
+      waiting += queued.filter(t => t.projectId === projectId && !["question", "review"].includes(wait(t)?.kind ?? "")).length;
     }
     // An export that has rendered and is still being saved to its file is one too: its owner lets go once it is saved.
     return c.json({

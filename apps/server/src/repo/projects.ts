@@ -1,5 +1,5 @@
 import { MediaAsset, Project, ProjectSettings, StyleGuide, Timeline, timelineDuration, type Change, type Note } from "@scarlet/timeline";
-import { countReviewDecisions, type ProjectSummary, type Task } from "@scarlet/shared";
+import { buildThreads, countReviewDecisions, type ProjectSummary, type Task, type Thread } from "@scarlet/shared";
 import { now, type Db } from "../db.js";
 import type { JsonStore } from "./store.js";
 
@@ -9,9 +9,11 @@ type MediaStatus = "ingesting" | "ready" | "failed";
 export type MediaWithStatus = MediaAsset & { status: MediaStatus; error?: string };
 
 interface ProjectRow {
+  row_revision?: number;
   completed_threads: string;
   style_guide?: string | null;
   media_paused: number;
+  editing_paused: number;
   archived: number;
   branch: string;
   id: string;
@@ -43,7 +45,39 @@ interface MediaRow {
 
 export class ProjectsRepo {
   private readonly reviewCounts = new Map<string, { revision: number; count: number }>();
+  private readonly builtThreads = new Map<string, { revision: number; threads: readonly Thread[] }>();
   constructor(private readonly db: Db, private readonly review: { changes: JsonStore<Change>; tasks: JsonStore<Task>; notes: JsonStore<Note> }) {}
+
+  /**
+   * The project's requests as its chat groups them. One thread is found only by linking every edit, request and note
+   * of the project, so the list is kept until one of them changes: review_revision counts those writes, made by any
+   * engine. The threads are shared between readers, which don't change them.
+   */
+  threads(projectId: string): readonly Thread[] {
+    const read = () => {
+      const row = this.db.prepare("SELECT review_revision AS revision FROM projects WHERE id = ?").get(projectId) as { revision: number } | undefined;
+      const cached = this.builtThreads.get(projectId);
+      if (row && cached?.revision === row.revision) {
+        this.builtThreads.delete(projectId);
+        this.builtThreads.set(projectId, cached);
+        return cached.threads;
+      }
+      const threads = buildThreads({
+        changes: this.review.changes.select("project_id = ?", [projectId]),
+        tasks: this.review.tasks.select("project_id = ? AND kind != 'transcribe'", [projectId]),
+        notes: this.review.notes.select("project_id = ? AND json_extract(json, '$.changeId') IS NOT NULL", [projectId]),
+      });
+      // What a transaction read is kept only once it commits: one that rolls back takes its writes, and their count, with it.
+      if (row) this.db.afterCommit(() => {
+        this.builtThreads.delete(projectId);
+        this.builtThreads.set(projectId, { revision: row.revision, threads });
+        if (this.builtThreads.size > 8) this.builtThreads.delete(this.builtThreads.keys().next().value!);
+      });
+      return threads;
+    };
+    // The count and the rows it counts are read in one snapshot.
+    return this.db.inTransaction ? read() : this.db.transaction(read)();
+  }
 
   private reviewCount(projectId: string, revision: number, completed: string): number {
     const cached = this.reviewCounts.get(projectId);
@@ -66,10 +100,10 @@ export class ProjectsRepo {
     return duration;
   }
 
-  private rowToProject(row: ProjectRow): Project {
+  withMedia(header: Omit<Project, "media">): Project {
     return {
-      ...projectHeader(row),
-      media: this.listMedia(row.id).map(({ status: _s, error: _e, ...asset }) => asset),
+      ...header,
+      media: this.listMedia(header.id).map(({ status: _s, error: _e, ...asset }) => asset),
     };
   }
 
@@ -79,13 +113,14 @@ export class ProjectsRepo {
   }
 
   get(id: string): Project | null {
-    const row = this.db.prepare(`${WITH_SOURCE} WHERE p.id = ? AND p.deleted_at IS NULL`).get(id) as ProjectRow | undefined;
-    return row ? this.rowToProject(row) : null;
+    const header = this.header(id);
+    return header ? this.withMedia(header) : null;
   }
 
   /** Move to the trash (kept TRASH_DAYS, then purged). */
   softDelete(id: string) {
     this.reviewCounts.delete(id);
+    this.builtThreads.delete(id);
     this.db.prepare("UPDATE projects SET deleted_at = ? WHERE id = ?").run(now(), id);
   }
 
@@ -164,6 +199,10 @@ export class ProjectsRepo {
     this.db.prepare("UPDATE projects SET completed_threads = ?, review_revision = review_revision + 1 WHERE id = ?").run(JSON.stringify(threads), id);
   }
 
+  setEditingPaused(id: string, paused: boolean) {
+    this.db.prepare("UPDATE projects SET editing_paused = ?, row_revision = row_revision + 1 WHERE id = ? AND editing_paused != ?").run(paused, id, paused);
+  }
+
   /** Repair a missing head only if another engine hasn't set a new one since the read. */
   initializeHead(id: string, expected: string | null, version: string): void {
     this.db.prepare("UPDATE projects SET head = ?, updated_at = ? WHERE id = ? AND head IS ? AND deleted_at IS NULL")
@@ -176,6 +215,7 @@ export class ProjectsRepo {
 
   remove(id: string) {
     this.reviewCounts.delete(id);
+    this.builtThreads.delete(id);
     this.db.prepare("DELETE FROM projects WHERE id = ?").run(id);
   }
 
@@ -218,6 +258,13 @@ export class ProjectsRepo {
     const row = this.db.prepare("SELECT * FROM media WHERE project_id = ? AND json_extract(json, '$.importId') = ? LIMIT 1")
       .get(projectId, importId) as MediaRow | undefined;
     return row ? this.rowToMedia(row) : null;
+  }
+
+  /** Whether any of these media ids is one of the project's recordings. */
+  hasAnyMedia(projectId: string, ids: Iterable<string>): boolean {
+    const wanted = [...ids];
+    return wanted.length > 0 && !!this.db.prepare(`SELECT 1 FROM json_each(?) wanted JOIN media m
+      ON m.id = wanted.value WHERE m.project_id = ? LIMIT 1`).get(JSON.stringify(wanted), projectId);
   }
 
   /** A render reads original metadata for the sources that can contribute to its window. */
@@ -263,6 +310,6 @@ function projectHeader(row: ProjectRow, styleGuide = true): Omit<Project, "media
   const made = row.source ? JSON.parse(row.source) as { projectId: string; name: string } : undefined;
   const source = made && { projectId: made.projectId, name: row.source_name ?? made.name,
     ...(row.source_notice ? { notice: true } : {}), ...(!row.source_name || row.source_deleted ? { gone: true } : {}) };
-  return Header.parse({ ...(styleGuide && row.style_guide && { styleGuide: JSON.parse(row.style_guide) }), ...(source && { source }), id: row.id, completedThreads: JSON.parse(row.completed_threads), name: row.name, mediaPaused: !!row.media_paused, archived: Boolean(row.archived), branch: row.branch, settings: JSON.parse(row.settings), head: row.head,
-    createdAt: row.created_at, updatedAt: row.updated_at });
+  return Header.parse({ ...(styleGuide && row.style_guide && { styleGuide: JSON.parse(row.style_guide) }), ...(source && { source }), id: row.id, completedThreads: JSON.parse(row.completed_threads), name: row.name, mediaPaused: !!row.media_paused, editingPaused: !!row.editing_paused, archived: Boolean(row.archived), branch: row.branch, settings: JSON.parse(row.settings), head: row.head,
+    createdAt: row.created_at, updatedAt: row.updated_at, rowRevision: row.row_revision });
 }

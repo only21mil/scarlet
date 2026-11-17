@@ -29,12 +29,12 @@ import { evaluationMarkdown, runMarkdown, type TrialRow } from "./report.ts";
 const USAGE = `Usage:
   run.ts --evaluate-task <taskId> [--case <id>] [--reference-version <v>] [--kept-side] [--refresh] [--engine <url>]
   run.ts --evaluate-case <id> [--kept-side]           (re-score the run a case was built from, offline)
-  run.ts (--cases <a,b> | --suite capability|regression) --configs <agent:model:effort,...> [--trials N] [--skills name,... | --add-skills name,...] [--timeout-min M] (--dry-run | --yes)
+  run.ts (--cases <a,b> | --suite capability|regression) --configs <agent:model:effort,...> [--service-tier ID] [--trials N] [--skills name,... | --add-skills name,...] [--timeout-min M] (--dry-run | --yes)
   run.ts --summarize <run dir>
 
 Results go to $SCARLET_EVAL_DATA/results (default: Scarlet's application support folder /evals).`;
 
-interface AgentConfig { agent: string; model?: string; effort?: string }
+interface AgentConfig { agent: string; model?: string; effort?: string; serviceTier?: string }
 
 async function transcriptSnapshot(engine: Engine, loaded: LoadedCase) {
   return Promise.all(loaded.file.dialogueMedia.map(async mediaId => {
@@ -66,7 +66,7 @@ function parseConfig(spec: string): AgentConfig {
   if (parts.length === 2) return { agent: parts[0]!, model: parts[1] || undefined };
   return { agent: parts[0]!, model: parts.slice(1, -1).join(":") || undefined, effort: parts.at(-1) || undefined };
 }
-const configLabel = (c: AgentConfig) => [c.agent, c.model ?? "default", c.effort ?? "default"].join(":");
+const configLabel = (c: AgentConfig) => [c.agent, c.model ?? "default", c.effort ?? "default", ...(c.serviceTier ? [c.serviceTier] : [])].join(":");
 const slug = (s: string) => s.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-|-$/g, "");
 
 /** The exact request the app's composer sends for a first cut, on a dedicated branch. */
@@ -74,6 +74,7 @@ function taskRequest(loaded: LoadedCase, config: AgentConfig, branch: string, sk
   const r = loaded.file.request;
   return {
     kind: "edit", agent: config.agent, ...(config.model && { model: config.model }), ...(config.effort && { effort: config.effort }),
+    ...(config.serviceTier && { serviceTier: config.serviceTier }),
     instruction: r.instruction,
     context: { branch, version: loaded.file.sourceVersion, skillIds, recordTranscriptDigests: true,
       ...(r.mediaId && { mediaId: r.mediaId }), ...(r.time !== undefined && { time: r.time }) },
@@ -247,7 +248,7 @@ async function runCli(argv = process.argv.slice(2)) {
     "evaluate-task": { type: "string" }, "evaluate-case": { type: "string" }, case: { type: "string" }, cases: { type: "string" }, suite: { type: "string" },
     configs: { type: "string" }, trials: { type: "string" }, "timeout-min": { type: "string" }, "dry-run": { type: "boolean" }, yes: { type: "boolean" },
     "reference-version": { type: "string" }, "kept-side": { type: "boolean" }, refresh: { type: "boolean" }, engine: { type: "string" },
-    summarize: { type: "string" }, skills: { type: "string" }, "add-skills": { type: "string" },
+    summarize: { type: "string" }, skills: { type: "string" }, "add-skills": { type: "string" }, "service-tier": { type: "string" },
   }, USAGE, argv);
 
   if (values.summarize) {
@@ -284,7 +285,7 @@ async function runCli(argv = process.argv.slice(2)) {
   }
 
   const caseIds = values.cases ? list(values.cases) : values.suite ? listCases().filter(c => c.suite === values.suite).map(c => c.id) : [];
-  const configs = list(values.configs).map(parseConfig);
+  const configs = list(values.configs).map(parseConfig).map(c => values["service-tier"] ? { ...c, serviceTier: values["service-tier"] } : c);
   const trials = Math.max(1, Math.floor(positiveNumber("--trials", values.trials, 3)));
   const timeoutMs = positiveNumber("--timeout-min", values["timeout-min"], 120) * 60_000;
   if (!caseIds.length || !configs.length) throw new Error("Choose --cases or --suite, and --configs.\n\n" + USAGE);

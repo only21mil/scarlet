@@ -79,15 +79,24 @@ pub fn claude_usage(raw: Option<&Value>, model: Option<&str>) -> Option<AgentUsa
 
 /// Codex `turn.completed.usage`: input includes cached input; output includes reasoning.
 pub fn codex_usage(raw: Option<&Value>, model: Option<&str>) -> Option<AgentUsage> {
-    let u = counts(raw, &["input_tokens", "output_tokens", "cached_input_tokens"])?;
-    let cached = token_count(u.get("cached_input_tokens"));
+    normalize_codex_usage(raw, model, ["input_tokens", "output_tokens", "cached_input_tokens", "cache_write_input_tokens", "reasoning_output_tokens"])
+}
+
+/// Codex App Server reports the cumulative usage of the ephemeral thread.
+pub fn codex_app_server_usage(raw: Option<&Value>, model: Option<&str>) -> Option<AgentUsage> {
+    normalize_codex_usage(raw, model, ["inputTokens", "outputTokens", "cachedInputTokens", "cacheWriteInputTokens", "reasoningOutputTokens"])
+}
+
+fn normalize_codex_usage(raw: Option<&Value>, model: Option<&str>, keys: [&str; 5]) -> Option<AgentUsage> {
+    let u = counts(raw, &keys)?;
+    let [input, output, cached, written, reasoning] = keys.map(|key| token_count(u.get(key)));
     Some(AgentUsage {
         model: model_name(model),
-        input_tokens: token_count(u.get("input_tokens")).saturating_sub(cached),
-        output_tokens: token_count(u.get("output_tokens")),
+        input_tokens: input.saturating_sub(cached).saturating_sub(written),
+        output_tokens: output,
         cache_read_tokens: cached,
-        reasoning_tokens: token_count(u.get("reasoning_output_tokens")),
-        ..Default::default()
+        cache_write_tokens: written,
+        reasoning_tokens: reasoning,
     })
 }
 

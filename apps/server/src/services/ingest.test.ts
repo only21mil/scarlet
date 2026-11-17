@@ -5,7 +5,9 @@ import { expect, it, vi } from "vitest";
 import { encodeWaveformCache, WAVEFORM_CACHE_VERSION } from "@scarlet/render";
 import { createProject } from "@scarlet/timeline";
 import { createApp } from "../app.js";
-import { getWaveform, readWaveformCache } from "./ingest.js";
+import { WhisperCppProvider } from "../transcribe/whispercpp.js";
+import { audioLane } from "./audioWork.js";
+import { getWaveform, readWaveformCache, transcribeMedia } from "./ingest.js";
 
 it("keeps both microphone waveforms warm and reads replacements and legacy JSON", async () => {
   const dir = await mkdtemp(join(tmpdir(), "scarlet-mic-waveforms-"));
@@ -36,4 +38,25 @@ it("keeps both microphone waveforms warm and reads replacements and legacy JSON"
       expect(decode).toHaveBeenCalledOnce();
     } finally { decode.mockRestore(); }
   } finally { await ctx.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+it("starts the next audio job immediately when local Whisper has no words to align", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "scarlet-silent-transcript-"));
+  const { ctx } = createApp({ dataDir: dir, env: {}, log() {} });
+  try {
+    ctx.speakers.beside = false;
+    vi.spyOn(ctx.speakers, "ensure").mockResolvedValue();
+    ctx.repos.settings.update({ transcription: { provider: "whispercpp", whisperCppPath: "fixture-whisper" } });
+    const project = ctx.repos.projects.insert(createProject("Silence"));
+    ctx.paths.ensureProject(project.id);
+    const media = ctx.repos.projects.putMedia(project.id, { id: "silence", name: "Silence", path: "silent.wav", kind: "audio" }, "ready");
+    await writeFile(join(ctx.paths.media(project.id), media.path), "fixture");
+    const nextJob = vi.fn(async () => {});
+    vi.spyOn(WhisperCppProvider.prototype, "transcribe").mockImplementation(async () => {
+      void audioLane(ctx).run({ mediaId: "next", kind: "page" }, undefined, nextJob);
+      return { segments: [] };
+    });
+    await transcribeMedia(ctx, project.id, media);
+    expect(nextJob).toHaveBeenCalledOnce();
+  } finally { await ctx.close(); vi.restoreAllMocks(); await rm(dir, { recursive: true, force: true }); }
 });

@@ -37,47 +37,70 @@ const toRow = (r: Raw, timeline: Timeline): VersionRow => ({
 
 /** Immutable, content-addressed timeline versions. */
 export class VersionsRepo {
-  // Keep validated JSON rather than shared mutable timelines. Every caller still
-  // owns its copy, and a rollback, purge or peer write is reflected in the SQL row.
-  private static readonly budget = 8 * 1024 * 1024;
-  private readonly validated = new Map<string, { raw: string; normalized?: string; bytes: number }>();
+  // A committed version never changes, apart from the edit that made it being named once (setChangeId), so a version
+  // read before is kept validated and found again with a look at its key alone. Only committed reads are kept, and
+  // each one returns a copy of its own, as the caller may change it. A purge or another engine's restore that takes
+  // the row away is seen by that look.
+  private static readonly budget = 64 * 1024 * 1024;
+  // A version larger than a quarter of the budget would push out most of the others.
+  private static readonly entryLimit = VersionsRepo.budget / 4;
+  private static readonly entries = 256;
+  private readonly validated = new Map<string, { json: string; row: Omit<VersionRow, "timeline">; bytes: number }>();
   private cachedBytes = 0;
 
   constructor(private readonly db: Db) {}
 
-  private readTimeline(row: Raw): Timeline {
-    const key = JSON.stringify([row.project_id, row.version]);
-    const previous = this.validated.get(key);
-    if (previous) {
-      this.validated.delete(key);
-      if (previous.raw === row.json) {
-        this.validated.set(key, previous);
-        return JSON.parse(previous.normalized ?? previous.raw) as Timeline;
-      }
-      this.cachedBytes -= previous.bytes;
-    }
-    const timeline = Timeline.parse(JSON.parse(row.json));
-    if (row.json.length * 2 > VersionsRepo.budget) return timeline;
-    const json = JSON.stringify(timeline);
-    const normalized = json === row.json ? undefined : json;
-    const bytes = (key.length + row.json.length + (normalized?.length ?? 0)) * 2;
-    if (bytes <= VersionsRepo.budget) {
-      this.validated.set(key, { raw: row.json, normalized, bytes });
+  private forget(key: string) {
+    const entry = this.validated.get(key);
+    if (!entry) return;
+    this.validated.delete(key);
+    this.cachedBytes -= entry.bytes;
+  }
+
+  private remember(key: string, row: VersionRow, json = JSON.stringify(row.timeline)) {
+    const { timeline: _timeline, ...rest } = row;
+    // JavaScript strings take up to two bytes a character.
+    const bytes = (key.length + json.length) * 2;
+    if (bytes > VersionsRepo.entryLimit) return;
+    // The caller can still edit its copy of the author after this version has been stored.
+    if (rest.author) rest.author = { ...rest.author };
+    this.db.afterCommit(() => {
+      this.forget(key);
+      this.validated.set(key, { json, row: rest, bytes });
       this.cachedBytes += bytes;
-      for (const [oldKey, entry] of this.validated) {
-        if (this.cachedBytes <= VersionsRepo.budget && this.validated.size <= 32) break;
-        this.validated.delete(oldKey);
-        this.cachedBytes -= entry.bytes;
+      for (const [oldKey] of this.validated) {
+        if (this.cachedBytes <= VersionsRepo.budget && this.validated.size <= VersionsRepo.entries) break;
+        this.forget(oldKey);
       }
-    }
-    return timeline;
+    });
   }
 
   get(projectId: string, version: string): VersionRow | null {
-    const row = this.db
+    const key = JSON.stringify([projectId, version]);
+    const cached = this.validated.get(key);
+    if (cached) {
+      // The edit that made a version can be named after it was read. Until it is, that column is read again.
+      const found = (cached.row.changeId === null
+        ? this.db.prepare("SELECT change_id FROM timeline_versions WHERE project_id = ? AND version = ?").get(projectId, version)
+        : this.db.prepare("SELECT 1 FROM timeline_versions WHERE project_id = ? AND version = ?").get(projectId, version)) as
+        { change_id?: string | null } | undefined;
+      if (found) {
+        this.validated.delete(key);
+        this.validated.set(key, cached);
+        const { author, ...row } = cached.row;
+        return { ...row, author: author && { ...author }, changeId: cached.row.changeId ?? found.change_id ?? null,
+          timeline: JSON.parse(cached.json) as Timeline };
+      }
+      this.forget(key);
+      return null;
+    }
+    const raw = this.db
       .prepare("SELECT * FROM timeline_versions WHERE project_id = ? AND version = ?")
       .get(projectId, version) as Raw | undefined;
-    return row ? toRow(row, this.readTimeline(row)) : null;
+    if (!raw) return null;
+    const row = toRow(raw, Timeline.parse(JSON.parse(raw.json)));
+    if (raw.json.length * 2 <= VersionsRepo.entryLimit) this.remember(key, row);
+    return row;
   }
 
   /** Older versions have no stored duration; only those need the full timeline to calculate it. */
@@ -103,7 +126,8 @@ export class VersionsRepo {
       .get(projectId, JSON.stringify(mediaId));
   }
 
-  insert(row: VersionRow): VersionRow {
+  insert(row: VersionRow, validated = false): VersionRow {
+    const json = JSON.stringify(row.timeline);
     const result = this.db
       .prepare(
         `INSERT INTO timeline_versions (version, project_id, parent, json, author, change_id, description, created_at, timeline_name, duration)
@@ -113,7 +137,7 @@ export class VersionsRepo {
         row.version,
         row.projectId,
         row.parent,
-        JSON.stringify(row.timeline),
+        json,
         row.author ? JSON.stringify(row.author) : null,
         row.changeId,
         row.description ?? null,
@@ -121,7 +145,9 @@ export class VersionsRepo {
         row.timeline.name,
         timelineDuration(row.timeline),
       );
-    return result.changes ? row : this.get(row.projectId, row.version)!;
+    if (!result.changes) return this.get(row.projectId, row.version)!;
+    if (validated) this.remember(JSON.stringify([row.projectId, row.version]), row, json);
+    return row;
   }
 
   setChangeId(projectId: string, version: string, changeId: string) {
@@ -131,10 +157,10 @@ export class VersionsRepo {
   }
 
   links(projectId: string) {
-    return this.db.prepare(`SELECT v.version, v.parent, v.change_id AS changeId, v.description,
+    return this.db.prepare(`SELECT v.version, v.parent, v.change_id AS changeId, v.description, v.created_at AS createdAt,
       json_extract(c.json, '$.revertsVersion') AS revertsVersion
       FROM timeline_versions v LEFT JOIN changes c ON c.id = v.change_id WHERE v.project_id = ?`)
-      .all(projectId) as Array<{ version: string; parent: string | null; changeId: string | null; description?: string; revertsVersion?: string }>;
+      .all(projectId) as Array<{ version: string; parent: string | null; changeId: string | null; description?: string; createdAt: string; revertsVersion?: string }>;
   }
 
   summaries(projectId: string, head: string | null): VersionSummary[] {

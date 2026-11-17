@@ -26,6 +26,11 @@ export class JsonStore<T extends { id: string }> {
 
   /** Insert or replace (by id). Returns the stored (validated) document. */
   put(doc: T): T {
+    return this.write(doc).doc;
+  }
+
+  /** Insert or replace (by id), with the row's number, in one statement. */
+  protected write(doc: T): { doc: T; rowid: number } {
     const parsed = this.schema.parse(doc);
     const cols = this.index(parsed);
     const names = ["id", "json", ...Object.keys(cols)];
@@ -34,13 +39,13 @@ export class JsonStore<T extends { id: string }> {
       .filter((n) => n !== "id")
       .map((n) => `${n} = excluded.${n}`)
       .join(", ");
-    this.db
+    const row = this.db
       .prepare(
         `INSERT INTO ${this.table} (${names.join(", ")}) VALUES (${names.map(() => "?").join(", ")})
-         ON CONFLICT(id) DO UPDATE SET ${updates}`,
+         ON CONFLICT(id) DO UPDATE SET ${updates} RETURNING rowid`,
       )
-      .run(...values);
-    return parsed;
+      .get(...values) as { rowid: number };
+    return { doc: parsed, rowid: row.rowid };
   }
 
   remove(id: string): void {

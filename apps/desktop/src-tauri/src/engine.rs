@@ -31,7 +31,7 @@ use tokio::process::{Child, ChildStdin};
 use tokio::sync::{Mutex, Notify};
 
 use crate::config::Paths;
-use crate::util::{child_env, hide_console, lossy_lines, split_command_line};
+use crate::util::{child_env, engine_env, hide_console, lossy_lines, split_command_line};
 
 pub const READY_PREFIX: &str = "SCARLET_READY";
 
@@ -56,7 +56,11 @@ pub fn parse_ready_line(line: &str) -> Option<ReadyInfo> {
 /// The level one line of the engine's output is logged at. The engine writes its log to stdout. What reaches stderr
 /// is an error or a stack trace.
 fn engine_line_level(line: &str, stderr: bool) -> log::Level {
-    match (line.starts_with("[error]"), stderr) {
+    let fault = line.starts_with("[error]");
+    let warning = ["[mcp] tool-finished ", "[audio] finished ", "[media] proxy_finished ", "[transfer] file-read "]
+        .iter().any(|prefix| line.starts_with(prefix))
+        && line.split_ascii_whitespace().any(|field| matches!(field, "outcome=failed" | "outcome=truncated" | "outcome=degraded"));
+    match (fault, stderr || warning) {
         // A fault, on either stream. One the engine carries on from, such as a request that failed, is written to
         // stdout with the rest of its log, and the uncaught error that stops it to stderr. A search of the app log
         // for ERROR has to find both. The stack under one stays at its stream's level: one ERROR line for each fault.
@@ -217,7 +221,7 @@ impl Running {
                     // beside the engine that replaces it, which starts the same jobs again.
                     #[cfg(unix)]
                     kill_group(pid).await;
-                    status.ok()
+                    status
                 }
                 _ = stop.cancelled() => {
                     #[cfg(windows)]
@@ -225,14 +229,17 @@ impl Running {
                     #[cfg(unix)]
                     kill_group(pid).await;
                     let _ = child.start_kill();
-                    child.wait().await.ok()
+                    child.wait().await
                 }
             };
             // Closing the job ends whatever the engine left in it. On Windows `taskkill /T` can't find a tree under
             // an engine that has already ended.
             #[cfg(windows)]
             drop(job);
-            status
+            status.map_err(|error| {
+                log::warn!("[desktop] engine-wait-failed pid={pid} code={}", error.raw_os_error().unwrap_or(0));
+                error
+            }).ok()
         }.boxed().shared();
         Self { exit, force, stdin, pid }
     }
@@ -256,6 +263,18 @@ async fn ready_before_exit(
         _ = exit => None,
         info = ready => info.ok(),
     }
+}
+
+fn log_engine_exit(status: Option<ExitStatus>, pid: u32, stage: &str, outcome: &str, level: log::Level) {
+    let code = status.and_then(|status| status.code()).map(|code| format!(" exitCode={code}")).unwrap_or_default();
+    #[cfg(unix)]
+    let signal = {
+        use std::os::unix::process::ExitStatusExt;
+        status.and_then(|status| status.signal()).map(|signal| format!(" signal={signal}")).unwrap_or_default()
+    };
+    #[cfg(not(unix))]
+    let signal = "";
+    log::log!(level, "[desktop] engine-exit pid={pid} stage={stage} outcome={outcome}{code}{signal}");
 }
 
 /// Failed starts in a row after which the window says Scarlet couldn't start, and why. The engine is still started
@@ -481,7 +500,10 @@ impl EngineManager {
     }
 
     async fn run_once(&self, launch: &EngineLaunch, generation: u64) -> Result<()> {
-        let mut env = child_env(&self.paths.home);
+        let mut env = engine_env(&self.paths.home);
+        // Node's 4 default threads serve every file read, stat and streamed range, so a playing video
+        // and a cache scan queue behind each other. Respect a value the user set.
+        env.entry("UV_THREADPOOL_SIZE".into()).or_insert_with(|| "16".into());
         crate::crisper::set_adapter_env(&mut env, self.paths.resource_dir.as_deref(), tauri::is_dev());
         if let Some(res) = &self.paths.resource_dir {
             let bin = res.join("bin");
@@ -531,8 +553,15 @@ impl EngineManager {
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(async move {
                 let mut lines = lossy_lines(stderr);
-                while let Ok(Some(l)) = lines.next_line().await {
-                    log::log!(engine_line_level(&l, true), "[engine] {l}");
+                loop {
+                    match lines.next_line().await {
+                        Ok(Some(l)) => log::log!(engine_line_level(&l, true), "[engine] {l}"),
+                        Ok(None) => break,
+                        Err(error) => {
+                            log::warn!("[desktop] engine-output-failed pid={pid} stage=stderr code={}", error.raw_os_error().unwrap_or(0));
+                            break;
+                        }
+                    }
                 }
             });
         }
@@ -547,10 +576,23 @@ impl EngineManager {
         let reader = tokio::spawn(async move {
             let mut tx = Some(ready_tx);
             let mut lines = lossy_lines(stdout);
-            while let Ok(Some(l)) = lines.next_line().await {
-                if let Some(info) = parse_ready_line(&l) {
-                    if let Some(tx) = tx.take() {
-                        let _ = tx.send(info);
+            loop {
+                let l = match lines.next_line().await {
+                    Ok(Some(line)) => line,
+                    Ok(None) => break,
+                    Err(error) => {
+                        log::warn!("[desktop] engine-output-failed pid={pid} stage=stdout code={}", error.raw_os_error().unwrap_or(0));
+                        break;
+                    }
+                };
+                if l.trim_start().starts_with(READY_PREFIX) {
+                    if let Some(info) = parse_ready_line(&l) {
+                        if let Some(tx) = tx.take() {
+                            let _ = tx.send(info);
+                        }
+                    } else {
+                        // A partial or malformed handshake can still carry the session credential.
+                        log::warn!("[desktop] engine-handshake-invalid pid={pid} stage=startup");
                     }
                     continue;
                 }
@@ -565,7 +607,7 @@ impl EngineManager {
                     // stop() owns the child. A late ready line must not restart the host.
                     return Ok(());
                 }
-                log::info!("engine ready on {} (user {})", info.url, info.user_id.as_deref().unwrap_or("?"));
+                log::info!("[desktop] engine-ready pid={pid} stage=startup kind={}", launch.kind);
                 self.port.store(info.port, Ordering::SeqCst);
                 self.update(|s| {
                     s.state = "ready".into();
@@ -587,6 +629,7 @@ impl EngineManager {
                 if self.reload.load(Ordering::SeqCst) {
                     return Ok(()); // the dev watcher stopped it mid-start
                 }
+                log_engine_exit(exit.await, pid, "startup", "early_exit", log::Level::Warn);
                 // stdout closed before ready: the process died. Maybe the port
                 // was taken; let the next attempt pick a fresh one.
                 self.port.store(0, Ordering::SeqCst);
@@ -595,6 +638,7 @@ impl EngineManager {
             Err(_) => {
                 self.shutdown_child().await;
                 let _ = reader.await;
+                log_engine_exit(exit.await, pid, "startup", "timeout", log::Level::Warn);
                 return Err(anyhow!("engine did not report ready within 60 s"));
             }
         }
@@ -611,9 +655,9 @@ impl EngineManager {
         let quitting = self.stopped.load(Ordering::SeqCst);
         let asked = quitting || self.reload.load(Ordering::SeqCst);
         if asked {
-            log::info!("engine stopped (exit code {code:?})");
+            log_engine_exit(status, pid, "running", if quitting { "quit" } else { "reload" }, log::Level::Info);
         } else {
-            log::warn!("engine exited with {code:?}");
+            log_engine_exit(status, pid, "running", "unexpected", log::Level::Warn);
         }
         self.update(|s| ended(s, quitting, asked, code));
         if !self.stopped.load(Ordering::SeqCst) {
@@ -643,7 +687,11 @@ impl EngineManager {
 
     /// Synchronous best-effort stop for process exit paths.
     pub fn stop_blocking(&self) {
-        tauri::async_runtime::block_on(async { let _ = tokio::time::timeout(Duration::from_secs(8), self.stop()).await; });
+        tauri::async_runtime::block_on(async {
+            if tokio::time::timeout(Duration::from_secs(8), self.stop()).await.is_err() {
+                log::warn!("[desktop] engine-stop-timeout elapsedMs=8000");
+            }
+        });
     }
 }
 

@@ -3,8 +3,8 @@ import { act, createElement } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { QueueTray } from "../components/chat/QueueTray";
-import { startAppLog, stopAppLog } from "./appLog";
-import { loggedFetch } from "./client";
+import { appLog, startAppLog, stopAppLog } from "./appLog";
+import { loggedFetch, readLoggedBody } from "./client";
 import { startUiLog, stopUiLog } from "./uiLog";
 
 let lines: string[], levels: string[];
@@ -34,7 +34,7 @@ it("logs a press by the control's name and where it sits", () => {
   document.body.innerHTML = '<section role="region" aria-label="Call"><button aria-pressed="false"><span>Before</span></button></section>';
   fresh();
   document.querySelector("span")!.click();
-  expect(written()).toEqual([expect.stringMatching(/^\[action\] .* click on=Before in=Call pressed=false$/)]);
+  expect(written()).toEqual([expect.stringMatching(/^\[action\] .* click on=Before control=button in=Call pressed=false$/)]);
 });
 
 it("logs the keys that act and never what is typed", () => {
@@ -56,8 +56,8 @@ it("names a control by its kind, not its words, where the words are the editor's
   fresh();
   for (const button of document.querySelectorAll("button")) button.click();
   expect(written()).toEqual([
-    expect.stringMatching(/^\[action\] .* click on=button\.queue-remove in="Queued requests"$/),
-    expect.stringMatching(/^\[action\] .* click on=button\.queue-head in="Queued requests" expanded=false$/),
+    expect.stringMatching(/^\[action\] .* click on=button\.queue-remove control=button in="Queued requests"$/),
+    expect.stringMatching(/^\[action\] .* click on=button\.queue-head control=button in="Queued requests" expanded=false$/),
   ]);
 });
 
@@ -248,7 +248,7 @@ it("sends what the console was told to the log as an error", () => {
   expect(levels).toEqual(["error"]);
 });
 
-it("logs each change the window asks of the engine, each failure with its reason, and each slow read", async () => {
+it("correlates mutations, failures and slow reads with the engine request ID", async () => {
   vi.useRealTimers();
   const answers: Record<string, () => Promise<Response>> = {
     "/api/changes/chg_1/approve": async () => new Response("{}", { status: 200 }),
@@ -256,19 +256,79 @@ it("logs each change the window asks of the engine, each failure with its reason
     "/api/projects/prj_1": async () => new Response("{}", { status: 200 }),
     "/api/projects/prj_slow": async () => { await new Promise(done => setTimeout(done, 1050)); return new Response("{}", { status: 200 }); },
   };
-  vi.spyOn(globalThis, "fetch").mockImplementation(async input => answers[new URL(String(input)).pathname]!());
-  vi.spyOn(globalThis, "fetch").mockImplementationOnce(async () => { throw new TypeError("Load failed"); });
+  const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async input => answers[new URL(String(input)).pathname]!());
+  fetcher.mockImplementationOnce(async () => { throw new TypeError("Load failed"); });
   await loggedFetch("http://127.0.0.1:5000/api/down").catch(() => {});
   await loggedFetch("http://127.0.0.1:5000/api/changes/chg_1/approve?token=sct_secret", { method: "POST", body: "{}" });
-  await loggedFetch("http://127.0.0.1:5000/api/projects/prj_gone");
+  const gone = await loggedFetch("http://127.0.0.1:5000/api/projects/prj_gone");
+  await readLoggedBody(gone, () => gone.text());
   await loggedFetch("http://127.0.0.1:5000/api/projects/prj_1");
   await loggedFetch("http://127.0.0.1:5000/api/projects/prj_slow");
   await new Promise(done => setTimeout(done, 300));
-  const api = lines.filter(line => line.startsWith("[api]")).map(line => line.replace(/^\[api\] \S+ \S+ /, "").replace(/ms=\d+/, "ms=N"));
+  const requestIds = fetcher.mock.calls.map(([, init]) => new Headers(init?.headers).get("X-Scarlet-Request-Id"));
+  expect(requestIds).toEqual(Array(5).fill(expect.stringMatching(/^[a-f0-9-]{36}$/)));
+  expect(new Set(requestIds).size).toBe(5);
+  const api = lines.filter(line => line.startsWith("[api]")).map(line => line.replace(/^\[api\] \S+ \S+ /, "")
+    .replace(/request=([a-f0-9-]+)/, (_, id) => `request=${requestIds.indexOf(id) + 1}`).replace(/ms=\d+/, "ms=N"));
   expect(api).toEqual([
-    'unreachable method=GET path=/api/down ms=N error="TypeError: Load failed"',
-    "did method=POST path=/api/changes/chg_1/approve?token status=200 ms=N",
-    expect.stringMatching(/^failed method=GET path=\/api\/projects\/prj_gone status=404 ms=N reason=.*not_found/),
-    "slow method=GET path=/api/projects/prj_slow status=200 ms=N",
+    'unreachable method=GET path=/api/down request=1 ms=N name=TypeError error="TypeError: Load failed"',
+    "did method=POST path=/api/changes/chg_1/approve?token request=2 status=200 ms=N phase=headers",
+    "failed method=GET path=/api/projects/prj_gone request=3 status=404 ms=N",
+    "error-code method=GET path=/api/projects/prj_gone request=3 status=404 ms=N code=not_found",
+    "slow method=GET path=/api/projects/prj_slow request=5 status=200 ms=N phase=headers",
   ]);
+});
+
+
+it("flushes pending actions at pagehide without waiting for a timer", () => {
+  fresh();
+  appLog("action", "submit");
+  expect(lines).toEqual([]);
+  window.dispatchEvent(new Event("pagehide"));
+  expect(lines).toEqual([
+    expect.stringMatching(/^\[action\].* submit$/),
+    expect.stringMatching(/^\[window\].* closing$/),
+  ]);
+});
+
+it("retains a terminal failure after the informational playback budget is exhausted", () => {
+  for (let i = 0; i < 400; i++) appLog("playback", "seek", { i });
+  appLog("playback", "failed", undefined, { level: "warn" });
+  expect(lines).toContainEqual(expect.stringMatching(/^\[playback\].* failed unlogged=\d+$/));
+  expect(levels.at(-1)).toBe("warn");
+});
+
+it("caps a failing poll's warnings without letting routine lines spend their budget", () => {
+  for (let i = 0; i < 400; i++) appLog("api", "unreachable", { i }, { level: "warn" });
+  const warnings = levels.filter(level => level === "warn").length;
+  expect(warnings).toBeGreaterThan(0);
+  expect(warnings).toBeLessThanOrEqual(41);
+});
+
+it("logs playback sections like reads: not when they load, and not when a seek drops one", async () => {
+  const fetcher = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}"));
+  await loggedFetch("http://127.0.0.1:5000/api/projects/prj_1/renders?wait=1", { method: "POST" });
+  fetcher.mockRejectedValue(new DOMException("The operation was aborted.", "AbortError"));
+  await loggedFetch("http://127.0.0.1:5000/api/projects/prj_1/renders?wait=1", { method: "POST" }).catch(() => undefined);
+  fetcher.mockRestore();
+  window.dispatchEvent(new Event("pagehide"));
+  expect(lines.filter(line => line.startsWith("[api]"))).toEqual([]);
+});
+
+it("traces a broken success response body after its headers arrived", async () => {
+  const response = new Response("");
+  const broken = new TypeError("Connection lost while reading the body");
+  const fetcher = vi.spyOn(globalThis, "fetch").mockResolvedValue(response);
+  await loggedFetch("http://127.0.0.1:5000/api/projects/prj_1");
+  const id = new Headers(fetcher.mock.calls[0]?.[1]?.headers).get("X-Scarlet-Request-Id");
+  await expect(readLoggedBody(response, () => Promise.reject(broken))).rejects.toBe(broken);
+  expect(lines.at(-1)).toContain(`body-failed method=GET path=/api/projects/prj_1 request=${id} status=200`);
+  expect(lines.at(-1)).toContain("phase=body name=TypeError");
+});
+
+it("uses the registered transcript control identity without recording its word", () => {
+  document.body.innerHTML = '<span role="button" data-log-label="Transcript word" data-log-control="transcript-word" aria-label="Private word">Private word</span>';
+  fresh();
+  document.querySelector("span")!.click();
+  expect(written()).toEqual([expect.stringMatching(/click on="Transcript word" control=transcript-word$/)]);
 });

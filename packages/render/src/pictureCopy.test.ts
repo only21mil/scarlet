@@ -40,6 +40,13 @@ it("copies every original picture and timestamp while mixing edited audio, and e
     expect((await renderFullCached(project, timeline, cache, output, options)).encoder).toBe("copy");
     expect(await audio()).not.toEqual(originalAudio);
     expect(await packets(output)).toEqual(await packets(source));
+    camera.transitionIn = { type: "dip", duration: 0.5, direction: "left" };
+    expect((await renderFullCached(project, timeline, join(dir, "transition-cache"), output, options)).encoder).toBe("libx264");
+    const opening = (await runCapture(ffmpeg, ["-v", "error", "-i", output, "-vf", "format=rgb24,scale=1:1", "-frames:v", "1", "-f", "rawvideo", "-"])).stdout;
+    // Black, give or take the encoder's rounding: other ffmpeg builds land a few levels above zero.
+    for (const level of opening) expect(level).toBeLessThanOrEqual(8);
+    expect(opening).toHaveLength(3);
+    delete camera.transitionIn;
     camera.sourceOut -= 1 / meta.fps;
     expect((await renderFullCached(project, timeline, cache, output, options)).encoder).toBe("libx264");
     camera.sourceOut = duration;

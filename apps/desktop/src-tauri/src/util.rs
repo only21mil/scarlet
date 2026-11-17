@@ -165,10 +165,24 @@ pub fn augmented_path(env: &HashMap<String, String>, home: &Path) -> String {
 /// Environment for child processes: inherited env with an augmented PATH and
 /// without the variables that make Claude Code refuse to start inside Claude Code.
 pub fn child_env(home: &Path) -> HashMap<String, String> {
+    child_env_with(home, true)
+}
+
+/// `child_env` for the engine. It finds its media tools through `SCARLET_BIN_DIR` and never starts the agent CLIs,
+/// so it takes the login shell's PATH only when the probe has already answered instead of waiting up to 5 s for it.
+pub fn engine_env(home: &Path) -> HashMap<String, String> {
+    child_env_with(home, false)
+}
+
+fn child_env_with(home: &Path, wait_for_login_path: bool) -> HashMap<String, String> {
     let mut env = env_map();
     let key = env.keys().find(|k| k.eq_ignore_ascii_case("PATH")).cloned().unwrap_or_else(|| "PATH".into());
     #[cfg(target_os = "macos")]
-    if let Some(login) = login_shell_path() {
+    let login = if wait_for_login_path { login_shell_path() } else { LOGIN_PATH.get().and_then(|p| p.as_deref()) };
+    #[cfg(not(target_os = "macos"))]
+    let _ = wait_for_login_path;
+    #[cfg(target_os = "macos")]
+    if let Some(login) = login {
         let inherited = env.get(&key).cloned().unwrap_or_default();
         env.insert(key.clone(), if inherited.is_empty() { login.to_string() } else { format!("{login}:{inherited}") });
     }
@@ -179,6 +193,9 @@ pub fn child_env(home: &Path) -> HashMap<String, String> {
     env
 }
 
+#[cfg(target_os = "macos")]
+static LOGIN_PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
 /// Apps opened from the Dock or Finder get launchd's minimal PATH, not the one
 /// the user's shell builds (Homebrew, nvm, asdf, mise, custom installs), so
 /// `claude` or `codex` would look missing. Ask the login shell once, the way
@@ -186,8 +203,7 @@ pub fn child_env(home: &Path) -> HashMap<String, String> {
 #[cfg(target_os = "macos")]
 pub fn login_shell_path() -> Option<&'static str> {
     use std::io::Read;
-    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    CACHE
+    LOGIN_PATH
         .get_or_init(|| {
             const MARK: &str = "__SCARLET_PATH__";
             let shell = std::env::var("SHELL").ok().filter(|s| s.starts_with('/')).unwrap_or_else(|| "/bin/zsh".into());

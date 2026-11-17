@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { expect, it, vi } from "vitest";
 import * as exec from "./exec.js";
 import { resolveFfmpeg, runCapture, spawnStats } from "./exec.js";
-import { contactSheet, packSheet, pictureActivity, qualityEvents, sampleTimes } from "./inspection.js";
+import { audition, contactSheet, packSheet, pictureActivity, qualityEvents, reviewWindow, sampleTimes } from "./inspection.js";
 import { extractFrame } from "./frame.js";
 import { isStoredAsShown, storedAsShown } from "./probe.js";
 
@@ -159,6 +159,21 @@ it("finds a black stretch, a frozen picture and a jump in level, on the clock th
       expect(step.deltaDb).toBeGreaterThanOrEqual(12);
     }
     expect(events.some(event => event.kind === "level-drop")).toBe(false);
+    const range = { start: 0.12, end: 2.84 };
+    const options = { fps: 25, count: 6, focus: 101, origin: 100, mode: "uniform" as const };
+    const expected = { ...await contactSheet(file, range, options), events: await qualityEvents(file, range, 100), wav: await audition(file, range) };
+    const decodes = spawnStats.ffmpeg;
+    expect(await reviewWindow(file, range, { ...options, includeAudio: true, tempDir: dir })).toEqual(expected);
+    expect(spawnStats.ffmpeg - decodes).toBe(1);
+    // A microphone that stops before the picture ends gets silence in the audition. The level reading
+    // still uses only the actual samples in the last partial bucket.
+    const short = join(dir, "short-audio.mkv");
+    await runCapture(resolveFfmpeg(), ["-v", "error", "-i", file, "-c:v", "copy", "-af", "atrim=end=1.72", "-c:a", "pcm_s16le", short]);
+    const observed = await reviewWindow(short, range, { ...options, includeAudio: true, tempDir: dir });
+    expect(observed.wav).toEqual(await audition(short, range));
+    expect(Buffer.from(observed.wav!, "base64").subarray(-1024)).toEqual(Buffer.alloc(1024));
+    expect(observed.events).toEqual(await qualityEvents(short, range, 100));
+    expect(observed.events.some(event => event.kind === "level-drop")).toBe(true);
     // The moving, level second on its own has nothing to report.
     expect(await qualityEvents(file, { start: 1.1, end: 1.9 }, 100)).toEqual([]);
   } finally { await rm(dir, { recursive: true, force: true }); }

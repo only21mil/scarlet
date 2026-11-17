@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createProject, makeMediaClip, type MediaClip, type Project, type Timeline, type Transition } from "@scarlet/timeline";
-import { buildFilterGraph, runCapture, segmentKey } from "./index.js";
+import { buildFilterGraph, renderFullCached, renderPlaybackSegment, runCapture, segmentKey } from "./index.js";
 import { planTransitions } from "./transitions.js";
 
 let dir: string;
@@ -37,9 +37,10 @@ beforeAll(async () => {
   dir = await fs.mkdtemp(path.join(os.tmpdir(), "scarlet-transitions-"));
   for (const colour of ["red", "blue"]) {
     await runCapture("ffmpeg", ["-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-f", "lavfi", "-i", `color=c=${colour}:s=64x64:r=30:d=4`,
-      "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", path.join(dir, `${colour}.mp4`)]);
+      "-f", "lavfi", "-i", `sine=frequency=${colour === "red" ? 400 : 800}:sample_rate=48000:d=4`,
+      "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", path.join(dir, `${colour}.mp4`)]);
   }
-  project.media = [movie("red"), movie("blue")];
+  project.media = [movie("red"), movie("blue")].map(asset => ({ ...asset, hasAudio: true }));
 });
 afterAll(async () => { await fs.rm(dir, { recursive: true, force: true }); });
 
@@ -99,6 +100,40 @@ describe("transitions", () => {
       const differs = parts.map((frame, i) => frame.reduce((most, v, k) => Math.max(most, Math.abs(v - whole[i]![k]!)), 0));
       expect(Math.max(...differs), type).toBeLessThanOrEqual(3);
     }
+  });
+
+  it("keeps both sides of a dissolve at a section boundary in exports and playback", async () => {
+    const timeline = join({ type: "dissolve", duration: 1, direction: "left" });
+    const cache = path.join(dir, "dissolve-sections");
+    const file = path.join(dir, "dissolve.mp4");
+    const options = { mediaRoot: dir, hwaccel: "none" } as const;
+    const pictureAt = async (time: number) => at((await runCapture("ffmpeg", ["-v", "error", "-ss", String(time), "-i", file,
+      "-frames:v", "1", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"])).stdout, 32);
+    const audio = async () => (await runCapture("ffmpeg", ["-v", "error", "-i", file, "-map", "0:a:0", "-f", "s16le", "-"])).stdout;
+
+    const result = await renderFullCached(project, timeline, cache, file, { ...options, segmentSeconds: 2, quality: "delivery" });
+    expect(result.segments.map(segment => segment.range)).toEqual([{ start: 0, end: 2 }, { start: 2, end: 4 }]);
+    expect(await pictureAt(1.9)).toBe("m");
+    expect(await pictureAt(2)).toBe("m");
+    const deliveryAudio = await audio();
+    await renderFullCached(project, join(), cache, file, { ...options, segmentSeconds: 2, quality: "delivery" });
+    expect(await audio()).toEqual(deliveryAudio);
+    // If a straight cut was already cached here, adding the dissolve must rerender its picture.
+    await renderPlaybackSegment(project, join(), { start: 2, end: 4 }, cache, file, options);
+    expect(await pictureAt(0)).toBe("b");
+    const playbackAudio = await audio();
+    await renderPlaybackSegment(project, timeline, { start: 2, end: 4 }, cache, file, options);
+    expect(await pictureAt(0)).toBe("m");
+    expect(await audio()).toEqual(playbackAudio);
+  });
+
+  it("allows a lower track to show through an incoming dissolve", async () => {
+    const base = { id: "base", kind: "color" as const, color: "#ff0000", timelineIn: 0, timelineOut: 4, enabled: true, opacity: 1 };
+    const card = { ...base, id: "card", color: "#00ff00", timelineOut: 2, transform: { scale: 0.5 } };
+    const timeline = join({ type: "dissolve", duration: 1, direction: "left" });
+    const upper = timeline.tracks[0]!;
+    timeline.tracks = [{ ...upper, id: "base-track", clips: [base] }, { ...upper, clips: [card, upper.clips[1]!] }];
+    expect(at(await frameAt(timeline, 2), 4)).toBe("m");
   });
 
   it("moves from a colour card that ends at the join, wherever the card is stored on the track", async () => {

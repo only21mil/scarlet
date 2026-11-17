@@ -84,6 +84,8 @@ export interface TranscriptSearchResult {
   segmentCount: number;
   wordCount: number;
   matches: TranscriptMatch[];
+  /** The exact word order searched. When the caller knows this id, its copy supplies the texts. */
+  wordSnapshot?: { id: string; texts?: string[] };
 }
 
 export interface FuzzyTranscriptMatch extends TranscriptMatch {
@@ -95,13 +97,22 @@ export interface FuzzyTranscriptMatch extends TranscriptMatch {
 export function tokenSimilarity(a: string, b: string): number {
   if (a === b) return 1;
   if (!a.length || !b.length) return 0;
-  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
-  for (let i = 1; i <= a.length; i++) {
-    const row = [i];
-    for (let j = 1; j <= b.length; j++) row[j] = Math.min(prev[j]! + 1, row[j - 1]! + 1, prev[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1));
-    prev = row;
+  // Shared affixes do not change edit distance. Keep the original lengths for the ratio.
+  let start = 0, endA = a.length, endB = b.length;
+  while (start < endA && start < endB && a[start] === b[start]) start++;
+  while (start < endA && start < endB && a[endA - 1] === b[endB - 1]) { endA--; endB--; }
+  const width = endB - start;
+  const row = Array.from({ length: width + 1 }, (_, j) => j);
+  for (let i = start; i < endA; i++) {
+    let diagonal = row[0]!;
+    row[0] = i - start + 1;
+    for (let j = 1; j <= width; j++) {
+      const above = row[j]!;
+      row[j] = Math.min(above + 1, row[j - 1]! + 1, diagonal + (a[i] === b[start + j - 1] ? 0 : 1));
+      diagonal = above;
+    }
   }
-  return 1 - prev[b.length]! / Math.max(a.length, b.length);
+  return 1 - row[width]! / Math.max(a.length, b.length);
 }
 
 /** Tokens this close count as the same word: plurals, ASR spelling drift and typos in words of five letters or more. */
@@ -112,22 +123,52 @@ const SAME_TOKEN = 0.8;
 export function sameToken(a: string, b: string): boolean {
   if (a === b) return true;
   const longest = Math.max(a.length, b.length);
-  if (1 - Math.abs(a.length - b.length) / longest < SAME_TOKEN) return false;
+  if (longest < 5 || 1 - Math.abs(a.length - b.length) / longest < SAME_TOKEN) return false;
   return tokenSimilarity(a, b) >= SAME_TOKEN;
+}
+
+/** For one query, compare each distinct transcript token at most once while its rows fit in memory. */
+function tokenMatches(query: string[], maxCells = Infinity) {
+  const cache = new Map<string, Uint8Array>();
+  return (token: string) => {
+    const cached = cache.get(token);
+    if (cached) return cached;
+    const matches = Uint8Array.from(query, q => Number(sameToken(q, token)));
+    if ((cache.size + 1) * query.length <= maxCells) cache.set(token, matches);
+    return matches;
+  };
+}
+
+/** Advance one column of the longest-common-subsequence table for an incoming word. */
+function advanceLcs(lengths: Uint32Array, matches: Uint8Array) {
+  let diagonal = 0;
+  for (let i = 1; i < lengths.length; i++) {
+    const previous = lengths[i]!;
+    lengths[i] = matches[i - 1] ? diagonal + 1 : Math.max(previous, lengths[i - 1]!);
+    diagonal = previous;
+  }
+}
+
+/** Compare a clause with nearby takes. The same LCS table also scores their equal-length prefixes. */
+export function transcriptSequenceMatcher(query: string[]) {
+  const matches = tokenMatches(query, 256 * 1024);
+  const lengths = new Uint32Array(query.length + 1);
+  return (other: string[]) => {
+    if (!query.length || !other.length) return { score: 0, prefix: 0 };
+    lengths.fill(0);
+    let prefix = 0;
+    const shorter = Math.min(query.length, other.length);
+    for (let j = 0; j < other.length; j++) {
+      advanceLcs(lengths, matches(other[j]!));
+      if (j + 1 === shorter) prefix = lengths[shorter]! / shorter;
+    }
+    return { score: (2 * lengths[query.length]!) / (query.length + other.length), prefix };
+  };
 }
 
 /** Dice-style similarity of two token sequences: 2·LCS / (|a|+|b|), with fuzzy token equality. */
 export function sequenceSimilarity(a: string[], b: string[]): number {
-  if (!a.length || !b.length) return 0;
-  let prev = new Array<number>(b.length + 1).fill(0);
-  for (let i = 1; i <= a.length; i++) {
-    const row = [0];
-    for (let j = 1; j <= b.length; j++) {
-      row[j] = sameToken(a[i - 1]!, b[j - 1]!) ? prev[j - 1]! + 1 : Math.max(prev[j]!, row[j - 1]!);
-    }
-    prev = row;
-  }
-  return (2 * prev[b.length]!) / (a.length + b.length);
+  return transcriptSequenceMatcher(a)(b).score;
 }
 
 /**
@@ -140,30 +181,21 @@ export function fuzzySearchTranscript(words: TranscriptWord[], query: string,
   const { contextWords = 6, minScore = 0.6, limit = 20 } = opts;
   const q = query.split(/\s+/).map(normalizeTranscriptToken).filter(Boolean).slice(0, 40);
   if (!q.length) return [];
-  // Compare each distinct word with each query token once; windows then only look up the matrix.
-  const rows = new Map<string, boolean[]>();
-  const same = words.map(w => {
-    const t = normalizeTranscriptToken(w.text);
-    let row = rows.get(t);
-    if (!row) rows.set(t, row = q.map(x => sameToken(t, x)));
-    return row;
-  });
-  const lcs = (i: number, n: number) => {
-    let prev = new Array<number>(n + 1).fill(0);
-    for (let a = 1; a <= q.length; a++) {
-      const row = [0];
-      for (let b = 1; b <= n; b++) row[b] = same[i + b - 1]![a - 1] ? prev[b - 1]! + 1 : Math.max(prev[b]!, row[b - 1]!);
-      prev = row;
-    }
-    return prev[n]!;
-  };
+  const matchToken = tokenMatches(q);
+  const same = words.map(w => matchToken(normalizeTranscriptToken(w.text)));
+  const lengths = new Uint32Array(q.length + 1);
+  const shortest = Math.max(1, q.length - 2);
   const found: Array<{ i: number; n: number; score: number }> = [];
   for (let i = 0; i < words.length; i++) {
     // A match starts on a word that resembles some query word.
     if (!same[i]!.some(Boolean)) continue;
     let best: { n: number; score: number } | undefined;
-    for (let n = Math.max(1, q.length - 2); n <= q.length + 2 && i + n <= words.length; n++) {
-      const score = (2 * lcs(i, n)) / (q.length + n);
+    lengths.fill(0);
+    const longest = Math.min(q.length + 2, words.length - i);
+    for (let n = 1; n <= longest; n++) {
+      advanceLcs(lengths, same[i + n - 1]!);
+      if (n < shortest) continue;
+      const score = (2 * lengths[q.length]!) / (q.length + n);
       if (!best || score > best.score) best = { n, score };
     }
     if (best && best.score >= minScore) found.push({ i, ...best });

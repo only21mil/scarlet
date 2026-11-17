@@ -27,11 +27,18 @@ export async function realignTranscript(ctx: Ctx, projectId: string, mediaId: st
   const original = linked(ctx, projectId, mediaId);
   if (!media || media.projectId !== projectId || !original) return { state: "unavailable", reason: "This recording has no transcript." };
   if (original.aligning) return { state: "unavailable", reason: "This transcript is still being aligned." };
+  if (!original.segments.some(segment => segment.words.length)) return { state: "unavailable", reason: "This transcript has no words to realign." };
   if (!alignsLanguage(original.language)) return { state: "unavailable", reason: "Word alignment doesn’t read this transcript’s language." };
   if (original.alignment === alignmentVersion) return { state: "current" };
   const source = join(ctx.paths.media(projectId), media.path);
-  const segments = await alignTranscript(ctx, { source, language: original.language, segments: original.segments, signal,
-    emissions: await emissionStore(ctx, projectId, source), work: { mediaId, kind: "alignment" } });
+  const emissions = await emissionStore(ctx, projectId, source).catch(() => undefined);
+  signal.throwIfAborted();
+  if (!emissions) return { state: "unavailable", reason: "The source recording is unavailable." };
+  let failed = false;
+  const segments = await alignTranscript(ctx, { source, language: original.language, segments: original.segments, signal, emissions,
+    work: { mediaId, kind: "alignment" }, onFailure: () => { failed = true; } });
+  signal.throwIfAborted();
+  if (failed) return { state: "unavailable", reason: "Scarlet couldn’t realign this transcript. Try again when the source recording and aligner are available." };
   return ctx.db.transaction((): Realigned => {
     // A transcription or a speaker reading that finished meanwhile wrote the transcript this one would replace.
     const current = ctx.repos.projects.getMedia(mediaId);

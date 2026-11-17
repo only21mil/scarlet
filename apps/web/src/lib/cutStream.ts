@@ -1,5 +1,5 @@
 import { firstIndex, type TimeRange } from "@scarlet/timeline";
-import { api } from "./client";
+import { api, loggedFetch, readLoggedBody } from "./client";
 import { logId, mediaState, playbackLog, playbackLogging, timeRanges } from "./playbackLog";
 
 type Load = (range: TimeRange, signal: AbortSignal) => Promise<ArrayBuffer>;
@@ -17,13 +17,13 @@ export function playbackLoader(projectId: string, version: string): Load {
     signal.throwIfAborted();
     const url = new URL(api.fileUrl(`/projects/${encodeURIComponent(projectId)}/renders`));
     url.searchParams.set("wait", "1");
-    const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
+    const response = await loggedFetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ kind: "playback", quality: "preview", version, range }), signal });
     if (!response.ok) {
-      const body = await response.json().catch(() => undefined);
+      const body = await readLoggedBody(response, () => response.json()).catch(() => undefined);
       throw new Error(body?.error?.message || "Couldn’t load the preview file.");
     }
-    const bytes = await response.arrayBuffer();
+    const bytes = await readLoggedBody(response, () => response.arrayBuffer());
     signal.throwIfAborted();
     return bytes;
   };

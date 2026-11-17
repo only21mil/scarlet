@@ -1,5 +1,5 @@
 import { planCutReview } from "./cutReview.js";
-import { stableStringify } from "./ids.js";
+import { sameJson as equal, stableStringify } from "./ids.js";
 import { replayJoinFades } from "./joinCrossfade.js";
 import { applyOps, TimelineOp } from "./ops.js";
 import { assignSpots, replayOps, changedSpots, rangesOverlapWithin, planApply, makeTimeMap } from "./rebase.js";
@@ -22,7 +22,6 @@ export function historyLineage(versions: VersionLink[], head: string | null) {
   return { lineage, undone };
 }
 
-const equal = (a: unknown, b: unknown) => stableStringify(a) === stableStringify(b);
 /** The tolerance a ripple reads two times as meeting within (MEET in ops.ts): a clip this short has no footage in it. */
 const NO_LENGTH = 1e-9;
 export class HistoryConflict extends Error {}

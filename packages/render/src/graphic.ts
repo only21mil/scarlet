@@ -296,6 +296,21 @@ async function evaluate<T>(browser: Browser, page: Page, expression: string): Pr
   return result.result?.value as T;
 }
 
+/**
+ * Whether nothing on the page can change with time: no clock of its own, no animation, transition or SVG animation,
+ * and nothing that plays by itself. Runs after PREPARE, so every animation the page declares already exists.
+ */
+const STILL = String.raw`(() => {
+  if (typeof window.scarletSeek === "function" || document.getAnimations().length) return false;
+  if (document.querySelector("script, video, audio, canvas, iframe, object, embed, marquee, animate, animateTransform, animateMotion, set")) return false;
+  const moving = /\.(gif|apng|webp|avif)\b|image\/(gif|apng|webp|avif)/i;
+  if (moving.test(document.documentElement.outerHTML)) return false;
+  for (const sheet of document.styleSheets) {
+    try { for (const rule of sheet.cssRules) if (moving.test(rule.cssText)) return false; } catch { return false; }
+  }
+  return true;
+})()`;
+
 async function prepare(browser: Browser, page: Page) {
   return evaluate<{ missing: MissingFont[]; installed: string[] }>(browser, page, PREPARE);
 }
@@ -336,6 +351,8 @@ export interface GraphicRenderResult {
   installedFonts: string[];
   /** Script errors and files the page couldn't load, as Chrome reported them. */
   problems: string[];
+  /** Frames Chrome drew. A page that doesn't change is drawn at its first and last frame, and the first is held. */
+  drawn: number;
   /** Milliseconds spent. */
   elapsedMs: number;
 }
@@ -369,9 +386,24 @@ export async function renderGraphic(opts: GraphicRenderOptions): Promise<Graphic
   const workers = Math.max(1, Math.min(opts.pages ?? Math.min(4, Math.max(1, Math.floor(availableParallelism() / 2))), total));
   return withBrowser(opts, async (browser, url) => {
     const size = { width: opts.width, height: opts.height, scale: 1 };
-    const pages = await Promise.all(Array.from({ length: workers }, () => openPage(browser, url, size, opts.signal)));
+    const pages = [await openPage(browser, url, size, opts.signal)];
     const { missing: missingFonts, installed: installedFonts } = await prepare(browser, pages[0]!);
-    await Promise.all(pages.slice(1).map(page => prepare(browser, page)));
+    // A page with nothing that moves is one picture held for its length: a photo or a title card. Drawing each of its
+    // frames in Chrome took five minutes for 6.5 s at 3840x2160 on a busy machine, and the call timed out (2026-11-16).
+    // Its first and last frames are drawn and compared, so a page that does change is drawn in full whatever it is made of.
+    let held: Buffer | undefined;
+    let drawn = 0;
+    if (total > 2 && await evaluate<boolean>(browser, pages[0]!, STILL).catch(() => false)) {
+      const first = await frameAt(browser, pages[0]!, 0);
+      const last = await frameAt(browser, pages[0]!, ((total - 1) / opts.fps) * 1000);
+      drawn = 2;
+      if (first.equals(last)) held = first;
+    }
+    if (!held && workers > 1) {
+      const more = await Promise.all(Array.from({ length: workers - 1 }, () => openPage(browser, url, size, opts.signal)));
+      await Promise.all(more.map(page => prepare(browser, page)));
+      pages.push(...more);
+    }
 
     const ffmpeg = spawn(resolveFfmpeg(opts.ffmpegPath), [
       "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
@@ -409,12 +441,20 @@ export async function renderGraphic(opts: GraphicRenderOptions): Promise<Graphic
         while (i >= written + window) await new Promise<void>(resolve => waiting.push(resolve));
         opts.signal?.throwIfAborted();
         ready.set(i, await frameAt(browser, page, (i / opts.fps) * 1000));
+        drawn++;
         writing = writing.then(write);
+      }
+    };
+    const hold = async (png: Buffer) => {
+      for (let i = 0; i < total; i++) {
+        opts.signal?.throwIfAborted();
+        ready.set(i, png);
+        await write();
       }
     };
     try {
       await Promise.race([
-        Promise.all(pages.map((page, w) => draw(page, w))),
+        held ? hold(held) : Promise.all(pages.map((page, w) => draw(page, w))),
         finished.then(() => { throw new Error("ffmpeg stopped before the graphic was drawn."); }),
       ]);
       await writing;
@@ -431,7 +471,7 @@ export async function renderGraphic(opts: GraphicRenderOptions): Promise<Graphic
     return {
       output: opts.output, frames: total, missingFonts, installedFonts,
       problems: [...new Set(pages.flatMap(p => p.problems))].slice(0, 10),
-      elapsedMs: Math.round(performance.now() - started),
+      drawn, elapsedMs: Math.round(performance.now() - started),
     };
   });
 }

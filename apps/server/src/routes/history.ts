@@ -1,4 +1,4 @@
-import { recoverIngestInBackground } from "../services/ingest.js";
+import { resumeImportsInBackground } from "../services/ingest.js";
 import { recoverSourcePreviews } from "../services/sourcePreviews.js";
 import { Hono } from "hono";
 import { z } from "zod/v3";
@@ -61,7 +61,7 @@ export function historyRoutes(ctx: Ctx) {
     if (!ctx.db.prepare("SELECT 1 FROM projects WHERE id = ? AND deleted_at IS NOT NULL").get(id)) throw notFound(`project ${id} in the trash`);
     const user = c.var.user;
     ctx.repos.projects.restore(id);
-    recoverIngestInBackground(ctx, id);
+    resumeImportsInBackground(ctx, id);
     recoverSourcePreviews(ctx, id);
     const project = ctx.repos.projects.get(id)!;
     logActivity(ctx, { projectId: id, actor: actorFor(user), type: "project.restored", summary: `${user.name} restored the project from the trash` });

@@ -21,6 +21,8 @@ export interface SpawnLinesOptions {
   /** Keep stdin open for a metadata protocol handshake. */
   interactive?: boolean;
   signal?: AbortSignal;
+  /** Ask a protocol client to stop, with a short period to drain its final events. */
+  interrupt?: () => boolean;
   /** Stop the process after this long, however busy it is. Omitted: no cap. */
   timeoutMs?: number;
   /** Stop the process once it has written nothing to stdout for this long. */
@@ -108,6 +110,7 @@ export function spawnLines(file: string, args: string[], opts: SpawnLinesOptions
   let killed = false;
   let settled = false;
   let stderr = "";
+  let interruptTimer: NodeJS.Timeout | undefined;
   const kill = () => {
     // Once the CLI and its output are gone, the system may give its process id to another program.
     if (killed || settled || !child.pid) return;
@@ -121,9 +124,13 @@ export function spawnLines(file: string, args: string[], opts: SpawnLinesOptions
       child.stderr?.destroy();
     }, 1000).unref();
   };
+  const stop = () => {
+    if (opts.interrupt?.()) interruptTimer ??= setTimeout(kill, 2000).unref();
+    else kill();
+  };
   const timer = opts.timeoutMs === undefined ? undefined : setTimeout(() => {
     timedOut = true;
-    kill();
+    stop();
   }, opts.timeoutMs);
   // The agent CLIs stream an event for every step, tool call and message, so a long silence means a hang.
   let lastOutput = Date.now();
@@ -134,7 +141,7 @@ export function spawnLines(file: string, args: string[], opts: SpawnLinesOptions
     const quiet = Date.now() - lastOutput;
     if (quiet >= opts.stallMs) {
       stalled = timedOut = true;
-      kill();
+      stop();
       return;
     }
     stallTimer = setTimeout(watchStall, opts.stallMs - quiet);
@@ -142,7 +149,7 @@ export function spawnLines(file: string, args: string[], opts: SpawnLinesOptions
   watchStall();
   const onAbort = () => {
     aborted = true;
-    kill();
+    stop();
   };
   if (opts.signal) {
     if (opts.signal.aborted) onAbort();
@@ -183,6 +190,7 @@ export function spawnLines(file: string, args: string[], opts: SpawnLinesOptions
       settled = true;
       clearTimeout(timer);
       clearTimeout(stallTimer);
+      clearTimeout(interruptTimer);
       opts.signal?.removeEventListener("abort", onAbort);
       if (buf.trim()) emitLine(buf.replace(/\r$/, ""));
       resolve({ code, signal, timedOut, stalled, aborted, killed, stderr });

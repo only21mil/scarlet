@@ -1,11 +1,14 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeAll, expect, it } from "vitest";
+import { afterAll, beforeAll, expect, it, vi } from "vitest";
+import { fileInDirectory } from "@scarlet/render";
 import { createProject, type MediaAsset, type Transcript } from "@scarlet/timeline";
 import { createApp, type ScarletApp } from "../app.js";
 import { ffmpeg } from "../render/ffmpeg.js";
-import { measureSources, readSourceEnergy, savedVoiceLabels, sourceLabels, transcriptSourceReader, wordSource } from "./transcriptSources.js";
+import * as sources from "./transcriptSources.js";
+import { measureSources, readSourceEnergy, savedVoiceLabels, sourceLabels, wordSource } from "./transcriptSources.js";
+import { sourceEnergyReader, transcriptSourceReader } from "./sourceEnergy.js";
 
 let directory: string;
 let workspace: ScarletApp;
@@ -95,6 +98,27 @@ it("marks each word of a transcript page with the microphone it came from, and l
   const fresh = transcriptSourceReader(workspace.ctx);
   expect(sourcesOf(await fresh(projectId, recording(), transcript([1.2, 1.6]), 1.1, 1.9))).toEqual([undefined]);
   expect(sourcesOf(await fresh(projectId, recording({ voiceRoles: { me: 3, other: 1 } }), transcript([1.2, 1.6]), 1.1, 1.9))).toEqual(["me"]);
+});
+
+it("reads a window's levels once for every reader that asks for it, as a decode of that window reads them", async () => {
+  const file = fileInDirectory(workspace.ctx.paths.media(projectId), "podcast.mka")!;
+  const decode = vi.spyOn(sources, "readSourceEnergy");
+  const probe = vi.spyOn(sources, "sourceLabels");
+  try {
+    const page = transcript([0.25, 0.65]);
+    // A transcript page, then a scan page or the editor's voice reference over the same stretch.
+    await transcriptSourceReader(workspace.ctx)(projectId, recording(), page, 0.05, 2.95);
+    const levels = sourceEnergyReader(workspace.ctx);
+    const [shared] = await Promise.all([levels.energy(file, 0.05, 2.95, never), levels.energy(file, 0.05, 2.95, never)]);
+    expect(await levels.labels(file, never)).toEqual(["Host mic", "Track 2", "Guest"]);
+    expect(decode).toHaveBeenCalledTimes(1);
+    // The streams were named by an earlier read of this file, if not by this one.
+    expect(probe.mock.calls.length).toBeLessThanOrEqual(1);
+    // The levels are the window's own decode. FFmpeg's join doesn't always give the last block or two the same.
+    const own = await readSourceEnergy(file, 0.05, 2.95, never);
+    expect(shared.mix).toBe(own.mix);
+    expect(shared.energy.slice(0, 140)).toEqual(own.energy.slice(0, 140));
+  } finally { decode.mockRestore(); probe.mockRestore(); }
 });
 
 it("returns the page as it was for a range it doesn't read, or a file with nothing to compare", async () => {

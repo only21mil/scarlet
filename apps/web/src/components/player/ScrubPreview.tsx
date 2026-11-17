@@ -1,11 +1,19 @@
 import { interactiveFrameUrl } from "../review/thumbs";
 import { useLayoutEffect, useRef, type CSSProperties, type ReactNode } from "react";
 import { playbackClock } from "../../lib/format";
+import { errorName, logPath } from "../../lib/appLog";
+import { logId, playbackLog } from "../../lib/playbackLog";
 
 const WIDTH = 320;
 // Give a nearby seek a chance to finish while the pointer is moving. Once it
 // settles elsewhere, a slow decode for the old position shouldn't hold it up.
 const RETARGET_MS = 64;
+// How long a hover waits for a seek once the file's index is read, and for the index itself.
+const SEEK_MS = 500;
+const METADATA_MS = 3_000;
+// After a decoder error the file is opened again, a little later each time.
+const REOPEN_MS = 2_000;
+const MAX_REOPEN_MS = 60_000;
 
 /** A playable file on the displayed timeline's clock, including its edits. */
 export interface HoverVideo { url: string; lastFrame: number }
@@ -16,30 +24,46 @@ function unload(video: HTMLVideoElement) {
   video.load();
 }
 
-/** Seek a paused copy of the playable file. Keep the decoder open between hovers. */
-function hoverMovie(video: HTMLVideoElement, lastFrame: number, paint: (frame: HTMLVideoElement) => void, useStill: () => void) {
+/**
+ * Seek a paused copy of the playable file. Keep the decoder open between hovers. A hover it is too slow for shows the
+ * engine's stills until the pointer leaves, and the next hover tries it again. A file it can't read is opened again later.
+ */
+function hoverMovie(video: HTMLVideoElement, file: string, lastFrame: number, paint: (frame: HTMLVideoElement) => void, useStill: () => void) {
   let time: number | undefined;
   let requested: number | undefined;
   let drawn: number | undefined;
   let timeout: number | undefined;
+  let stills = false;
+  let errors = 0;
+  let reopen: number | undefined;
 
   function clearWait() {
     window.clearTimeout(timeout);
     timeout = undefined;
   }
-  function fail() {
-    if (!video.hasAttribute("src")) return;
+  function fail(reason: "timeout" | "no-metadata" | "out-of-range" | "no-picture" | "media-error") {
+    if (!video.hasAttribute("src") || (stills && reason !== "media-error")) return;
+    playbackLog("scrub-video-fallback", { reason, el: logId(video), t: time, ready: video.readyState });
     clearWait();
-    unload(video);
+    if (reason === "no-picture") unload(video);
+    else if (reason === "media-error") {
+      unload(video);
+      window.clearTimeout(reopen);
+      reopen = window.setTimeout(() => {
+        reopen = undefined;
+        if (!video.hasAttribute("src")) video.src = file;
+      }, Math.min(MAX_REOPEN_MS, REOPEN_MS * 2 ** errors++));
+    } else stills = true;
     if (time !== undefined) useStill();
   }
   function seek() {
-    if (time === undefined || !video.hasAttribute("src")) return;
+    if (time === undefined || !video.hasAttribute("src") || stills) return;
     let ready = false;
     if (video.readyState >= 1 && Number.isFinite(video.duration) && video.duration > 0) {
       // The MP4's audio can extend past the final picture.
       const at = Math.floor(Math.min(time, lastFrame) * 4) / 4;
-      if (at >= video.duration || (video.readyState >= 2 && !video.videoWidth)) { fail(); return; }
+      const reason = at >= video.duration ? "out-of-range" : video.readyState >= 2 && !video.videoWidth ? "no-picture" : undefined;
+      if (reason) { fail(reason); return; }
       const matches = Math.abs(video.currentTime - at) < 0.001;
       const decoded = !video.seeking && video.readyState >= 2;
       ready = decoded && matches;
@@ -54,22 +78,30 @@ function hoverMovie(video: HTMLVideoElement, lastFrame: number, paint: (frame: H
         video.currentTime = at;
       }
     }
-    if (!ready) timeout ??= window.setTimeout(fail, 500);
+    // The wait for a seek starts once the file's index is read. Until then it waits for the index, and longer.
+    if (!ready) timeout ??= video.readyState >= 1 ? window.setTimeout(() => fail("timeout"), SEEK_MS)
+      : window.setTimeout(() => fail("no-metadata"), METADATA_MS);
     else clearWait();
   }
-  function progress() { clearWait(); seek(); }
+  function progress() {
+    if (video.readyState >= 1) errors = 0;
+    clearWait();
+    seek();
+  }
   video.addEventListener("loadedmetadata", progress);
   video.addEventListener("loadeddata", progress);
   video.addEventListener("seeked", progress);
-  video.addEventListener("error", fail);
+  const mediaError = () => fail("media-error");
+  video.addEventListener("error", mediaError);
   return {
-    show(at: number) { time = at; seek(); return video.hasAttribute("src"); },
-    hide() { time = requested = drawn = undefined; clearWait(); },
+    show(at: number) { time = at; seek(); return video.hasAttribute("src") && !stills; },
+    hide() { time = requested = drawn = undefined; stills = false; clearWait(); },
     dispose() {
+      window.clearTimeout(reopen);
       video.removeEventListener("loadedmetadata", progress);
       video.removeEventListener("loadeddata", progress);
       video.removeEventListener("seeked", progress);
-      video.removeEventListener("error", fail);
+      video.removeEventListener("error", mediaError);
       clearWait();
     },
   };
@@ -148,19 +180,30 @@ export function ScrubPreview({ start = 0, duration, pictureAspect = 16 / 9, fram
       const request = new AbortController();
       pending = { url, controller: request };
       let objectUrl: string | undefined;
+      const started = performance.now(), target = time;
+      let phase = "fetch", status: number | undefined;
       try {
         const response = await fetch(url, { signal: request.signal });
+        status = response.status;
+        phase = "http";
         if (!response.ok) throw Error("Unavailable preview frame");
+        phase = "body";
         const bytes = await response.blob();
         if (request.signal.aborted) return;
         objectUrl = URL.createObjectURL(bytes);
         const image = new Image();
         image.src = objectUrl;
+        phase = "decode";
         await image.decode();
         if (request.signal.aborted || (dragId !== undefined && wanted !== url)) return;
         draw(image);
         displayed = url;
-      } catch {
+      } catch (error) {
+        if (!request.signal.aborted) {
+          const path = logPath(url);
+          playbackLog("scrub-frame-failed", { phase, status, t: target, ms: performance.now() - started,
+            path: path.startsWith("/api/") ? path : undefined, name: errorName(error) });
+        }
         if (!request.signal.aborted && wanted === url) {
           canvas.hidden = true;
           displayed = undefined;
@@ -195,7 +238,7 @@ export function ScrubPreview({ start = 0, duration, pictureAspect = 16 / 9, fram
         }, RETARGET_MS);
       }
     }
-    const movie = video.current && lastFrame !== undefined ? hoverMovie(video.current, lastFrame, draw, sample) : undefined;
+    const movie = video.current && file && lastFrame !== undefined ? hoverMovie(video.current, file, lastFrame, draw, sample) : undefined;
     function update() {
       paint = 0;
       const rect = track.getBoundingClientRect();

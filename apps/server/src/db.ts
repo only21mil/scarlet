@@ -483,8 +483,11 @@ export function openDb(path: string): Db {
       (NEW.state = 'failed' AND json_extract(NEW.json, '$.interrupted') IS NOT 1))
     BEGIN DELETE FROM transcription_work WHERE task_id = NEW.id; END;`);
   ensureReadIndexes(db);
+  ensureLookupIndexes(db);
   ensureGraphics(db);
   ensureProjectSource(db);
+  ensureProjectRowRevision(db);
+  ensureColumn(db, "projects", "editing_paused", "ALTER TABLE projects ADD COLUMN editing_paused INTEGER NOT NULL DEFAULT 0;");
   return db;
 }
 
@@ -546,6 +549,14 @@ function ensureProjectFormat(db: Db): void {
   }, "immediate")();
 }
 
+// Order snapshots independently of Last edited. The trigger also sees writes by older engines sharing the library.
+function ensureProjectRowRevision(db: Db): void {
+  ensureColumn(db, "projects", "row_revision", `ALTER TABLE projects ADD COLUMN row_revision INTEGER NOT NULL DEFAULT 0;
+    CREATE TRIGGER project_row_changed AFTER UPDATE OF name, settings, head, archived, media_paused, branch,
+      style_guide, source, source_notice, completed_threads, updated_at, deleted_at ON projects
+    BEGIN UPDATE projects SET row_revision = OLD.row_revision + 1 WHERE id = NEW.id; END;`);
+}
+
 /**
  * The project a short was made from, and whether the line in its chat that says so is still shown. Installed by name,
  * as the graphics columns are, so a checkout and a release sharing a library don't take each other's numbers.
@@ -592,6 +603,33 @@ function ensureReadIndexes(db: Db): void {
         BEGIN INSERT INTO transcript_revisions(transcript_id) VALUES (NEW.id)
           ON CONFLICT(transcript_id) DO UPDATE SET revision = excluded.revision; END;`);
     }
+  }, "immediate")();
+}
+
+/**
+ * Lookups the engine makes as it starts and while it runs that would otherwise read every row of a growing table.
+ * Installed by name, as the read indexes are. A partial index holds only the rows its query looks for: the repairs
+ * that run as Scarlet starts find nothing to do without reading the edits and requests that were done with long ago.
+ */
+const LOOKUP_INDEXES = {
+  changes_by_task: "ON changes(project_id, json_extract(json, '$.taskId'))",
+  tasks_by_revised_cut: "ON tasks(project_id, json_extract(json, '$.context.changeId')) WHERE json_extract(json, '$.context.cutIndex') IS NOT NULL",
+  tasks_by_resume_root: "ON tasks(json_extract(json, '$.resumeRootId')) WHERE json_extract(json, '$.resumeRootId') IS NOT NULL",
+  changes_state: "ON changes(state)",
+  renders_export: "ON renders(created_at) WHERE json_extract(json, '$.export.owner') IS NOT NULL",
+  changes_left_out_unread: `ON changes(created_at) WHERE state = 'approved' AND json_extract(json, '$.leftOut') IS NULL
+    AND json_array_length(coalesce(json_extract(json, '$.ops'), '[]')) > 0
+    AND json_array_length(coalesce(json_extract(json, '$.cutReasons'), '[]')) = 0`,
+  tasks_dialogue_unset: "ON tasks(created_at) WHERE kind IN ('edit','revise','note') AND json_type(json, '$.context.dialogueOperation') IS NULL",
+};
+
+function ensureLookupIndexes(db: Db): void {
+  const names = Object.keys(LOOKUP_INDEXES);
+  const missing = () => names.filter(name => !db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = ?").get(name));
+  if (!missing().length) return;
+  db.transaction(() => {
+    // Another engine opening this library may have added them since. Look again with the write lock held.
+    for (const name of missing()) db.exec(`CREATE INDEX IF NOT EXISTS ${name} ${LOOKUP_INDEXES[name as keyof typeof LOOKUP_INDEXES]};`);
   }, "immediate")();
 }
 

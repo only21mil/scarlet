@@ -304,6 +304,45 @@ it("treats a left-over export whose destination is gone as already settled, with
   expect(lines).toEqual([]);
 });
 
+it("leaves settlement to the other Scarlet window when it already has the resumed export", async () => {
+  const kept: Render = { ...render, state: "done", export: { owner: "11111111-1111-4111-8111-111111111111", name: NAME, ...DESTINATION } };
+  vi.spyOn(api, "exports").mockResolvedValue({ renders: [kept] });
+  asked.save.mockRejectedValue("Export is already saving in another Scarlet window.");
+  await resumeExports();
+  await vi.waitFor(() => expect(job()).toBeUndefined());
+  expect(asked.save).toHaveBeenCalledTimes(1);
+  expect(asked.release).not.toHaveBeenCalled();
+  expect(asked.discard).not.toHaveBeenCalled();
+  expect(lines).toEqual([]);
+});
+
+it("leaves settlement to another Scarlet window that resumed an export this window started", async () => {
+  // The other window picked up every export the engine owed, this one too, and claimed its save first.
+  render = { ...render, state: "done", progress: 1 };
+  asked.save.mockRejectedValue("Export is already saving in another Scarlet window.");
+  await exportFile(project, video);
+  expect(job()).toBeUndefined();
+  expect(asked.release).not.toHaveBeenCalled();
+  expect(asked.discard).not.toHaveBeenCalled();
+  expect(lines).toEqual([]);
+});
+
+it.each([["a new export", false], ["a resumed export", true]])("lets go of %s whose destination record can't be read, so a failure shown never saves later", async (_, resumed) => {
+  render = { ...render, state: "done", progress: 1 };
+  asked.save.mockRejectedValue("Export destinations could not be saved or read.");
+  // Even when the engine can't hear that the export is settled, the destination is given up.
+  asked.release.mockRejectedValue(new TypeError("Load failed"));
+  if (resumed) {
+    vi.spyOn(api, "exports").mockResolvedValue({ renders: [{ ...render, export: { owner: "11111111-1111-4111-8111-111111111111", name: NAME, ...DESTINATION } }] });
+    await resumeExports();
+  } else {
+    await exportFile(project, video);
+  }
+  await vi.waitFor(() => expect(asked.discard).toHaveBeenCalledExactlyOnceWith(DESTINATION.ticket));
+  expect(job()).toMatchObject({ phase: "failed", error: "Export destinations could not be saved or read." });
+  expect(asked.release).toHaveBeenCalledExactlyOnceWith("rnd_export", resumed ? "11111111-1111-4111-8111-111111111111" : asked.request.mock.calls[0]![1].owner);
+});
+
 it("counts an export's percent only while it moves", () => {
   const job: ExportJob = { file: video, context: "c", version: "v", phase: "rendering", progress: 0.42, cancel: () => {} };
   expect(exportCounting(job)).toBe(true);

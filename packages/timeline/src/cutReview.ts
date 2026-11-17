@@ -214,11 +214,11 @@ export function canStartCutReview(change: Change): boolean {
 }
 
 /** Restored source shifts the remaining joins on the approved cut. Preserve the proposed coordinates for Undo. */
-export function appliedCutReview(review: CutReview, restored: number[]): NonNullable<Change["appliedReview"]> {
+export function appliedCutReview(review: CutReview, restored: number[], preserveProposedAt = false): NonNullable<Change["appliedReview"]> {
   const indices = new Set(restored);
   let shift = 0;
   const joins = review.cuts.flatMap((cut, i) => {
-    if (!indices.has(i)) return [{ at: cut.at + shift, removed: cut.removed }];
+    if (!indices.has(i)) return [{ at: cut.at + shift, removed: cut.removed, ...(preserveProposedAt && { proposedAt: cut.at }) }];
     shift += cut.removed.end - cut.removed.start;
     return [];
   });
@@ -307,31 +307,46 @@ export function cutSummary(description: string) {
   return description.startsWith(legacyPrefix) ? "Optional dialogue cuts are ready to review." : description;
 }
 
-/** Older engines put all reasons in one string. Recover the original ops' exact
- * starts from the rounded labels before associating them with coalesced cuts. */
-export function reviewReasons(change: Pick<Change, "cutReasons" | "ops" | "description">, cuts: ReadonlyArray<Pick<ReviewCut, "removed"> & { reviewIndex?: number }>) {
-  let items = change.cutReasons;
-  if (!items && change.description.startsWith(legacyPrefix)) {
-    const ops = (change.ops ?? []).filter(op => op.op === "rippleDelete" && typeof op.start === "number" && typeof op.end === "number")
-      .sort((a, b) => Number(a.start) - Number(b.start));
-    const parts = change.description.slice(legacyPrefix.length).split(/ · (?=\d+(?:\.\d+)? s: )/);
-    items = parts.flatMap((part, index) => {
-      const match = /^(\d+(?:\.\d+)?) s: ([\s\S]+)$/.exec(part);
-      if (!match) return [];
-      const op = ops[index];
-      const rounded = Number(match[1]);
-      const start = op && Math.abs(Number(op.start) - rounded) < 0.005001 ? Number(op.start) : rounded;
-      return [{ start, end: start, reason: match[2]! }];
-    });
-  }
-  if (!items) return cuts.map(() => change.description ? [change.description] : []);
-  const reasons = items;
-  const candidates = cuts.length > 1 ? intervalCandidates(reasons, r => r.start, r => r.start) : () => reasons;
-  const original = cuts.some(c => c.reviewIndex !== undefined) ? mergeRanges(reasons, eps) : [];
+type ReviewSpots = ReadonlyArray<Pick<ReviewCut, "removed"> & { reviewIndex?: number }>;
+
+function reviewNotes(items: NonNullable<Change["cutReasons"]>, cuts: ReviewSpots) {
+  const candidates = cuts.length > 1 ? intervalCandidates(items, r => r.start, r => r.start) : () => items;
+  const original = cuts.some(c => c.reviewIndex !== undefined) ? mergeRanges(items, eps) : [];
   return cuts.map(c => {
     const removed = c.reviewIndex === undefined ? c.removed : original[c.reviewIndex] ?? c.removed;
     const start = removed.start - eps;
-    return [...new Set(candidates(start, removed.end).filter(r => r.start >= start && r.start < removed.end)
-      .map(r => r.reason).filter(Boolean))];
+    return candidates(start, removed.end).filter(r => r.start >= start && r.start < removed.end);
+  });
+}
+
+/** Older engines put all reasons in one string. Recover the original ops' exact
+ * starts from the rounded labels before associating them with coalesced cuts. */
+function legacyReviewNotes(change: Pick<Change, "ops" | "description">) {
+  if (!change.description.startsWith(legacyPrefix)) return;
+  const ops = (change.ops ?? []).filter(op => op.op === "rippleDelete" && typeof op.start === "number" && typeof op.end === "number")
+    .sort((a, b) => Number(a.start) - Number(b.start));
+  const parts = change.description.slice(legacyPrefix.length).split(/ · (?=\d+(?:\.\d+)? s: )/);
+  return parts.flatMap((part, index) => {
+    const match = /^(\d+(?:\.\d+)?) s: ([\s\S]+)$/.exec(part);
+    if (!match) return [];
+    const op = ops[index];
+    const rounded = Number(match[1]);
+    const start = op && Math.abs(Number(op.start) - rounded) < 0.005001 ? Number(op.start) : rounded;
+    return [{ start, end: start, reason: match[2]! }];
+  });
+}
+
+export function reviewReasons(change: Pick<Change, "cutReasons" | "ops" | "description">, cuts: ReviewSpots) {
+  const items = change.cutReasons ?? legacyReviewNotes(change);
+  if (!items) return cuts.map(() => change.description ? [change.description] : []);
+  return reviewNotes(items, cuts).map(notes => [...new Set(notes.map(r => r.reason).filter(Boolean))]);
+}
+
+/** Find the short chat summaries on a review spot's original footage, including coalesced removals. */
+export function reviewCutSummaries(change: Pick<Change, "cutReasons">, cuts: ReviewSpots) {
+  if (!change.cutReasons?.some(cut => cut.summary)) return cuts.map(() => undefined);
+  return reviewNotes(change.cutReasons, cuts).map(notes => {
+    const summaries = notes.map(note => note.summary);
+    if (summaries.length && summaries.every(Boolean)) return [...new Set(summaries)].join(" · ");
   });
 }

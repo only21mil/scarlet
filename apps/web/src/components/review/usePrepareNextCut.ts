@@ -3,6 +3,7 @@ import { fullRenderContext, type ThreadEdit } from "@scarlet/shared";
 import { cutPlaybackWindow, firstIndex, mergeRanges, CUT_LEAD_SECONDS, snapToFrame, timelineDuration, type Change, type CutAssessment, type CutReview, type Project, type Timeline, type TimeRange } from "@scarlet/timeline";
 import { appliedCutClock, appliedCutSource } from "../../lib/appliedCutPlayback";
 import { api, IS_MOCK } from "../../lib/client";
+import { readTimeline } from "../../lib/timelineCache";
 import { cutAudition, cutAuditionClock, isolatedReviewCut } from "../../lib/cutAudition";
 import { besides, removedSince } from "../../lib/removedSince";
 import { usePlayerStore } from "../../stores/player";
@@ -87,7 +88,8 @@ export interface PreparedCut {
 
 interface PreparedMedia {
   timelines: Map<string, Timeline>;
-  files: Map<string, { checked: number; url?: string }>;
+  /** A lookup still on its way is shared by the decisions prepared beside it. */
+  files: Map<string, { checked: number; url?: string; lookup?: Promise<string | undefined> }>;
   windows: Map<string, CutPlaybackWindow>;
 }
 
@@ -105,7 +107,7 @@ export async function prepareCut(projectId: string, fps: number, target: CutToPr
     if (current?.id === projectId && current.timeline?.version === version) return current.timeline;
     const cached = media?.timelines.get(version);
     if (cached) return cached;
-    const { timeline } = await api.timeline(projectId, version, signal);
+    const timeline = await readTimeline(projectId, version, signal);
     remember(media?.timelines, version, timeline);
     return timeline;
   };
@@ -136,11 +138,17 @@ export async function prepareCut(projectId: string, fps: number, target: CutToPr
   if (after && clock && target.key && onPlan) {
     const file = async (version: string) => {
       const cached = media?.files.get(version);
-      if (cached && (cached.url || Date.now() - cached.checked < 5_000)) return cached.url;
-      const { renders, fullRenderKeys } = await api.renders(projectId, { kind: "full", version });
-      const ready = renders.find(r => r.key === fullRenderKeys?.preview && r.state === "done");
-      const url = ready && api.renderFileUrl(ready.id);
-      remember(media?.files, version, { url, checked: Date.now() });
+      if (cached && (cached.url || Date.now() - cached.checked < 5_000)) return cached.lookup ?? cached.url;
+      const lookup = api.renders(projectId, { kind: "full", version }).then(({ renders, fullRenderKeys }) => {
+        const ready = renders.find(r => r.key === fullRenderKeys?.preview && r.state === "done");
+        return ready && api.renderFileUrl(ready.id);
+      });
+      remember(media?.files, version, { checked: Date.now(), lookup });
+      const url = await lookup.catch((error: unknown) => {
+        if (media?.files.get(version)?.lookup === lookup) media.files.delete(version);
+        throw error;
+      });
+      if (media?.files.get(version)?.lookup === lookup) remember(media.files, version, { url, checked: Date.now() });
       return url;
     };
     const [beforeFile, afterFile] = await Promise.all([file(before.version).catch(() => undefined), file(after.version).catch(() => undefined)]);
@@ -174,22 +182,34 @@ export async function prepareCut(projectId: string, fps: number, target: CutToPr
     return true;
   }
   // A whole file or an audible audition file serves this side directly. A long Before or an unavailable
-  // encoder still warms the canonical fragments for the ordinary streaming player.
-  if (after && clock && !await prepareWindow("after", clock.toMedia(listen.end), afterDuration)) {
+  // encoder still warms the canonical fragments for the ordinary streaming player. Both sides are asked for at once:
+  // the engine renders two at a time, and each side's file updates the plan on its own.
+  const prepareAfter = async () => {
+    if (!after || !clock || await prepareWindow("after", clock.toMedia(listen.end), afterDuration)) return;
     const join = clock.toMedia(cut.end);
     const tail = Math.min(afterDuration, clock.toMedia(listen.end)) - 1 / fps;
     const times = [clock.toMedia(listen.start), join, ...(tail > join ? [tail] : [])].filter(t => t < afterDuration);
     if (times.length) await api.preparePlayback(projectId, after.version, times, signal).catch(() => undefined);
-  }
-  signal.throwIfAborted();
-  const original = cutAudition(cut, "before", duration, { whole: target.applied });
-  if (!await prepareWindow("before", original.end, beforeDuration)) {
+  };
+  const prepareBefore = async () => {
+    const original = cutAudition(cut, "before", duration, { whole: target.applied });
+    if (await prepareWindow("before", original.end, beforeDuration)) return;
     const times = [original.start, cut.end, cut.start].filter(t => t < beforeDuration);
     if (times.length) await api.preparePlayback(projectId, before.version, times, signal);
-  }
+  };
+  await Promise.all([prepareAfter(), prepareBefore()]);
+  signal.throwIfAborted();
 }
 
-/** Prepare one decision at a time. The open decoder takes priority when playback is waiting for media. */
+/** Decisions prepared at once. The engine renders two files at a time. */
+const PREPARING_AT_ONCE = 2;
+
+function sameTarget(a: CutToPrepare, b: CutToPrepare) {
+  return idOf(a.before) === idOf(b.before) && a.cut.start === b.cut.start && a.cut.end === b.cut.end &&
+    (a.after && idOf(a.after.version)) === (b.after && idOf(b.after.version));
+}
+
+/** Prepare the next two decisions at a time. The open decoder takes priority when playback is waiting for media. */
 export function usePrepareReviewCuts(project: Project, settingsRevision: number | undefined, targets: CutToPrepare[],
   drafts: SingleCutDrafts, plans: Map<string, PreparedCut>, openCut?: { version: string; removed: TimeRange; key?: string }) {
   const context = useMemo(() => fullRenderContext(project) + "/" + (settingsRevision ?? 0), [project, settingsRevision]);
@@ -207,7 +227,7 @@ export function usePrepareReviewCuts(project: Project, settingsRevision: number 
     if (mediaPaused || IS_MOCK) return;
     let closed = false;
     let previousFirst: string | undefined;
-    let running: { key: string; target: CutToPrepare; controller: AbortController } | undefined;
+    const running = new Map<string, { target: CutToPrepare; controller: AbortController }>();
     let handoff: { controller: AbortController; timer: ReturnType<typeof setTimeout> } | undefined;
     const finishHandoff = () => {
       if (!handoff) return;
@@ -233,10 +253,15 @@ export function usePrepareReviewCuts(project: Project, settingsRevision: number 
       previousFirst = first;
       if (first && plan) setParked(was => was?.plan === plan ? was : { key: first, context, plan });
 
-      const next = available && queue.find(entry => !prepared.has(entry.key));
-      if (running && (!next || next.key !== running.key)) {
-        const { controller, target, key } = running;
-        running = undefined;
+      // The same cut under another key waits for the first: it then reuses that one's files.
+      const wanted: typeof queue = [];
+      for (const entry of available ? queue : []) {
+        if (wanted.length >= PREPARING_AT_ONCE) break;
+        if (!prepared.has(entry.key) && !wanted.some(other => sameTarget(other.target, entry.target))) wanted.push(entry);
+      }
+      for (const [key, { controller, target }] of running) {
+        if (wanted.some(entry => entry.key === key)) continue;
+        running.delete(key);
         // The engine and source time map can disagree by a fraction of a frame on a moved call.
         const sameCut = openCut?.key && target.key ? openCut.key === target.key : openCut && idOf(target.before) === openCut.version &&
           target.cut.start === openCut.removed.start && target.cut.end === openCut.removed.end;
@@ -246,12 +271,13 @@ export function usePrepareReviewCuts(project: Project, settingsRevision: number 
           handoff = { controller, timer: setTimeout(finishHandoff, 750) };
         } else controller.abort();
       }
-      if (!next || running) return;
-      const { key, target } = next;
+      for (const next of wanted) if (!running.has(next.key)) start(next);
+    };
+    const start = ({ key, target }: { key: string; target: CutToPrepare }) => {
       const controller = new AbortController();
-      running = { key, target, controller };
+      running.set(key, { target, controller });
       void prepareCut(id, fps, target, controller.signal, drafts, plan => {
-        if (controller.signal.aborted || closed || (running?.controller !== controller && handoff?.controller !== controller)) return;
+        if (controller.signal.aborted || closed || (running.get(key)?.controller !== controller && handoff?.controller !== controller)) return;
         plans.set(plan.key, plan);
         // Preserve the first candidate while filling the rest of a long pass.
         if (plans.size > 8) {
@@ -263,7 +289,7 @@ export function usePrepareReviewCuts(project: Project, settingsRevision: number 
         if (latest.current.openCut?.key === plan.key) refreshOpen(n => n + 1);
         else if (latest.current.queue.find(entry => entry.target.key !== latest.current.openCut?.key)?.key === key) setParked({ key, context, plan });
       }, media).then(() => true, () => false).then(done => {
-        if (running?.controller !== controller || closed) return;
+        if (running.get(key)?.controller !== controller || closed) return;
         prepared.add(key);
         // A preparation that failed, say on a moment's engine error, is tried again a little later, twice at most.
         const tries = done ? 0 : (failures.get(key) ?? 0) + 1;
@@ -271,7 +297,7 @@ export function usePrepareReviewCuts(project: Project, settingsRevision: number 
           failures.set(key, tries);
           setTimeout(() => { if (!closed) { prepared.delete(key); schedule(); } }, 5_000 * tries);
         }
-        running = undefined;
+        running.delete(key);
         schedule();
       });
     };
@@ -285,7 +311,7 @@ export function usePrepareReviewCuts(project: Project, settingsRevision: number 
     return () => {
       closed = true;
       reconcile.current = undefined;
-      running?.controller.abort();
+      for (const { controller } of running.values()) controller.abort();
       finishHandoff();
       unsubscribe();
       document.removeEventListener("visibilitychange", schedule);

@@ -283,11 +283,9 @@
   background: rgb(16 16 16 / 86%);
 }
 .monitor-controls button:enabled { color: #f4f0e8; }
-.monitor-controls .preference-select.compact {
-  min-height: 28px; padding: 0 4px 0 8px; gap: 3px; border: 0; background: none;
-  font: 11px var(--font-mono); font-variant-numeric: tabular-nums;
-}
-.monitor-controls .preference-select:enabled:hover, .monitor-controls .preference-select[aria-expanded="true"] { background: rgb(255 255 255 / 10%); }
+.playback-speed { display: flex; align-items: center; }
+.playback-speed .btn-icon { width: 26px; height: 28px; }
+.playback-speed output { width: 5ch; text-align: center; color: #f4f0e8; font: 11px var(--font-mono); }
 .mic-ready {
   background: var(--color-raised);
   color: var(--color-accent-soft);
@@ -338,6 +336,93 @@
 .media-thumb { flex: none; width: 68px; height: 40px; border-radius: 5px; }
 .media-glyph { display: grid; place-items: center; background: var(--color-raised); color: var(--color-muted); }
 .settings-page { max-width: 930px; }
+.about-settings { display: grid; gap: 20px; }
+.about-build {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 20px;
+  padding: 22px 24px;
+}
+.about-identity { display: flex; align-items: center; gap: 16px; min-width: 0; }
+.about-identity img { flex: none; width: 72px; height: 72px; }
+.about-identity h2 { font-size: 32px; font-weight: 650; line-height: 1.05; letter-spacing: -.045em; }
+.about-identity dl { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 9px; }
+.about-identity dl div { display: flex; align-items: baseline; gap: 6px; }
+.about-identity dt { color: var(--color-dim); }
+.about-identity dd { font-variant-numeric: tabular-nums; }
+.about-identity code { font-size: 12px; }
+.about-updates {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  max-width: 260px;
+}
+.about-updates [role="status"] { flex-basis: 100%; color: var(--color-muted); text-align: end; overflow-wrap: anywhere; }
+.about-updates [role="status"]:empty { position: absolute; }
+.about-content {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(235px, 31%);
+  gap: 20px;
+  align-items: start;
+}
+.about-changelog, .about-telemetry { min-width: 0; padding: 20px; }
+.about-changelog h2, .about-telemetry h2 { font-size: 17px; line-height: 1.25; font-weight: 600; letter-spacing: -.02em; }
+.about-release-day h3 { margin: 14px 0 4px; font-size: 12px; font-weight: 500; color: var(--color-dim); }
+.about-release-day ul { list-style: disc; padding-inline-start: 15px; }
+.about-release-day li { padding-block: 9px; color: var(--color-muted); line-height: 1.55; }
+.about-release-day li::marker { color: var(--color-dim); }
+.about-release-day li + li { border-top: 1px solid var(--color-line); }
+.about-telemetry { color: var(--color-muted); line-height: 1.55; overflow-wrap: anywhere; }
+.about-telemetry h2 { color: var(--color-fg); margin-bottom: 12px; }
+.about-telemetry-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--color-fg);
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  border-radius: 7px;
+  background: var(--color-raised);
+}
+.about-telemetry-toggle button { flex: none; }
+.about-telemetry > p + p { margin-top: 8px; }
+.about-disclosure { margin-top: 10px; border-top: 1px solid var(--color-line); }
+.about-disclosure > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 32px;
+  margin: 4px -6px -6px;
+  padding: 0 6px;
+  border-radius: 5px;
+  color: var(--color-muted);
+  font-weight: 500;
+  list-style: none;
+  cursor: pointer;
+}
+.about-disclosure > summary::-webkit-details-marker { display: none; }
+.about-disclosure > summary:hover { color: var(--color-fg); background: var(--color-raised); }
+.about-disclosure > summary svg { flex: none; }
+.about-disclosure[open] > summary svg { transform: rotate(90deg); }
+.about-telemetry-details { display: grid; gap: 10px; margin-top: 14px; }
+.about-telemetry-details code { font-size: 11px; }
+.about-credit { margin: 12px 2px 0; font-size: 12px; line-height: 1.5; color: var(--color-dim); }
+.about-credit a { color: var(--color-muted); text-underline-offset: 2px; }
+.about-credit a:hover { color: var(--color-fg); }
+@media (max-width: 680px) {
+  .about-content { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 480px) {
+  .about-build { padding: 16px; }
+  .about-updates { justify-content: flex-start; }
+  .about-updates [role="status"] { text-align: start; }
+}
 /* Esc with unsaved settings lands on Save instead of leaving, so Save shows that the keyboard is on it. Focus set from a key handler isn't always :focus-visible.
    A skill's page does the same: Esc lands on its Save while something is unsaved, or on Send while a request is typed and not sent. Its page marks the
    button Esc landed on, so a click on Save or Send shows no outline. */
@@ -389,6 +474,21 @@
 /* The heading over the instructions. After it, when the skill was saved again since the editor's unsaved changes were
    made: one line that says so, then its two actions as plain text links. The line is no taller than the heading. */
 .skill-instructions-head { display: flex; align-items: center; gap: 14px; flex: none; min-width: 0; padding: 8px 16px; border-bottom: 1px solid var(--color-line); background: var(--color-panel); }
+.skill-instructions-head:has(.skill-find) { flex-wrap: wrap; }
+.skill-instructions-head:has(.skill-find-replace:not([hidden])) { align-items: flex-start; }
+.skill-instructions-head:has(.skill-find-replace:not([hidden])) > .eyebrow { padding-top: 6px; }
+.skill-find, .skill-find-trigger { margin-inline-start: auto; }
+.skill-find { flex: 0 1 390px; min-width: 240px; max-width: 100%; }
+.skill-find-row { display: flex; align-items: center; gap: 3px; }
+.skill-find-row .field { flex: 1 1 auto; min-width: 0; padding-block: 5px; }
+.skill-find-row .btn-icon { flex: none; width: 28px; height: 28px; }
+.skill-find-count { color: var(--color-muted); font-size: 11.5px; font-variant-numeric: tabular-nums; white-space: nowrap; padding-inline: 4px; }
+.skill-find-replace { margin-block-start: 4px; margin-inline-start: 31px; }
+.skill-find-replace .btn-ghost { min-height: 28px; padding: 4px 9px; font-size: 12px; }
+.skill-find-feedback { display: flex; flex: none; justify-content: space-between; align-items: center; padding: 7px 16px;
+  font-size: 12px; color: var(--color-muted); border-top: 1px solid var(--color-line); }
+.skill-find-match { color: inherit; background: #ffffff29; }
+.skill-find-match[data-active] { background: #edc28555; box-shadow: inset 0 -1px var(--color-warn); }
 /* A skill's instructions: the field's own text is clear over the same words drawn under it, where each $template and
    /skill of the editor's has a faint fill that doesn't move the text. */
 .skill-instructions { position: relative; display: flex; flex: 1; min-height: 0; }

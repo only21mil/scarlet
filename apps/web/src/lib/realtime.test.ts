@@ -178,9 +178,9 @@ it("pings the engine while connected, and stops when the connection drops", () =
 it("holds a project's first read until the engine confirms it is listening, or a second has passed", async () => {
   const log = logged();
   vi.spyOn(useProjectStore.getState(), "load").mockResolvedValue();
-  stop = startRealtime();
   // With no connection there is nothing to wait for.
   expect(subscribeProject("prj_1")).toBeUndefined();
+  stop = startRealtime();
   latest().open();
   const waiting = subscribeProject("prj_1");
   expect(latest().sent).toEqual([{ type: "subscribe", projectId: "prj_1" }]);
@@ -218,6 +218,42 @@ it("holds a project's first read until the engine confirms it is listening, or a
   // Leaving a project that isn't the open one changes nothing.
   leaveProject("prj_1");
   expect(latest().sent).toHaveLength(4);
+});
+
+it("holds a read made while the connection opens until the engine listens, and reads nothing twice", async () => {
+  const log = logged();
+  const load = vi.spyOn(useProjectStore.getState(), "load").mockResolvedValue();
+  stop = startRealtime();
+  const waiting = subscribeProject("prj_1");
+  expect(waiting).toBeInstanceOf(Promise);
+  expect(subscribeProject("prj_1")).toBe(waiting);
+  let ready = false;
+  void waiting!.then(() => { ready = true; });
+  // Opening asks for the project, and the read waits on for the engine to confirm, instead of being made again.
+  await vi.advanceTimersByTimeAsync(600);
+  latest().open();
+  expect(latest().sent).toEqual([{ type: "subscribe", projectId: "prj_1" }]);
+  expect(load).not.toHaveBeenCalled();
+  // Its second for the engine to answer counts from the moment it asked.
+  await vi.advanceTimersByTimeAsync(600);
+  expect(ready).toBe(false);
+  latest().hear({ type: "project.subscribed", projectId: "prj_1", found: true });
+  await vi.advanceTimersByTimeAsync(0);
+  expect(ready).toBe(true);
+  expect(log.written()).toEqual(["[realtime] connected project=prj_1", "[realtime] subscribe project=prj_1"]);
+
+  // A connection that drops before it opens lets the read go ahead, and the next one that opens reads again.
+  latest().drop();
+  vi.advanceTimersByTime(2000);
+  let released = false;
+  void subscribeProject("prj_1")!.then(() => { released = true; });
+  latest().drop();
+  await vi.advanceTimersByTimeAsync(0);
+  expect(released).toBe(true);
+  vi.advanceTimersByTime(4000);
+  latest().open();
+  expect(load).toHaveBeenCalledExactlyOnceWith("prj_1");
+  leaveProject("prj_1");
 });
 
 it("lets a wait for one project go when another is opened, and says when the engine doesn't know the project", async () => {

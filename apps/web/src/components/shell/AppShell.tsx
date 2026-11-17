@@ -1,13 +1,14 @@
 import { useEffect, useLayoutEffect, useState } from "react";
 import { Outlet, useLocation, useNavigate } from "react-router-dom";
-import { api, IS_MOCK, serverUrl } from "../../lib/client";
+import { api, IS_MOCK } from "../../lib/client";
+import { appLog } from "../../lib/appLog";
 import { desktop } from "../../lib/desktop";
 import { useHotkeys } from "../../lib/hotkeys";
 import { reconnectRealtime, startRealtime } from "../../lib/realtime";
 import { useAuthStore } from "../../stores/auth";
 import { useHostsStore } from "../../stores/hosts";
 import { useProjectStore } from "../../stores/project";
-import { loadAgent, useUiStore } from "../../stores/ui";
+import { useUiStore } from "../../stores/ui";
 import { scheduleStorageScan } from "../../lib/storage";
 import { ExportStarNotice } from "./ExportStarNotice";
 import { ShortcutsModal } from "./ShortcutsModal";
@@ -102,22 +103,23 @@ export function AppShell() {
     return () => { active = false; clearTimeout(timer); };
   }, [status, bootstrap]);
 
-  useEffect(() => {
-    const user = useAuthStore.getState().user;
-    void desktop.log(`ui auth=${status} server=${serverUrl} user=${user?.name ?? "-"} path=${location.pathname}`);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status]);
+  useEffect(() => { appLog("app", "auth", { state: status }); }, [status]);
 
+  // The connection starts before any page's effects run, so a project opened in the same moment reads once, after the
+  // engine is listening, and not a second time when the connection opens.
+  useLayoutEffect(() => {
+    if (status !== "ready") return;
+    return startRealtime();
+  }, [status]);
   useEffect(() => {
     if (status !== "ready") return;
-    const stop = startRealtime();
     let active = true;
     void api.settings().then(({ settings }) => {
-      if (active) useUiStore.setState({ agent: loadAgent(settings.defaultAgent) });
+      if (active) useUiStore.getState().setDefaultAgent(settings.defaultAgent);
     }).catch(() => undefined);
     void useHostsStore.getState().load();
     void useProjectStore.getState().loadList();
-    return () => { active = false; stop(); };
+    return () => { active = false; };
   }, [status]);
 
   useHotkeys((e) => {

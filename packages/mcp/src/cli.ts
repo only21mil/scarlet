@@ -79,7 +79,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const opts = parseArgs(argv);
   const client = new ScarletClient({ baseUrl: opts.server, token: opts.token });
   const [, assignment] = await Promise.all([
-    client.settings(), opts.task ? client.forProject(opts.project).task(opts.task) : undefined,
+    client.settings(), opts.task ? client.forProject(opts.project).task(opts.task, "none") : undefined,
   ]);
   const task = assignment?.task;
   if (opts.task && assignment?.checksTaskAttempts !== true) throw new Error("Update the Scarlet engine to use task-scoped editing tools.");

@@ -1,5 +1,5 @@
 import { z } from "zod/v3";
-import { ActivityEntry, AgentHost, GraphicTemplate, Learning, QuickAction, Render, Skill, SkillVersion, Task, TaskEvent } from "@scarlet/shared";
+import { ActivityEntry, AgentHost, GraphicTemplate, Learning, QuickAction, Render, Skill, SkillVersion, Task, TaskEvent, type QueueTask } from "@scarlet/shared";
 import { Author, Change, Note, Transcript } from "@scarlet/timeline";
 import { now, type Db } from "../db.js";
 import { JsonStore } from "./store.js";
@@ -78,6 +78,63 @@ class SkillVersionsRepo {
   }
 }
 
+class TasksRepo extends JsonStore<Task> {
+  constructor(private readonly database: Db) {
+    super(database, "tasks", Task, t => ({
+      project_id: t.projectId,
+      kind: t.kind,
+      agent: t.agent,
+      state: t.state,
+      host_id: t.hostId,
+      created_at: t.createdAt ?? now(),
+    }));
+  }
+
+  override put(task: Task): Task {
+    const { doc, rowid } = this.write({ ...task, createdAt: task.createdAt ?? now(), queueSequence: undefined });
+    return { ...doc, queueSequence: rowid };
+  }
+
+  override get(id: string): Task | null {
+    const row = this.database.prepare("SELECT json, rowid, created_at FROM tasks WHERE id = ?").get(id) as TaskRow | undefined;
+    return row ? this.read(row) : null;
+  }
+
+  override select(where = "1=1", params: unknown[] = [], orderBy = "created_at ASC"): Task[] {
+    const rows = this.database.prepare(`SELECT json, rowid, created_at FROM tasks WHERE ${where} ORDER BY ${orderBy}`).all(...params) as TaskRow[];
+    return rows.map(row => this.read(row));
+  }
+
+  private read(row: TaskRow): Task {
+    const task = this.parse(row.json);
+    return { ...task, createdAt: task.createdAt ?? row.created_at, queueSequence: row.rowid };
+  }
+
+  /** Pending requests and the older rows needed to find their place or the branch that made a proposal. */
+  queue(projectId: string, reviewMakers: readonly string[]): QueueTask[] {
+    const rows = this.database.prepare(`WITH pending AS (
+      SELECT rowid, id, project_id, kind, state, json, created_at FROM tasks
+      WHERE project_id = ? AND state IN ('queued', 'claimed', 'running', 'waiting_for_user')
+    ), queue AS (
+      SELECT * FROM pending
+      UNION ALL
+      SELECT rowid, id, project_id, kind, state, json, created_at FROM tasks
+      WHERE id IN (SELECT json_extract(json, '$.resumeRootId') FROM pending UNION SELECT value FROM json_each(?))
+        AND id NOT IN (SELECT id FROM pending)
+    )
+    SELECT rowid AS queueSequence, id, project_id AS projectId, kind, state, created_at AS createdAt,
+      json_extract(json, '$.resumeRootId') AS resumeRootId, json_extract(json, '$.resumesAfterProjectStop') AS resumesAfterProjectStop,
+      json_extract(json, '$.startsBeforeCalls') AS startsBeforeCalls, json_extract(json, '$.context') AS context
+    FROM queue`).all(projectId, JSON.stringify(reviewMakers)) as
+      (Omit<QueueTask, "context" | "resumeRootId" | "resumesAfterProjectStop" | "startsBeforeCalls"> &
+        { context: string | null; resumeRootId: string | null; resumesAfterProjectStop: number | null; startsBeforeCalls: number | null })[];
+    return rows.map(row => ({ ...row, resumeRootId: row.resumeRootId ?? undefined,
+      resumesAfterProjectStop: row.resumesAfterProjectStop === 1, startsBeforeCalls: row.startsBeforeCalls === 1, context: row.context ? JSON.parse(row.context) : {} }));
+  }
+}
+
+type TaskRow = { json: string; rowid: number; created_at: string };
+
 export function createRepos(db: Db, defaultProvider: DefaultProvider = "none") {
   const changes = new JsonStore<Change>(db, "changes", Change, (c) => ({
     project_id: c.projectId,
@@ -89,14 +146,7 @@ export function createRepos(db: Db, defaultProvider: DefaultProvider = "none") {
     state: n.state,
     created_at: n.createdAt ?? now(),
   }));
-  const tasks = new JsonStore<Task>(db, "tasks", Task, (t) => ({
-    project_id: t.projectId,
-    kind: t.kind,
-    agent: t.agent,
-    state: t.state,
-    host_id: t.hostId,
-    created_at: t.createdAt ?? now(),
-  }));
+  const tasks = new TasksRepo(db);
   return {
     users: new UsersRepo(db),
     projects: new ProjectsRepo(db, { changes, tasks, notes }),

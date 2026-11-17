@@ -1,11 +1,12 @@
 import { appliedReviewChange, CutAssessment, isPublishedCall, type Change } from "@scarlet/timeline";
 import { Hono } from "hono";
 import { z } from "zod/v3";
-import { namedTimelineEdits, ApproveRequest, FlagEditRequest, CutChoicesRequest, ChangeState, DialogueCutsRequest, ProposeChangeRequest, ReviseRequest, sameRun, StagedCutRevision } from "@scarlet/shared";
+import { namedTimelineEdits, ApproveRequest, FlagEditRequest, KeepEditsRequest, CutChoicesRequest, ChangeState, DialogueCutsRequest, ProposeChangeRequest, ReviseRequest, sameRun, StagedCutRevision } from "@scarlet/shared";
 import type { AppEnv } from "../auth.js";
 import type { Ctx } from "../context.js";
 import { badRequest, conflict, notFound } from "../errors.js";
-import { approveChange, changeDiff, flagEdit, saveCutChoices, prepareCutReview, prepareFirstDecision, proposeChange, recordPlayableDecision, requireUnscopedEdit, scheduleSpotCheck, submitDialogueCuts, rejectChange, reopenChange, reviseChange, reviseStagedCut, unapproveChange, withSpotCapability } from "../services/changes.js";
+import { logId } from "../logText.js";
+import { approveChange, changeDiff, flagEdit, keepEdits, keptEdits, saveCutChoices, prepareCutReview, prepareFirstDecision, proposeChange, recordPlayableDecision, requireUnscopedEdit, scheduleSpotCheck, submitDialogueCuts, rejectChange, reopenChange, reviseChange, reviseStagedCut, unapproveChange, withSpotCapability } from "../services/changes.js";
 import { jsonBody, requireProjectHeader, TIMELINE_JSON_BYTES } from "./util.js";
 import { requestAttempt, requireProjectEditAttempt } from "../services/taskAttempt.js";
 
@@ -34,8 +35,8 @@ export function changeRoutes(ctx: Ctx) {
     const result = proposeChange(ctx, c.var.user, projectId, body, () => requireProjectEditAttempt(ctx, attempt, projectId, body.taskId));
     if (c.req.query("summary") === "true") {
       const viewed = appliedReviewChange(result.change);
-      const { id, state, description, fromVersion, toVersion, ranges, timelineEdits } = viewed;
-      return c.json({ change: { id, state, description, fromVersion, toVersion, ranges, timelineEdits }, duration: result.duration, diffDescription: result.diffDescription,
+      const { id, state, description, reason, fromVersion, toVersion, ranges, timelineEdits } = viewed;
+      return c.json({ change: { id, state, description, reason, fromVersion, toVersion, ranges, timelineEdits }, duration: result.duration, diffDescription: result.diffDescription,
         ...(result.onWholeFrames && { onWholeFrames: result.onWholeFrames }), ...(result.notApplied && { notApplied: result.notApplied }) }, 201);
     }
     // The proposal is saved by now, so a failed check must not read as a failed proposal.
@@ -51,6 +52,21 @@ export function changeRoutes(ctx: Ctx) {
       if (!task) throw badRequest("no_task", "Only a request's run flags an edit for the editor.");
       return flagEdit(ctx, projectId, task, body);
     }, "immediate")(), 201);
+  });
+
+  // The editor kept edits. The runs of their request hear of it, so a doubt they settled isn't raised again.
+  r.post("/projects/:id/kept-edits", async c => {
+    const body = await jsonBody(c, KeepEditsRequest);
+    const project = requireProjectHeader(ctx, c.req.param("id"));
+    ctx.db.transaction(() => keepEdits(ctx, project.id, body), "immediate")();
+    return c.body(null, 204);
+  });
+
+  r.get("/projects/:id/kept-edits", c => {
+    const project = requireProjectHeader(ctx, c.req.param("id"));
+    const thread = c.req.query("thread");
+    if (!thread) throw badRequest("no_thread", "Name the request with ?thread=.");
+    return c.json({ kept: keptEdits(ctx, project.id, thread) });
   });
 
   r.post("/projects/:id/dialogue-cuts", async c => {
@@ -71,7 +87,7 @@ export function changeRoutes(ctx: Ctx) {
       // What Scarlet changed on its own: confident cuts it staged, edges it put on frames, earlier staged cuts it let go.
       ...(stagedForEditor && { stagedForEditor }), ...(onFrames && { onFrames }), ...(droppedFromReview && { droppedFromReview }),
       // The version to build on next: where the confident cuts left the edit.
-      head: ctx.repos.projects.get(c.req.param("id"))?.head }, 201);
+      head: ctx.repos.projects.header(c.req.param("id"))?.head }, 201);
   });
 
   r.get("/projects/:id/changes", (c) => {
@@ -104,7 +120,7 @@ export function changeRoutes(ctx: Ctx) {
 
   r.on("POST", ["/changes/:changeId/cut-assessments", "/projects/:projectId/changes/:changeId/cut-assessments"], async c => {
     const body = await jsonBody(c, z.object({ fromVersion: z.string(), toVersion: z.string(),
-      assessments: z.array(CutAssessment.omit({ provisional: true, askOrder: true, revised: true })).min(1).max(500) }));
+      assessments: z.array(CutAssessment.omit({ provisional: true, askOrder: true, revised: true }).extend({ amend: z.boolean().optional() })).min(1).max(500) }));
     return c.json(ctx.db.transaction(() => {
       const change = requireChange(c.req.param("changeId"), c.req.param("projectId"));
       const task = requireProjectEditAttempt(ctx, requestAttempt(c.req.raw), change.projectId);
@@ -121,12 +137,14 @@ export function changeRoutes(ctx: Ctx) {
       const heldRevised: number[] = [];
       const heldForEditor: number[] = [];
       const heldCalls: number[] = [];
+      const amended: number[] = [];
+      const called = new Set(change.cutChoices?.map(choice => choice.index));
       // The range guards against a recommendation landing on another cut after the indices shift. Cuts sit on whole
       // frames, so a range within a frame names this one: an agent that copied 18.9667 for 18.96666… was refused,
       // twice in one pass, and one that gave the range it had asked for, 9.59 to 11.33 s for a cut saved a frame
       // inward as 9.6 to 11.3 s, once more. The cut's own range is what gets saved.
       const slack = 1 / (ctx.repos.projects.get(change.projectId)?.settings.fps || 30) + 0.001;
-      for (const given of body.assessments) {
+      for (const { amend, ...given } of body.assessments) {
         const span = review.cuts[given.index]?.removed;
         if (!span) throw badRequest("wrong_cut", `This pass has no cut ${given.index}. Its cuts are numbered 0 to ${review.cuts.length - 1}.`);
         if (Math.abs(span.start - given.start) > slack || Math.abs(span.end - given.end) > slack) {
@@ -138,7 +156,17 @@ export function changeRoutes(ctx: Ctx) {
         if (suggestOnly) heldForEditor.push(item.index);
         const shown = previous.get(item.index);
         if (shown && (isPublishedCall(shown) || shown.askOrder !== undefined)) {
-          if (shown.reason !== item.reason || item.verdict !== shown.verdict) {
+          // A call still waiting on the editor takes a new note when Scarlet means to change it: something found after
+          // asking that the editor should know before deciding, such as a join that clips a word. Its number, footage
+          // and verdict stay. A pass that couldn't, asked the editor a separate question about the call (2026-11-16).
+          if (amend && isPublishedCall(shown) && item.verdict === "ask" && !called.has(item.index)) {
+            if (shown.reason !== item.reason || item.summary && shown.summary !== item.summary) {
+              byIndex.set(item.index, { ...shown, reason: item.reason, ...(item.summary && { summary: item.summary }), inspected: shown.inspected || item.inspected });
+              amended.push(item.index);
+            }
+            continue;
+          }
+          if (shown.reason !== item.reason || shown.summary !== item.summary || item.verdict !== shown.verdict) {
             if (shown.revised && item.verdict !== "ask") heldRevised.push(item.index);
             else heldCalls.push(item.index);
           } else if (item.inspected && !shown.inspected) {
@@ -156,7 +184,7 @@ export function changeRoutes(ctx: Ctx) {
       // shown under one note aren't held against a save that doesn't touch them.
       const newCall = (index: number) => {
         const before = previous.get(index);
-        return !before || !isPublishedCall(before);
+        return !before || !isPublishedCall(before) || amended.includes(index);
       };
       const byNote = new Map<string, number[]>();
       for (const a of cutAssessments) {
@@ -201,18 +229,25 @@ export function changeRoutes(ctx: Ctx) {
       }
       // A pass set to apply when the run finishes was scheduled on the calls made so far. A cut Scarlet now asks about,
       // with no call from the editor, waits for them: applying on schedule would skip it unseen.
-      const called = new Set(change.cutChoices?.map(choice => choice.index));
       const applyWhenDone = cutAssessments.some(a => isPublishedCall(a) && !called.has(a.index)) ? undefined : change.applyWhenDone;
       const assessedForReview = first ? true : change.assessedForReview;
       if (assessedForReview !== change.assessedForReview || firstDecisionPreview !== change.firstDecisionPreview || applyWhenDone !== change.applyWhenDone ||
           cutAssessments.some(a => a !== previous.get(a.index))) {
         const saved = ctx.repos.changes.put({ ...change, cutAssessments, assessedForReview, firstDecisionPreview, applyWhenDone });
         ctx.bus.publish({ type: "change.updated", projectId: change.projectId, change: saved });
+        const published = calls.filter(a => !previous.has(a.index) || !isPublishedCall(previous.get(a.index)!)).length;
+        if (published || (change.applyWhenDone && !applyWhenDone)) ctx.db.afterCommit(() => {
+          const target = `change=${logId(change.id)} project=${logId(change.projectId)}${change.taskId ? ` task=${logId(change.taskId)}` : ""}`;
+          if (published) ctx.log(`[review] calls_published ${target} count=${published}`);
+          if (change.applyWhenDone && !applyWhenDone) ctx.log(`[review] schedule ${target} outcome=cleared reason=new_call`);
+        });
         if (firstDecisionPreview && firstDecisionPreview.briefToPlayableMs === undefined) recordPlayableDecision(ctx, saved);
       }
       return { total: review.cuts.length, assessed: cutAssessments.filter(a => !a.provisional).length,
         needsDecision: review.cuts.length - cutAssessments.filter(a => a.verdict !== "ask").length,
-        ...(heldCalls.length ? { heldCalls, existingCalls: "These cuts already reached the editor as calls. Their original notes and the editor's choices stand." } : {}),
+        ...(heldCalls.length ? { heldCalls, existingCalls: "These cuts already reached the editor as calls. Their original notes and the editor's choices stand. "
+          + "To change the note of one still waiting on the editor, save it as an ask with amend:true." } : {}),
+        ...(amended.length ? { amended, amendedCalls: "These calls show their new note to the editor." } : {}),
         ...(heldForEditor.length ? { heldForEditor, editorPreference: "These cuts were staged with the editor’s approval required." } : {}),
         ...(heldRevised.length ? { heldRevised, editorRequest: "The editor sent these cuts back, so each revised cut waits in Needs your call. Its revised note is preserved." } : {}) };
     }, "immediate")());

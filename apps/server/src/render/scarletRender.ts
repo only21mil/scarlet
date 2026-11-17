@@ -20,9 +20,16 @@ function hwaccel(opts: RenderOptions): R.HwAccel {
 /** A stored hash identifies the current bytes only while its filesystem stamp matches.
  * Give unverified originals a file-local cache identity so they cannot reuse a different source’s picture. */
 async function cacheInputs(project: Project, timeline: Timeline, root: string, range?: TimeRange): Promise<Project> {
+  // A transition shows its incoming and outgoing sources up to half its length outside their clips’ own spans
+  // (planTransitions). Widening the range by the longest half keeps every source it can show, without planning twice.
+  let reach = 0;
+  if (range) for (const track of timeline.tracks) for (const clip of track.clips) {
+    if (clip.kind === "media" && clip.transitionIn) reach = Math.max(reach, clip.transitionIn.duration / 2);
+  }
+  const window = range && { start: range.start - reach, end: range.end + reach };
   const used = new Set<string>();
   for (const track of timeline.tracks) for (const clip of track.clips) {
-    if (clip.kind === "media" && clip.enabled !== false && (!range || rangesOverlap(clipRange(clip), range))) used.add(clip.mediaId);
+    if (clip.kind === "media" && clip.enabled !== false && (!window || rangesOverlap(clipRange(clip), window))) used.add(clip.mediaId);
   }
   const media = await Promise.all(project.media.filter(asset => used.has(asset.id)).map(async asset => {
     const file = join(root, asset.path);
@@ -90,7 +97,8 @@ export const scarletRenderAdapter: RenderAdapter = {
   },
 
   async renderPlaybackSegment(project, timeline, range, cacheDir, output, opts) {
-    const inputs = await cacheInputs(project, timeline, opts.mediaRoot, range);
+    // The playback window includes footage outside the range when a transition needs its handles.
+    const inputs = await cacheInputs(project, timeline, opts.mediaRoot);
     // A renderer that reports nothing for a playback section resolves with nothing.
     const result = (await R.renderPlaybackSegment(inputs, timeline, range, cacheDir, output, {
       ...opts, pictureSource: previewPictures(opts.mediaRoot),
@@ -99,7 +107,12 @@ export const scarletRenderAdapter: RenderAdapter = {
   },
 
   async renderFullCached(project, timeline, cacheDir, outputPath, opts) {
-    const inputs = await cacheInputs(project, timeline, opts.mediaRoot);
+    const inputs = await cacheInputs(project, timeline, opts.mediaRoot, opts.exportRange);
+    if (opts.exportRange) {
+      // Segment boundaries and the audio mix plan use media kinds across the timeline.
+      const verified = new Map(inputs.media.map(asset => [asset.id, asset]));
+      inputs.media = project.media.map(asset => verified.get(asset.id) ?? asset);
+    }
     const { encoder, rendered, warnings } = await R.renderFullCached(inputs, timeline, cacheDir, outputPath, {
       exportHeight: opts.exportHeight,
       exportRange: opts.exportRange,

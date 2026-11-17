@@ -33,7 +33,7 @@ const segments = Array.from({ length: n }, (_, i) => {
 segments[8].words[0].end += 2;
 const transcript = { id: "transcript", mediaId: "mic", language: "en", speakerAnalysis: { version: 3, count: 2 }, segments };
 const metrics = {};
-let searchWireBytes, captionSummary;
+let searchWireBytes, fullTranscriptBytes, captionSummary;
 async function measure(label, fn) {
   const start = performance.now(), output = await fn();
   (metrics[label] ??= []).push(performance.now() - start);
@@ -54,7 +54,7 @@ for (let run = 0; run < count; run++) {
     ctx.repos.projects.initializeHead(project.id, null, base.version);
     const token = accessToken(ctx);
     let onStatusRead;
-    const client = new ScarletClient({ baseUrl: "http://benchmark.invalid", token, fetch: (url, init) => {
+    const client = new ScarletClient({ baseUrl: "https://benchmark.invalid", token, fetch: (url, init) => {
       if (onStatusRead && new URL(url).pathname.includes("/tasks/")) {
         const start = onStatusRead;
         onStatusRead = undefined;
@@ -80,8 +80,16 @@ for (let run = 0; run < count; run++) {
     const firstSearch = await measure("firstPhraseSearch", search);
     assert.match(firstSearch, new RegExp("^" + Math.ceil(n / 47) + " exact match"));
     for (let i = 0; i < 8; i++) assert.equal(await measure("repeatPhraseSearch", search), firstSearch);
-    const response = await app.request("/api/media/mic/transcript?search=milestone+camera&contextWords=2", { headers: { Authorization: "Bearer " + token } });
+    const headers = { Authorization: "Bearer " + token };
+    const response = await app.request("/api/media/mic/transcript?search=milestone+camera&contextWords=2&wordSnapshot=", { headers });
     searchWireBytes = (await response.arrayBuffer()).byteLength;
+    fullTranscriptBytes = (await (await app.request("/api/media/mic/transcript?granularity=word", { headers })).arrayBuffer()).byteLength;
+    const approximate = await measure("fuzzyPhraseSearch", () => call("transcript_search", {
+      mediaId: "mic", query: "Milestone cameras keep the cadence while another voice moves on", match: "fuzzy",
+    }));
+    assert.match(approximate, /fuzzy match/);
+    const retakes = await measure("nearbyTakes", () => client.retakes(project.id, "mic", 0, Math.min(600, seconds)));
+    assert(retakes.groups.some(group => group.takes.length > 1));
     await measure("captionSourceSelection", () => {
       assert.equal(captionSourceClips(timeline, () => true).length, n);
     });
@@ -91,7 +99,7 @@ for (let run = 0; run < count; run++) {
       assert(clips.reduce((total, c) => total + map(c).length, 0) > 0);
     });
     captionSummary = (await measure("captionsGenerateProposal", () => call("captions_generate",
-      { intent: "suggestion", mediaId: "mic", maxWords: 5 }))).split("\n")[0];
+      { intent: "suggestion", mediaId: "mic", maxWords: 5, reason: "Keep the interview readable with short captions." }))).split("\n")[0];
     assert.match(captionSummary, /caption clip/);
 
     // Two recording clocks share noisy, non-periodic landmarks at a known offset.
@@ -140,4 +148,4 @@ const summary = Object.fromEntries(Object.entries(metrics).map(([name, times]) =
   return [name, { medianMs: Number(((times[times.length >>> 1] + times[(times.length - 1) >>> 1]) / 2).toFixed(2)),
     p95Ms: Number(times[Math.ceil(times.length * .95) - 1].toFixed(2)) }];
 }));
-console.log(JSON.stringify({ runCount: count, seconds, sourceWords: n * 10, sourceClips: n * 2, syncSeconds: Math.min(3600, seconds), searchWireBytes, captionSummary, timings: summary }, null, 2));
+console.log(JSON.stringify({ runCount: count, seconds, sourceWords: n * 10, sourceClips: n * 2, syncSeconds: Math.min(3600, seconds), fullTranscriptBytes, searchWireBytes, captionSummary, timings: summary }, null, 2));

@@ -1,8 +1,8 @@
-import { ScarletClient, ScarletApiError } from "@scarlet/shared";
+import { newRequestId, REQUEST_ID_HEADER, ScarletClient, ScarletApiError } from "@scarlet/shared";
 import type { ScarletApi } from "./api";
 import { MockClient } from "./mock/MockClient";
 import { isDesktop, markDesktop } from "./desktop";
-import { appLog, logPath } from "./appLog";
+import { appLog, errorName, logPath, withoutAddresses } from "./appLog";
 
 export const IS_DESKTOP = isDesktop();
 export const IS_MOCK = import.meta.env.DEV && import.meta.env.MODE === "desktop-demo" && IS_DESKTOP;
@@ -32,43 +32,91 @@ export function engineUnavailable(error: unknown): boolean {
     || error instanceof ScarletApiError && error.status === 503 && error.code === "http_error";
 }
 
-/**
- * Every request the window makes of the engine goes through here. The log gets each change it asks for (anything
- * but a read), each failure with the engine's reason, each call that never got through, and each slow read, so
- * "nothing happened" and "it took forever" can be told apart afterwards. Paths only: no bodies, no query values.
- */
+type RequestLog = { method: string; path: string; request: string; started: number; signal?: AbortSignal | null };
+const responseRequests = new WeakMap<Response, RequestLog>();
+const elapsed = (started: number) => Math.round(performance.now() - started);
+
+/** Record failures in body consumers, which run after fetch has returned the headers. */
+export async function readLoggedBody<T>(response: Response, read: () => Promise<T>): Promise<T> {
+  const trace = responseRequests.get(response);
+  const fields = trace && {
+    method: trace.method, path: trace.path, request: trace.request, status: response.status,
+  };
+  let body: T;
+  try {
+    body = await read();
+  } catch (error) {
+    if (trace) {
+      const name = errorName(error);
+      const stopped = trace.signal?.aborted || name === "AbortError";
+      appLog("api", stopped ? "stopped" : "body-failed", { ...fields, ms: elapsed(trace.started), phase: "body", name }, { level: stopped ? "info" : "warn" });
+    }
+    throw error;
+  }
+  if (trace && !response.ok) {
+    let json: unknown = body;
+    if (typeof body === "string" && body.length <= 65536) {
+      try { json = JSON.parse(body); } catch { /* The HTTP status is already logged. */ }
+    }
+    const code = (json as { error?: { code?: unknown } } | null)?.error?.code;
+    if (typeof code === "string" && /^[a-z][a-z0-9_]{0,39}$/.test(code)) {
+      appLog("api", "error-code", { ...fields, ms: elapsed(trace.started), code }, { level: "warn" });
+    }
+  }
+  return body;
+}
+
+/** Writes the engine makes in the course of playback, logged like reads: only when slow or failed. */
+const ROUTINE_WRITE = /\/renders(\?|$)/;
+
+/** Changes, failures and slow reads, with an ID the engine can log alongside the same request. */
 export const loggedFetch: typeof fetch = async (input, init) => {
-  const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
-  const path = logPath(input instanceof Request ? input.url : String(input));
+  const original = input instanceof Request ? input : undefined;
+  const method = (init?.method ?? original?.method ?? "GET").toUpperCase();
+  const path = logPath(original?.url ?? String(input));
+  const request = newRequestId();
   const started = performance.now();
-  const took = () => Math.round(performance.now() - started);
+  const signal = init?.signal ?? original?.signal;
+  const headers = new Headers(init?.headers ?? original?.headers);
+  headers.set(REQUEST_ID_HEADER, request);
+  const fields = { method, path, request };
+  const routine = method === "GET" || method === "HEAD" || ROUTINE_WRITE.test(path);
   let response: Response;
   try {
-    response = await fetch(input, init);
+    response = await fetch(input, { ...init, headers });
   } catch (error) {
-    const stopped = init?.signal?.aborted || (error instanceof DOMException && error.name === "AbortError");
-    if (stopped) appLog("api", "stopped", { method, path, ms: took() }, { key: `stopped:${method} ${path}` });
-    else appLog("api", "unreachable", { method, path, ms: took(), error: String(error) }, { key: `unreachable:${method} ${path}`, level: "warn" });
+    const name = errorName(error);
+    const stopped = signal?.aborted || name === "AbortError";
+    // A seek drops the playback section it no longer needs: nothing went wrong.
+    if (!(stopped && routine)) appLog("api", stopped ? "stopped" : "unreachable", { ...fields, ms: elapsed(started), name,
+      error: stopped ? undefined : withoutAddresses(String(error)) }, { level: stopped ? "info" : "warn" });
     // Still a TypeError, as a failed fetch is, in words the editor can read wherever it shows.
     throw stopped || !unanswered(error) ? error : new TypeError(ENGINE_UNREACHABLE, { cause: error });
   }
-  const ms = took();
+  responseRequests.set(response, { ...fields, started, signal });
+  const status = response.status, ms = elapsed(started);
   if (!response.ok) {
-    // The engine's own words for what went wrong, read from a copy so the caller still gets the body.
-    void response.clone().text().then(body => body.slice(0, 300), () => "").then(reason =>
-      appLog("api", "failed", { method, path, status: response.status, ms, reason: reason || undefined }, { key: `failed:${method} ${path} ${response.status}`, level: "warn" }));
-  } else if (method !== "GET" && method !== "HEAD") appLog("api", "did", { method, path, status: response.status, ms }, { key: `did:${method} ${path}` });
-  else if (ms >= SLOW_CALL_MS) appLog("api", "slow", { method, path, status: response.status, ms }, { key: `slow:${path}` });
+    appLog("api", "failed", { ...fields, status, ms }, { level: "warn" });
+  } else if (!routine) {
+    appLog("api", "did", { ...fields, status, ms, phase: "headers" });
+  } else if (ms >= SLOW_CALL_MS) {
+    appLog("api", "slow", { ...fields, status, ms, phase: "headers" });
+  }
   return response;
+};
+
+const clientTransport = {
+  fetch: loggedFetch,
+  readResponse: (response: Response) => readLoggedBody(response, () => response.text()),
 };
 
 export let api: ScarletApi = IS_MOCK
   ? (mockInstance = new MockClient(() => "mock-token", true))
-  : new ScarletClient({ baseUrl: serverUrl, previewFrames: true, fetch: loggedFetch });
+  : new ScarletClient({ baseUrl: serverUrl, previewFrames: true, ...clientTransport });
 
 export function connectDesktopEngine(url: string, token: string) {
   serverUrl = url;
-  api = new ScarletClient({ baseUrl: url, token, previewFrames: true, fetch: loggedFetch });
+  api = new ScarletClient({ baseUrl: url, token, previewFrames: true, ...clientTransport });
   markDesktop(url);
 }
 

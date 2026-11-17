@@ -1,9 +1,9 @@
 import { WindowActions } from "../components/shell/WorkspaceNavigation";
 import { PreferenceSelect } from "../components/ui/PreferenceSelect";
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useBlocker, useNavigate, useParams } from "react-router-dom";
 import type { Skill, SkillVersion, Task } from "@scarlet/shared";
-import { useAgentAvailability } from "../components/agent/AgentChip";
+import { AgentChip, useAgentAvailability } from "../components/agent/AgentChip";
 import { api, errorMessage } from "../lib/client";
 import { isComposing } from "../lib/hotkeys";
 import { clockTime, dayName } from "../lib/format";
@@ -16,6 +16,7 @@ import { ConfirmDialog, ErrorState, Icon, InlineError, Loading, Modal, Spinner, 
 import { Said } from "../components/review/RunBundle";
 import { SkillCommandInput } from "../components/agent/SkillCommandInput";
 import { MarkedKeywords, SkillInstructions } from "../components/agent/SkillInstructions";
+import { markSkillMatches, normalizeSkillLines, revealSkillMatch, useSkillFind, type SkillFindState } from "../components/agent/SkillFind";
 // The conversation beside the skill is built from the pieces of a project's chat, and the page's plain text links are the chat's.
 import "../simple.css";
 
@@ -47,9 +48,9 @@ function writeDraft(key: string, kept: Draft | Draft[] | null) {
   } catch { /* Storage is optional. */ }
 }
 
-/** What the page holds, as one string. A change is unsaved only while this differs from what was loaded or last saved. */
+/** Compare what the page holds using the textarea's line endings. */
 const pageOf = (name: string, description: string, body: string, enabled: boolean, original?: SplitSkill) =>
-  JSON.stringify([name, enabled, composeSkill({ name: slugify(name) || name, description }, body, original)]);
+  JSON.stringify([name, enabled, normalizeSkillLines(composeSkill({ name: slugify(name) || name, description }, body, original))]);
 
 export function SkillEditorPage({ onReturnToEdit }: { onReturnToEdit?: () => void } = {}) {
   const { skillId } = useParams();
@@ -68,6 +69,7 @@ export function SkillEditorPage({ onReturnToEdit }: { onReturnToEdit?: () => voi
   const [original, setOriginal] = useState<SplitSkill>();
   const [enabled, setEnabled] = useState(true);
   const [busy, setBusy] = useState(false);
+  const creating = isNew && busy;
   const [err, setErr] = useState<string | null>(null);
   // What is wrong with the name, said beside the name.
   const [nameErr, setNameErr] = useState<string | null>(null);
@@ -180,7 +182,7 @@ export function SkillEditorPage({ onReturnToEdit }: { onReturnToEdit?: () => voi
   useEffect(() => {
     const leave = (e: KeyboardEvent) => {
       if (e.key !== "Escape" || e.defaultPrevented || e.isComposing || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
-      if (useUiStore.getState().shortcutsOpen || document.querySelector('dialog[open], [role="menu"]')) return;
+      if (useUiStore.getState().shortcutsOpen || document.querySelector('dialog[open], [role="menu"], [data-shortcut-overlay]')) return;
       const target = e.target instanceof HTMLElement ? e.target : null;
       if (target?.closest("input, textarea, select, [contenteditable]:not([contenteditable=false])")) {
         target.blur();
@@ -259,17 +261,32 @@ export function SkillEditorPage({ onReturnToEdit }: { onReturnToEdit?: () => voi
   const shownVersion = useMemo(() => {
     if (!picked) return null;
     const now = splitFrontmatter(picked.content), was = pickedBefore ? splitFrontmatter(pickedBefore.content) : now;
+    const searchableBody = normalizeSkillLines(now.body);
     return {
       description: diffLines(was.frontmatter.description ?? "", now.frontmatter.description ?? ""),
-      body: diffLines(was.body, now.body),
+      body: diffLines(normalizeSkillLines(was.body), searchableBody),
+      searchableBody,
     };
   }, [picked, pickedBefore]);
   const changesPane = useRef<HTMLDivElement>(null);
+  const instructionsPane = useRef<HTMLDivElement>(null);
+  const editor = useRef<HTMLTextAreaElement>(null);
+  const find = useSkillFind({
+    text: shownVersion?.searchableBody ?? body,
+    readOnly: !!shownVersion || working || creating,
+    onChange(value) { setBody(value); setDirty(true); },
+    scope: instructionsPane,
+    editor,
+  });
   // The picked version opens at its first change.
   useEffect(() => {
     const pane = changesPane.current, first = pane?.querySelector<HTMLElement>("[data-changed]");
-    if (pane && first) pane.scrollTop = Math.max(0, first.offsetTop - pane.offsetTop - 60);
+    if (pane && first && find.activeIndex < 0) pane.scrollTop = Math.max(0, first.offsetTop - pane.offsetTop - 60);
   }, [shownVersion]);
+  useLayoutEffect(() => {
+    const pane = changesPane.current;
+    if (pane && find.activeIndex >= 0) revealSkillMatch(pane);
+  }, [shownVersion, find.matches, find.activeIndex]);
 
   // The page isn't on the project's live feed, so it asks how the request is going. When it ends, the skill it
   // changed and its outcome arrive together.
@@ -384,7 +401,7 @@ export function SkillEditorPage({ onReturnToEdit }: { onReturnToEdit?: () => voi
     const parsed = splitFrontmatter(v.content);
     setOriginal(parsed);
     setBody(parsed.body);
-    if (parsed.frontmatter.description) setDescription(parsed.frontmatter.description);
+    setDescription(parsed.frontmatter.description ?? "");
     setViewVersion("current");
     setDirty(true);
   };
@@ -410,11 +427,12 @@ export function SkillEditorPage({ onReturnToEdit }: { onReturnToEdit?: () => voi
           {onReturnToEdit ? "← Back to edit" : "← Skill library"}
         </button>
         {/* The name is edited where it reads. It is saved as a slug ("My Skill" as my-skill). */}
-        <input id="sk-name" ref={nameField} className="skill-name" aria-label="Name" aria-invalid={nameErr ? true : undefined} value={name} disabled={working} placeholder="new-skill" spellCheck={false}
+        <input id="sk-name" ref={nameField} className="skill-name" aria-label="Name" aria-invalid={nameErr ? true : undefined} value={name} disabled={working || creating} placeholder="new-skill" spellCheck={false}
           style={{ width: `calc(${Math.max(name.length, 9) + 1}ch + 18px)` }} onChange={(e) => { setNameErr(null); mark(setName)(e.target.value); }} />
         {nameErr && <span role="alert" className="text-bad text-[12px]">{nameErr}</span>}
         {unsaved && <span className="chip bg-warn/15 text-warn">Unsaved</span>}
         <div className="flex-1" />
+        <AgentChip direction="down" variant="icon" />
         {versionChoices.length > 1 && (
           <PreferenceSelect compact label="Version history" value={viewVersion} onChange={setViewVersion} options={shownChoices} valueLabel="History"
             more={older > 0 ? { label: `Show ${older} older ${older === 1 ? "version" : "versions"}`, onPick: () => setAllVersions(true) } : undefined} />
@@ -482,18 +500,18 @@ export function SkillEditorPage({ onReturnToEdit }: { onReturnToEdit?: () => voi
             </div>
           </aside>
         )}
-        <div className="flex-1 min-w-0 min-h-0 flex flex-col">
+        <div ref={instructionsPane} className="flex-1 min-w-0 min-h-0 flex flex-col">
           <div className="skill-details">
             {/* One line says what the field is and what it's for. It grows with what's written in it. */}
             <label className="eyebrow" htmlFor="sk-desc">When to use it</label>
             <div className="skill-enabled">
               <span>Enabled</span>
-              <Toggle checked={enabled} onChange={mark(setEnabled)} label="Enabled" disabled={working} />
+              <Toggle checked={enabled} onChange={mark(setEnabled)} label="Enabled" disabled={working || creating} />
             </div>
             {shownVersion ? <div className="field skill-version-text" aria-label="When to use it, in this version"><ChangedText lines={shownVersion.description} /></div>
               : <div className="skill-when">
                 <span className="field" aria-hidden="true">{description}{"\u200b"}</span>
-                <textarea id="sk-desc" className="field" rows={1} value={description} disabled={working} onChange={(e) => mark(setDescription)(e.target.value)} />
+                <textarea id="sk-desc" className="field" rows={1} value={description} disabled={working || creating} onChange={(e) => mark(setDescription)(e.target.value)} />
               </div>}
             <InlineError>{err}</InlineError>
           </div>
@@ -512,21 +530,25 @@ export function SkillEditorPage({ onReturnToEdit }: { onReturnToEdit?: () => voi
               <button type="button" className="simple-link" disabled={working} onClick={bringBack}>Bring them back</button>
               <button type="button" className="simple-link" onClick={discardKept}>Discard</button>
             </span>}
+            {find.controls}
           </div>
           {isNew && <p id="skill-style-help" className="px-4 pt-3 text-[13px] leading-5 text-muted">
             A skill tells Scarlet how you like to edit your videos. Describe what to keep, cut, or change in your own words.
           </p>}
           {shownVersion ? <div ref={changesPane} className="flex-1 min-h-0 w-full overflow-y-auto bg-bg p-3 font-mono text-[12.5px] leading-5 skill-version-text max-md:min-h-[250px]"
             aria-label={`Skill markdown, v${picked!.version}`}>
-            <ChangedText lines={shownVersion.body} />
+            <ChangedText lines={shownVersion.body} find={find} />
           </div> : <SkillInstructions
             className="flex-1 w-full bg-bg p-3 font-mono text-[12.5px] leading-5 resize-none max-md:min-h-[250px]"
             value={body}
+            box={editor}
+            find={find}
             describedBy={isNew ? "skill-style-help" : undefined}
             placeholder={isNew ? "For interviews, leave a beat after a difficult question." : undefined}
-            readOnly={working}
+            readOnly={working || creating}
             onChange={mark(setBody)}
           />}
+          {find.feedback}
         </div>
       </div>
 
@@ -578,10 +600,20 @@ function changedIn(v: SkillVersion, me?: string): string {
 }
 
 /** Text with what changed marked in it: a bar beside each changed line, taken-out words struck, added ones tinted. */
-function ChangedText({ lines }: { lines: DiffLine[] }) {
-  return <>{lines.map((line, i) => <div key={i} data-changed={line.changed ? "" : undefined}>
-    {line.pieces.map((piece, k) => piece.kind === "add" ? <ins key={k}>{piece.text}</ins> : piece.kind === "del" ? <del key={k}>{piece.text}</del> : piece.text)}
-    {/* An empty line keeps its height. */}
-    {!line.pieces.some(piece => piece.text) && "\u200b"}
-  </div>)}</>;
+function ChangedText({ lines, find }: { lines: DiffLine[]; find?: SkillFindState }) {
+  let offset = 0;
+  return <>{lines.map((line, i) => {
+    const pieces = line.pieces.map((piece, k) => {
+      if (piece.kind === "del") return <del key={k}>{piece.text}</del>;
+      const marked = markSkillMatches(piece.text, offset, find);
+      offset += piece.text.length;
+      return piece.kind === "add" ? <ins key={k}>{marked}</ins> : <Fragment key={k}>{marked}</Fragment>;
+    });
+    if (line.pieces.some(piece => piece.kind !== "del")) offset++;
+    return <div key={i} data-changed={line.changed ? "" : undefined}>
+      {pieces}
+      {/* An empty line keeps its height. */}
+      {!line.pieces.some(piece => piece.text) && "\u200b"}
+    </div>;
+  })}</>;
 }

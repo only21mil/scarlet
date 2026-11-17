@@ -22,7 +22,7 @@ interface GraphicsDeps {
   caps: Pick<AgentCapabilities, "files" | "images">;
   /** A file in the task artifact directory. */
   readArtifact(path: string): Promise<Buffer<ArrayBuffer>>;
-  getProject(): Promise<ProjectDetail>;
+  getProject(): Promise<{ project: Pick<ProjectDetail["project"], "settings"> }>;
 }
 
 /**

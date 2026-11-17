@@ -1,7 +1,7 @@
 /**
  * Tiny in-process Scarlet API mock used by the MCP tests (and reusable by the
  * agent host tests). Implements only the routes the tools touch and records
- * every request so tests can assert on bodies.
+ * operational requests and tool diagnostics separately so tests can assert on both.
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -37,6 +37,7 @@ export interface MockServer {
   url: string;
   state: MockState;
   requests: RecordedRequest[];
+  diagnostics: RecordedRequest[];
   close(): Promise<void>;
 }
 
@@ -84,6 +85,7 @@ async function readBody(req: IncomingMessage): Promise<unknown> {
 
 export async function startMockServer(state: MockState = makeState()): Promise<MockServer> {
   const requests: RecordedRequest[] = [];
+  const diagnostics: RecordedRequest[] = [];
   let changeSeq = 0;
   let versionSeq = 0;
 
@@ -92,6 +94,13 @@ export async function startMockServer(state: MockState = makeState()): Promise<M
     const path = url.pathname.replace(/^\/api/, "");
     const body = await readBody(req);
     const rec: RecordedRequest = { method: req.method ?? "GET", path, query: url.searchParams, body, headers: req.headers };
+    const diagnostic = rec.method === "POST" && /^\/projects\/([^/]+)\/tasks\/[^/]+\/tool-diagnostic$/.exec(path);
+    if (diagnostic) {
+      if (diagnostic[1] !== state.project.id) return notFound(res, "project");
+      diagnostics.push(rec);
+      res.writeHead(204).end();
+      return;
+    }
     requests.push(rec);
     try {
       if (state.extra && (await state.extra(rec, res))) return;
@@ -242,6 +251,7 @@ export async function startMockServer(state: MockState = makeState()): Promise<M
     url: `http://127.0.0.1:${port}`,
     state,
     requests,
+    diagnostics,
     close: () => new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve()))),
   };
 }

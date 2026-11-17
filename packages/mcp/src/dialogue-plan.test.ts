@@ -106,6 +106,8 @@ describe("dialogue plan", () => {
     const result = await resolveCutRange(tl, { occurrence: ref }, "cut", sources);
     expect(result).toMatchObject({ start: 6.8, end: 6.9, words: "go", problems: [expect.any(String), expect.any(String)] });
     await expect(resolveCutRange(tl, { occurrence: ref, start: 0, end: 1 }, "cut", sources)).rejects.toThrow("already identifies");
+    // How long the join plays is not a second removal: it is taken as it is on a word reference.
+    expect(await resolveCutRange(tl, { occurrence: ref, leave: .14 }, "cut", sources)).toMatchObject({ words: "go", wordRef: true });
   });
 
   it("reports an edge it moved onto a quiet frame, and doesn't count the cut as unchanged", async () => {
@@ -554,6 +556,23 @@ describe("dialogue plan", () => {
       expect(through.decision.held).toContain("The recording has speech at this edge");
       expect(through.decision.reason).not.toContain("The recording has speech");
     }
+  });
+
+  it("names a word too short to remove from running speech, so the rest of its batch can be planned without it", async () => {
+    // “click it it kind”, said straight through: the recording has no sound of its own for the second “it”. Then a pause and “first”.
+    const said = [{ start: 1, end: 1.22, text: "click" }, { start: 1.22, end: 1.32, text: "it" }, { start: 1.32, end: 1.32, text: "it" },
+      { start: 1.32, end: 1.6, text: "kind" }, { start: 2.4, end: 2.8, text: "first" }, { start: 4, end: 4.4, text: "next" }];
+    const talk = [{ start: .98, end: 1.62 }, { start: 2.4, end: 2.82 }, { start: 4, end: 4.42 }];
+    const rms = Array.from({ length: 250 }, (_, i) => talk.some(v => v.start <= i/50 && i/50 < v.end) ? .12 : .001);
+    const scan: JoinPage = { mediaId: "mic", start: 0, end: 5, edges: joinEvidence(said, { from: 0, to: 5, peaks: rms, rms, speechActivity: talk }) };
+    const { tl, sources } = fixture();
+    const live = { ...sources, pages: () => [scan], words: async () => said };
+    const cuts = [cut({ mediaId: "mic", fromWord: 2, toWord: 2 }), cut({ mediaId: "mic", fromWord: 4, toWord: 4 })];
+    const plan = await planDialogueCuts({ tl, localPauses: false, cuts }, live);
+    expect(plan).toMatchObject({ outcome: "needsRevision", disputedEdges: [{ cuts: [0], reason: expect.stringContaining("cuts[0]: Words #2–#2 (“it”) leave no range to remove") }] });
+    const rest = await planDialogueCuts({ tl, localPauses: false, cuts, setAside: new Set([0]) }, live);
+    expect(rest).toMatchObject({ outcome: "ready", decisions: [{ review: false }] });
+    if (rest.outcome === "ready") expect(dialogueGate(rest).decisions).toEqual([expect.objectContaining({ cut: 1, words: "first" })]);
   });
 
   it("saves only the submitted cut when another quiet gap falls inside its range", async () => {

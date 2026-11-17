@@ -1,8 +1,8 @@
 /** One inventory for Settings and MCP registration. Every tool is always
  * offered; only the harness's capabilities limit what a session sees. */
 export const EDITING_TOOL_GROUPS = [
-  { title: "Timeline editing", description: "Read the timeline, trim dialogue and propose changes.",
-    tools: ["project_get", "timeline_get", "timeline_at", "timeline_diff", "timeline_propose", "timeline_first_cut", "timeline_crossfade_audio", "timeline_transition"] },
+  { title: "Timeline editing", description: "Read the timeline, trim dialogue, frame the picture and propose changes.",
+    tools: ["project_get", "timeline_get", "timeline_at", "timeline_diff", "timeline_propose", "timeline_first_cut", "timeline_crossfade_audio", "timeline_transition", "timeline_framing"] },
   { title: "Speech and waveform", description: "Find a line, measure pauses and loudness, and check the words and sound at each cut.",
     tools: ["transcript_get", "transcript_search", "timeline_transcript", "timeline_join_audit", "waveform_get", "sound_picture", "media_profile", "audio_sync", "dialogue_scan", "dialogue_check_join", "dialogue_check_repeats", "dialogue_apply_cuts", "dialogue_review_inspect", "dialogue_review_save", "dialogue_revise_cut"] },
   { title: "Screen text", description: "Read and search the words shown on screen in a recording.",

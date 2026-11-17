@@ -497,7 +497,10 @@ def finish_restart(intent):
 
 def watch():
     CACHE.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.environ.update(CARGO_TARGET_DIR=str(CACHE / "target"), GIT_TERMINAL_PROMPT="0", CI="true")
+    # A local build of main is replaced within the hour, so it optimizes the shell with thin LTO across parallel
+    # codegen units instead of the published installers' whole-program pass, which took most of each build.
+    os.environ.update(CARGO_TARGET_DIR=str(CACHE / "target"), GIT_TERMINAL_PROMPT="0", CI="true",
+                      CARGO_PROFILE_RELEASE_LTO="thin", CARGO_PROFILE_RELEASE_CODEGEN_UNITS="16")
     # One attendant for as long as the worker runs: a verified build stays on offer while GitHub is asked and from one
     # build to the next, not only between checks. It is closed where the worker installs or rests, answering no one.
     with (CACHE / "worker.lock").open("w") as lock, contextlib.closing(Attendant()) as attend:

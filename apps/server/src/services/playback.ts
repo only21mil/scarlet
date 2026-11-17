@@ -20,8 +20,11 @@ export async function waitForPlayback(ctx: Ctx, render: Render, signal: AbortSig
   return join(ctx.paths.renders(render.projectId), render.path);
 }
 
-/** Both the published call and its player acquire the same immutable, self-contained MP4. */
+/**
+ * Both the published call and its player acquire the same immutable, self-contained MP4. It covers the whole playback
+ * sections around the window, so it is assembled from the section cache and fills it for the full preview.
+ */
 export function requestCutPlaybackFile(ctx: Ctx, project: Pick<Project, "id" | "settings">, version: string, range: TimeRange, owner: string) {
   return ctx.renders.fullPreview(project, version) ?? ctx.renders.request({ projectId: project.id, version,
-    kind: "segment", range, quality: "preview", speculative: true }, owner);
+    kind: "segment", range: ctx.renders.sectionWindow(project, version, range), quality: "preview", speculative: true }, owner);
 }

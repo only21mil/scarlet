@@ -1,5 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { startAppLog, stopAppLog } from "./appLog";
 import { addPendingImports, clearSetsFormat, isLink, markImportStarted, pendingImports, removePendingImport } from "./pendingImports";
 
 const KEY = "scarlet.imports.v1";
@@ -8,7 +9,7 @@ beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(new Date("2026-11-01T10:00:00Z"));
 });
-afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+afterEach(() => { stopAppLog(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
 it("keeps the files still to import for each project, each once, until they are done", () => {
   addPendingImports("prj_1", ["/cards/A001.mov", "/cards/A002.mov"]);
@@ -91,4 +92,14 @@ it("tells a link from a path on this computer", () => {
   expect(isLink("/Volumes/Cards/https://clip.mp4")).toBe(false);
   expect(isLink("C:\\\\footage\\\\clip.mp4")).toBe(false);
   expect(isLink("ftp://example.com/clip.mp4")).toBe(false);
+});
+
+
+it("records an import queue write failure without the file path", () => {
+  const lines: string[] = [];
+  startAppLog(batch => lines.push(...batch));
+  vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => { throw new DOMException("/private/clip.mov", "QuotaExceededError"); });
+  addPendingImports("prj_1", ["/private/clip.mov"]);
+  expect(lines).toEqual([expect.stringContaining("queue-persist-failed project=prj_1 operation=enqueue count=1 name=QuotaExceededError")]);
+  expect(lines[0]).not.toContain("/private/");
 });

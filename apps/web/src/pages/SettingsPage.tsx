@@ -1,12 +1,11 @@
-import { Changelog } from "../components/shell/Changelog";
+import { AboutSettings } from "../components/shell/AboutSettings";
 import { LocalModelNotice, TranscriptionGuide, useLocalModelStatus } from "../components/shell/LocalModelNotice";
 import { PreferenceSelect } from "../components/ui/PreferenceSelect";
 import { StorageSettings } from "../components/shell/StorageSettings";
 import { UsageSettings } from "../components/shell/UsageSettings";
-import { UpdateSettings } from "../components/shell/UpdateSettings";
 import { WindowActions } from "../components/shell/WorkspaceNavigation";
 import { useEffect, useState } from "react";
-import { FEATURE_NAMES, selectedLocalModel, type LocalTranscriptionModel, type ServerSettings, type TelemetryUnavailable } from "@scarlet/shared";
+import { selectedLocalModel, type LocalTranscriptionModel, type ServerSettings } from "@scarlet/shared";
 import { api, errorMessage } from "../lib/client";
 import { desktop } from "../lib/desktop";
 import { Link, Navigate, Outlet, useBlocker, useLocation, useMatch, useNavigate } from "react-router-dom";
@@ -68,15 +67,22 @@ function ServerSettingsForm({ section }: { section: "general" | "advanced" }) {
   const retyped = (field: keyof typeof typed) => typed[field] !== undefined && typed[field] !== String(saved?.render[field]);
   const dirty = section === "advanced" && !!settings && !!saved
     && (shown(settings) !== shown(saved) || retyped("handleSeconds") || retyped("concurrency"));
-  // Another tab or the back link would drop a change that hasn't been saved, so leaving asks first, as a skill does.
-  const leaving = useBlocker(({ currentLocation: from, nextLocation: to }) => dirty && (from.pathname !== to.pathname || from.hash !== to.hash));
+  const savingChoice = section === "general" && busy;
+  // Advanced asks before leaving with changes. General waits for its pending choice to save so the next tab reads it.
+  const leaving = useBlocker(({ currentLocation: from, nextLocation: to }) =>
+    (dirty || savingChoice) && (from.pathname !== to.pathname || from.hash !== to.hash));
+  useEffect(() => {
+    if (section !== "general" || busy || leaving.state !== "blocked") return;
+    if (saveError) leaving.reset();
+    else leaving.proceed();
+  }, [section, leaving, busy, saveError]);
   // Restart to update asks the page before it restarts, so an unsaved change holds it until it's saved or discarded.
   useEffect(() => {
-    if (!dirty) return;
+    if (!dirty && !savingChoice) return;
     const warn = (e: BeforeUnloadEvent) => { e.preventDefault(); e.returnValue = ""; };
     window.addEventListener("beforeunload", warn);
     return () => window.removeEventListener("beforeunload", warn);
-  }, [dirty]);
+  }, [dirty, savingChoice]);
 
   if (error) return <ErrorState title="Couldn’t load server settings" body={error} onRetry={() => void load()} />;
   if (!settings) return <Loading label="Loading settings…" />;
@@ -132,10 +138,10 @@ function ServerSettingsForm({ section }: { section: "general" | "advanced" }) {
       data-unsaved={dirty || undefined}
       onSubmit={(e) => {
         e.preventDefault();
-        void save();
+        if (dirty && !busy) void save();
       }}
     >
-      <div className={section === "general" ? "max-w-md" : "grid sm:grid-cols-2 gap-x-8 gap-y-4"}>
+      <fieldset disabled={busy} className={section === "general" ? "max-w-md min-w-0" : "min-w-0 grid sm:grid-cols-2 gap-x-8 gap-y-4"}>
         <div>
           {section === "general" && (
           <>
@@ -231,15 +237,16 @@ function ServerSettingsForm({ section }: { section: "general" | "advanced" }) {
           </>
           )}
         </div>
-      </div>
+      </fieldset>
       {section === "advanced" && <div className="flex justify-end gap-2 mt-2">
         <button type="submit" className="btn-primary" disabled={!dirty || busy}>
           {busy && <Spinner className="size-3" />} Save
         </button>
       </div>}
+      {savingChoice && <p role="status" className="mt-2 text-xs text-muted">Saving…</p>}
       <InlineError>{saveError}</InlineError>
     </form>
-    <Modal open={leaving.state === "blocked"} onClose={() => { if (!busy) leaving.reset?.(); }} title="Save your settings?" footer={<>
+    <Modal open={section === "advanced" && leaving.state === "blocked"} onClose={() => { if (!busy) leaving.reset?.(); }} title="Save your settings?" footer={<>
       <button className="btn-ghost" disabled={busy} onClick={() => leaving.reset?.()}>Stay</button>
       <button className="btn-ghost" disabled={busy} onClick={() => leaving.proceed?.()}>Discard changes</button>
       <button className="btn-primary" disabled={busy} onClick={() => void save().then(saved => { if (saved) leaving.proceed?.(); })}>
@@ -250,54 +257,6 @@ function ServerSettingsForm({ section }: { section: "general" | "advanced" }) {
     </Modal>
     </>
   );
-}
-
-function TelemetrySwitch() {
-  const [state, setState] = useState<{ enabled: boolean; unavailable?: TelemetryUnavailable }>();
-  const [error, setError] = useState("");
-  const [saving, setSaving] = useState(false);
-  const load = () => {
-    setError("");
-    return api.settings().then(({ settings, telemetryUnavailable }) => {
-      setState({ enabled: settings.telemetryEnabled, unavailable: telemetryUnavailable });
-    }).catch(e => setError(errorMessage(e)));
-  };
-  useEffect(() => { void load(); }, []);
-  async function change(enabled: boolean) {
-    setSaving(true);
-    setError("");
-    try {
-      const { settings } = await api.updateSettings({ telemetryEnabled: enabled });
-      setState({ enabled: settings.telemetryEnabled });
-    } catch (e) {
-      setError(errorMessage(e));
-    } finally {
-      setSaving(false);
-    }
-  }
-  return <>
-    {state ? <div className="flex items-center gap-2 text-fg">
-      <Toggle label="Send usage reports" checked={!state.unavailable && state.enabled} disabled={saving || !!state.unavailable} onChange={change} />
-      <span>Send usage reports</span>
-    </div> : !error && <Loading label="Loading telemetry setting…" />}
-    {state?.unavailable === "environment" && <p>Usage reporting is turned off by the engine environment.</p>}
-    {state?.unavailable === "unconfigured" && <p>This build has no telemetry project configured.</p>}
-    <InlineError>{error}</InlineError>
-    {error && !state && <button className="btn-quiet" onClick={() => void load()}>Retry</button>}
-  </>;
-}
-
-function ModelCredit() {
-  const [error, setError] = useState("");
-  const url = "https://desertant.com";
-  return <div className="mt-6 text-sm text-muted">
-    Filler-word detection uses <a className="underline" href={url} onClick={e => {
-      e.preventDefault();
-      setError("");
-      void desktop.openUrl(url).catch(e => setError(errorMessage(e)));
-    }}>Uhm by Desert Ant Labs</a>.
-    <InlineError>{error}</InlineError>
-  </div>;
 }
 
 const tabs = [
@@ -375,36 +334,7 @@ export function SettingsPage() {
             <UsageSettings />
           </>
         )}
-        {tab === "about" && (
-          <section className="card p-5" aria-label="About Scarlet">
-            <dl className="grid w-fit grid-cols-[auto_auto] gap-x-6 gap-y-2">
-              <dt className="text-muted">Version</dt><dd>{__SCARLET_VERSION__}</dd>
-              {__SCARLET_REVISION__ && <><dt className="text-muted">Commit</dt><dd className="font-mono">{__SCARLET_REVISION__.slice(0, 7)}</dd></>}
-            </dl>
-            <UpdateSettings />
-            <Changelog />
-            <section className="mt-6 max-w-prose space-y-2 text-sm leading-relaxed text-muted" aria-labelledby="telemetry-heading">
-              <h2 id="telemetry-heading" className="font-semibold text-fg">Usage telemetry</h2>
-              <TelemetrySwitch />
-              <p>Scarlet releases send usage reports to PostHog in the US by default. We use them to see how often installations edit, whether editors return or export, and how they review Scarlet’s changes.</p>
-              <ul className="list-disc space-y-1 pl-5">
-                <li>At startup, Scarlet sends the number of projects in your library, excluding the trash.</li>
-                <li>When a tracked feature succeeds, Scarlet sends its name. This includes actions an agent takes on your behalf.</li>
-                <li>When a task is queued, Scarlet sends its type, selected agent and fast-mode setting. When it finishes, Scarlet sends the type, agent, outcome (done, failed or cancelled), interruption flag, duration when available, and number of recorded changes. This includes background transcriptions and resumed tasks.</li>
-                <li>When an export finishes, Scarlet sends the render type, outcome and quality setting when available.</li>
-                <li>When you explicitly keep an applied edit, send a revision about it, or request Undo edit, Scarlet sends the choice and an installation-specific code for that edit. The code links later choices about the same edit. Revise and Undo count when the request is accepted. Opening the card, dismissing it or leaving an edit untouched sends no review decision.</li>
-              </ul>
-              <p>Every event carries its time, a random event ID to prevent double counting, Scarlet version, operating system, processor architecture and an anonymous ID that links events from the same installation. PostHog sees the connection’s IP address. Scarlet disables location lookups and person profiles.</p>
-              <p>Reports exclude account details, footage, audio, transcripts, prompts, notes, edit titles, revision text, project names, file paths, model names, error messages and the IDs Scarlet uses in your library.</p>
-              <p>You can also turn reporting off by setting <code>SCARLET_TELEMETRY_ENABLED=false</code> before starting Scarlet.</p>
-              <details>
-                <summary className="cursor-pointer">All tracked feature names</summary>
-                <ul className="mt-2 list-disc pl-5">{FEATURE_NAMES.map(name => <li key={name}><code>{name}</code></li>)}</ul>
-              </details>
-            </section>
-            <ModelCredit />
-          </section>
-        )}
+        {tab === "about" && <AboutSettings />}
         {tab === "advanced" && (
           <>
             <ExportLogs />

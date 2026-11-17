@@ -26,7 +26,16 @@ export interface AgentCapabilities {
   plan: boolean;
   /** Prefix the harness uses when it exposes Scarlet's MCP tools to the model. */
   toolPrefix?: string;
+  /**
+   * How long one tool call may wait for evidence still being measured before it answers "still running" and costs the
+   * model a turn. Scarlet's hosts launch Claude Code (MCP_TOOL_TIMEOUT) and Codex (tool_timeout_sec) with a 300 s tool
+   * deadline; a client Scarlet didn't launch keeps the common 60 s one, so it waits less.
+   */
+  toolWaitSeconds?: number;
 }
+
+/** Wait for a client whose tool deadline is unknown: a margin below the common 60-second one. */
+export const DEFAULT_TOOL_WAIT_SECONDS = 45;
 
 // A 58-minute transcript exceeded Claude Code's result window and was saved to a file its
 // file-disabled session couldn't read. Leave headroom below its 50,000-character spill point.
@@ -39,10 +48,10 @@ export const DEFAULT_RESULT_CHARS = 40_000;
 const KNOWN: Record<string, AgentCapabilities> = {
   // claude -p runs with --tools "" (no file tools); Claude models take images but not audio.
   // Plan: Claude Code 2.1.316 has TaskCreate and TaskUpdate (TodoWrite before it) only when --tools names them.
-  claude: { images: true, audio: false, files: false, plan: false, toolPrefix: "mcp__scarlet__" },
+  claude: { images: true, audio: false, files: false, plan: false, toolPrefix: "mcp__scarlet__", toolWaitSeconds: 240 },
   // codex exec has a writable workspace; MCP audio blocks are not forwarded to the model.
   // Plan: Codex 0.166 has update_plan only with tools.update_plan.enabled, and reports it as `todo_list` items.
-  codex: { images: true, audio: false, files: true, plan: false },
+  codex: { images: true, audio: false, files: true, plan: false, toolWaitSeconds: 240 },
   // gemini runs with tools.core = [] (no file tools); audio forwarding from MCP is unverified. Its runner reads no plan.
   gemini: { images: true, audio: false, files: false, plan: false },
 };

@@ -1,7 +1,43 @@
-import { createReadStream, statSync } from "node:fs";
+import { createReadStream, statSync, type ReadStream } from "node:fs";
 import { extname } from "node:path";
 import { Readable } from "node:stream";
 import { HttpError } from "./errors.js";
+import { requestLogId } from "./logText.js";
+
+const fileLogs = new WeakMap<Request, { log: (line: string) => void; route: () => string }>();
+
+/** Install the request's diagnostic sink before a route opens a file. */
+export function startFileLog(req: Request, log: (line: string) => void, route: () => string) {
+  fileLogs.set(req, { log, route });
+}
+
+function logFileTransfer(req: Request, stream: ReadStream, status: number, start: number, end: number, renderId?: string) {
+  const context = fileLogs.get(req);
+  if (!context) return;
+  const started = performance.now();
+  const download = req.headers.get("x-scarlet-download") === "1";
+  const expected = end - start + 1;
+  let failure: string | undefined;
+  stream.once("error", (error: NodeJS.ErrnoException) => {
+    if (error.name === "AbortError" || error.code === "ERR_STREAM_PREMATURE_CLOSE" && req.signal.aborted) return;
+    failure = error.code && /^[A-Z][A-Z0-9_]{1,39}$/.test(error.code) ? error.code : "READ_ERROR";
+  });
+  stream.once("close", () => {
+    const elapsedMs = Math.round(performance.now() - started);
+    const readBytes = stream.bytesRead;
+    const outcome = failure ? "failed" : !stream.readableEnded ? "cancelled" : readBytes !== expected ? "truncated" : "finished";
+    // A fast successful range or abandoned scrub is routine. Always keep faults and explicit downloads.
+    if (!download && elapsedMs < 1000 && (outcome === "finished" || outcome === "cancelled")) return;
+    const parts = new URL(req.url).pathname.split("/");
+    const fields = [["project", /^prj_[a-z0-9]{12}$/], ["media", /^med_[a-z0-9]{12}$/], ["render", /^rnd_[a-z0-9]{12}$/]] as const;
+    const ids = fields.map(([key, pattern]) => {
+      const id = key === "render" && renderId && pattern.test(renderId) ? renderId : parts.find(part => pattern.test(part));
+      return id ? ` ${key}=${id}` : "";
+    }).join("");
+    context.log(`[transfer] file-read request=${requestLogId(req)} route=${context.route()} status=${status} outcome=${outcome}`
+      + ` startByte=${start} endByte=${end} readBytes=${readBytes} expectedBytes=${expected} elapsedMs=${elapsedMs}${ids}${failure ? ` code=${failure}` : ""}`);
+  });
+}
 
 const TYPES: Record<string, string> = {
   ".mp4": "video/mp4",
@@ -68,6 +104,7 @@ export function serveOriginal(req: Request, path: string): Response {
 interface ServeOptions {
   contentType?: string;
   cacheControl?: string;
+  renderId?: string;
 }
 
 /** Serve a file with HTTP Range support (single range), 404 when missing. */
@@ -117,6 +154,7 @@ export function serveFile(req: Request, path: string, opts: ServeOptions = {}): 
   // while keeping range requests and abandoned playback seeks inexpensive.
   const wholeDownload = !range && size >= 1024 * 1024 && req.headers.get("x-scarlet-download") === "1";
   const stream = createReadStream(path, { start, end, highWaterMark: wholeDownload ? 1024 * 1024 : undefined });
+  logFileTransfer(req, stream, status, start, end, opts.renderId);
   const body = Readable.toWeb(stream, { strategy: new ByteLengthQueuingStrategy({ highWaterMark: stream.readableHighWaterMark }) });
   return new Response(body as ReadableStream, { status, headers });
 }

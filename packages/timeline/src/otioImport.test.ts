@@ -323,6 +323,46 @@ describe("fromOtio", () => {
     expect(audioClips.map((c) => (c as MediaClip).mediaId)).toEqual(["m2"]);
   });
 
+  it("recovers reordered, overlapping and repeated takes after Resolve renames them all", () => {
+    const { project, tl } = setup();
+    tl.tracks = [tl.tracks[0]!];
+    tl.markers = [];
+    const clips = [
+      makeMediaClip("m1", 20, 25, 0, { id: "later-in-source" }),
+      makeMediaClip("m1", 0, 8, 5, { id: "wide" }),
+      makeMediaClip("m1", 2, 7, 13, { id: "first-take", volume: 0.5 }),
+      makeMediaClip("m1", 2, 7, 18, { id: "second-take", volume: 0.25 }),
+    ];
+    tl.tracks[0]!.clips = clips;
+    const doc = stripScarlet(toOtio(project, tl) as Json);
+    for (const item of doc.tracks.children[0].children) item.name = "Camera footage";
+    const back = fromOtio(doc, project, tl);
+    expect(back).toMatchObject({ version: "draft", parent: tl.version });
+    expect((back.tracks[0]!.clips as MediaClip[]).map(c => [c.id, c.volume])).toEqual(clips.map(c => [c.id, c.volume]));
+  });
+
+  it("matches linked sound strictly within half a frame on the timeline and at both source edges", () => {
+    const { project, tl } = setup();
+    project.settings.fps = 32;
+    tl.tracks[0]!.clips = [makeMediaClip("m1", 4, 5, 2)];
+    const doc = stripScarlet(toOtio(project, tl) as Json);
+    const picture = doc.tracks.children[0];
+    const halfFrame = 0.5 / project.settings.fps;
+    for (const [timelineOffset, startOffset, endOffset, expected] of [
+      [-0.9, 0.9, -0.9, 0], [0.9, -0.9, 0.9, 0],
+      [-1, 0, 0, 2], [1, 0, 0, 2], [0, 1, 0, 2], [0, 0, -1, 2], [10, 0, 0, 2],
+    ] as const) {
+      const linked = { ...structuredClone(picture), kind: "Audio", name: "Linked" };
+      const [gap, clip] = linked.children;
+      gap.source_range.duration = { rate: 1, value: 2 + timelineOffset * halfFrame };
+      clip.source_range.start_time = { rate: 1, value: 4 + startOffset * halfFrame };
+      clip.source_range.duration = { rate: 1, value: 1 + (endOffset - startOffset) * halfFrame };
+      doc.tracks.children = [picture, linked, { ...linked, name: "Second copy" }];
+      const audio = fromOtio(doc, project, tl).tracks.filter(t => t.kind === "audio");
+      expect(audio.flatMap(t => t.clips)).toHaveLength(expected);
+    }
+  });
+
   it("keeps an independently edited audio clip from the same recording", () => {
     const { project, tl } = setup();
     const video = tl.tracks[0]!.clips[0] as MediaClip;

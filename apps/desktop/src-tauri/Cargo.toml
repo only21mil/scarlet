@@ -36,14 +36,17 @@ flate2 = "1"
 sha2 = "0.10"
 regex = "1"
 url = "2"
+uuid = { version = "1", features = ["v4"] }
 tauri-plugin-updater = "2.14.1"
 semver = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 
-# Already in the build through tokio. A job object holds the engine and everything it starts.
 [target.'cfg(windows)'.dependencies]
+webview2-com = "0.39"
+windows = { version = "0.62", features = ["Win32_UI_Input_KeyboardAndMouse"] }
+# Already in the build through tokio. A job object holds the engine and everything it starts.
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

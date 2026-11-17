@@ -2,6 +2,7 @@ import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { create } from "zustand";
 import { importLinkFilename, type ProjectSummary } from "@scarlet/shared";
 import type { MediaAsset } from "@scarlet/timeline";
+import { appLog } from "../../lib/appLog";
 import { dropTargets, fileDropZone } from "../../lib/dropTargets";
 import { api, engineUnavailable, errorMessage, IS_DESKTOP } from "../../lib/client";
 import { canResumeFirstClip, matchAddedClip, resumeFirstClip } from "../../lib/firstClipFormat";
@@ -31,6 +32,7 @@ export interface LocalImport {
   position: number;
   total: number;
   checked?: number;
+  cancelDownload?: () => void;
 }
 
 export type ImportSource = File | string;
@@ -96,6 +98,8 @@ export function enqueueImports(projectId: string, sources: ImportSource[], match
   // Files by path are remembered until each is in the project, so a quit picks up where it stopped.
   const paths = sources.filter((source): source is string => typeof source === "string");
   addPendingImports(projectId, paths, !!matchFormat);
+  appLog("import", "queued", { project: projectId, count: sources.length, uploads: sources.length - paths.length,
+    links: paths.filter(isLink).length, first: !!matchFormat });
   update(projectId, state => ({ pending: state.pending + sources.length }));
   const job = (queues.get(projectId) ?? Promise.resolve()).then(async () => {
     for (const source of sources) {
@@ -104,6 +108,7 @@ export function enqueueImports(projectId: string, sources: ImportSource[], match
       const patch = (changes: Partial<UploadItem>) => update(projectId, state => ({
         items: state.items.map(item => item.id === id ? { ...item, ...changes } : item),
       }));
+      const download = typeof source === "string" && isLink(source) ? new AbortController() : undefined;
       let keepPending = typeof source === "string" && disconnected.has(projectId);
       try {
         if (keepPending) continue;
@@ -111,10 +116,17 @@ export function enqueueImports(projectId: string, sources: ImportSource[], match
         // Check when this file gets its turn: earlier files may have finished without yielding any video.
         const deferFormat = !matchFormat && pendingImports(projectId).some(i => i.setsFormat);
         if (typeof source === "string") {
-          const current = { projectId, name, path: source, position: 1, total: 1 };
+          const current: LocalImport = { projectId, name, path: source, position: 1, total: 1 };
+          if (download) current.cancelDownload = () => {
+            removePendingImport(projectId, source);
+            download.abort();
+          };
           update(projectId, () => ({ localImport: current }));
           const importId = markImportStarted(projectId, source);
-          media = await importLocalFile(projectId, source, checked => update(projectId, () => ({ localImport: { ...current, checked } })), importId, deferFormat);
+          media = await importLocalFile(projectId, source, checked => update(projectId, () => ({ localImport: { ...current, checked } })), importId, deferFormat, download?.signal);
+          if (download) update(projectId, state => ({ localImport: state.localImport && {
+            ...state.localImport, checked: 1, cancelDownload: undefined,
+          } }));
         } else {
           const upload = uploadMedia(projectId, source, progress => patch({ progress, state: progress === 1 ? "preparing" : "uploading" }), deferFormat);
           update(projectId, state => ({ items: [...state.items, { id, name, size: source.size, progress: 0, state: "uploading", abort: upload.abort }] }));
@@ -127,6 +139,7 @@ export function enqueueImports(projectId: string, sources: ImportSource[], match
           window.setTimeout(() => dismiss(projectId, id), 6000);
         }
       } catch (error) {
+        if (download?.signal.aborted) continue;
         if (typeof source === "string" && engineUnavailable(error)) {
           disconnected.set(projectId, id);
           keepPending = retryInterruptedImport(projectId, source);
@@ -181,8 +194,10 @@ export function resumeImports(projectId: string, media: readonly MediaAsset[]) {
   const matchFormat = waiting.some(i => i.setsFormat) ? resumeFirstClip(projectId) : undefined;
   const jobs: Promise<void>[] = [];
   const first: string[] = [], later: string[] = [];
+  let legacy = 0;
   for (const entry of waiting) {
     const asset = added(entry);
+    if (asset && !entry.importId) legacy++;
     if (!asset) {
       (entry.setsFormat ? first : later).push(entry.source);
     } else if (entry.setsFormat && matchFormat) {
@@ -198,6 +213,8 @@ export function resumeImports(projectId: string, media: readonly MediaAsset[]) {
     }
   }
   // Only a project's first files set its format. They were chosen before anything added later, so the saved order holds.
+  if (waiting.length) appLog("import", "resume", { project: projectId, count: waiting.length, first: first.length,
+    replay: first.length + later.length, matched: waiting.length - first.length - later.length, legacy });
   jobs.push(enqueueImports(projectId, first, matchFormat), enqueueImports(projectId, later));
   return Promise.all(jobs).then(() => undefined);
 }

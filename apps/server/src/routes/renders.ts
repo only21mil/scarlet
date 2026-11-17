@@ -2,8 +2,8 @@ import { join, resolve } from "node:path";
 import { statSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
-import { extractFrame, extractFilmstrip, fileInDirectory, fileInDirectoryAsync, probeMedia, renderTimelineFrame } from "@scarlet/render";
-import { clipEnd, FILMSTRIP_SEEK_BATCH, MAX_CUT_PLAYBACK_SECONDS, planPlaybackSegments, planSegments, snapToFrame, timelineDuration, type Project, type Timeline, type TimeRange } from "@scarlet/timeline";
+import { TRANSITION_RENDER_REVISION, extractFrame, extractFilmstrip, fileInDirectory, fileInDirectoryAsync, probeMedia, renderTimelineFrame, timelinePreviewDecoder } from "@scarlet/render";
+import { clipEnd, FILMSTRIP_SEEK_BATCH, MAX_CUT_PLAYBACK_SECONDS, planPlaybackSegments, planSegments, planTransitions, snapToFrame, timelineDuration, type Project, type Timeline, type TimeRange } from "@scarlet/timeline";
 import { Hono } from "hono";
 import { z } from "zod/v3";
 import { fullRenderContext, RenderKind, RenderRequest, type Render } from "@scarlet/shared";
@@ -13,13 +13,14 @@ import { requestAttempt, requireProjectEditAttempt } from "../services/taskAttem
 import { badRequest, conflict, notFound } from "../errors.js";
 import { requestCutPlaybackFile, waitForPlayback } from "../services/playback.js";
 import { serveFile } from "../files.js";
-import { clip, throttledLog } from "../logText.js";
-import { ensureHead } from "../services/timeline.js";
+import { logId, throttledLog } from "../logText.js";
+import { ensureProjectHead } from "../services/timeline.js";
 import { AnalysisCache } from "../services/analysisCache.js";
 import { pictureDecoder, pictureLane } from "../services/pictureWork.js";
 import { previewPictures } from "../services/previewPictures.js";
 import { jsonBody, numberParam, requireProject, requireProjectHeader } from "./util.js";
 import { measuredLoudness, type Loudness } from "../render/loudness.js";
+import { editorFirst } from "../services/editorFirst.js";
 
 /** Index visible clip intervals once so one still stats only the files that can contribute to its pixels. */
 function frameSources(timeline: Timeline) {
@@ -64,6 +65,14 @@ function frameSources(timeline: Timeline) {
   };
 }
 
+/**
+ * A still's cache key. A cut with transitions can keep its source files across a fix to how they are drawn, so its
+ * key names that revision too, as a section's does. A cut without them keeps the key it had, and its cached stills.
+ */
+export function frameKey(parts: unknown[], transitions: boolean) {
+  return createHash("sha256").update(JSON.stringify(transitions ? [...parts, TRANSITION_RENDER_REVISION] : parts)).digest("hex");
+}
+
 export function renderRoutes(ctx: Ctx) {
   const r = new Hono<AppEnv>();
 
@@ -74,13 +83,15 @@ export function renderRoutes(ctx: Ctx) {
   async function requestFrame(request: Request, projectId: string, key: string, priority: boolean, cacheControl: string, decode: (signal: AbortSignal) => Promise<Buffer>, etag?: string) {
     try {
       const headers = { "Cache-Control": cacheControl, ...(etag ? { ETag: etag } : {}) };
+      // Only the editor's window asks for a cut's pictures: background work yields while they look (editorFirst.ts).
+      editorFirst.touch();
       if (etag && request.headers.get("If-None-Match") === etag) return new Response(null, { status: 304, headers });
       // Frames share the engine's picture lane with the agent's contact sheets. The editor's own requests go first.
       const job = frames.get(key, demand => {
         const signal = AbortSignal.any([demand, ctx.projectSignal(projectId)]);
-        return ctx.track(pictureLane(ctx).run(() => decode(signal), { priority, signal }));
+        return ctx.track(pictureLane(ctx).run(() => decode(signal), { priority, signal }), projectId);
       }, { signal: request.signal, priority });
-      const jpeg = await ctx.track(job);
+      const jpeg = await ctx.track(job, projectId);
       return new Response(new Uint8Array(jpeg), { headers: { ...headers, "Content-Type": "image/jpeg" } });
     } catch (error) {
       if (ctx.shutdown.aborted || request.signal.aborted) return new Response(null, { status: ctx.shutdown.aborted ? 503 : 499 });
@@ -89,7 +100,7 @@ export function renderRoutes(ctx: Ctx) {
   }
   // The strip requests several samples from the same immutable cut. Parse it once.
   let sampledTimeline: Timeline | undefined;
-  let sourcesAt: ReturnType<typeof frameSources> | undefined;
+  let sourcesAt: { projectInputs: string; read: ReturnType<typeof frameSources>; transitions: boolean } | undefined;
   let sampledDuration = 0;
   let sampledProject: { revision: string; project: Project; inputs: string; paths: Map<string, string> } | undefined;
   function frameProject(id: string) {
@@ -125,10 +136,14 @@ export function renderRoutes(ctx: Ctx) {
     if (sampledTimeline?.projectId !== project.id || sampledTimeline.version !== version) {
       sampledTimeline = ctx.repos.versions.get(project.id, version)?.timeline;
       sampledDuration = sampledTimeline ? timelineDuration(sampledTimeline) : 0;
-      sourcesAt = sampledTimeline && frameSources(sampledTimeline);
+      sourcesAt = undefined;
     }
     const timeline = sampledTimeline;
     if (!timeline) throw notFound("timeline version");
+    if (sourcesAt?.projectInputs !== inputs) {
+      const { timeline: picture, motions } = planTransitions(timeline, new Map(project.media.map(asset => [asset.id, asset])), project.settings.fps);
+      sourcesAt = { projectInputs: inputs, read: frameSources(picture), transitions: motions.size > 0 };
+    }
     const frame = numberParam(c.req.query("frame"), "frame");
     const { fps, width, height } = project.settings;
     if (!Number.isSafeInteger(frame) || frame < 0 || frame >= Math.ceil(sampledDuration * fps - 1e-6))
@@ -136,26 +151,29 @@ export function renderRoutes(ctx: Ctx) {
     const range = { start: frame / fps, end: (frame + 1) / fps };
     const monitor = c.req.query("view") === "monitor";
     const size = monitor ? 960 : c.req.query("w") === "640" ? 640 : 160;
-    const key = createHash("sha256").update(JSON.stringify([project.id, version, frame, size, inputs, sourcesAt!(range, paths, ctx.paths.media(project.id))])).digest("hex");
+    const key = frameKey([project.id, version, frame, size, inputs, sourcesAt.read(range, paths, ctx.paths.media(project.id))], sourcesAt.transitions);
     const sameFormat = c.req.query("format") === `${width}x${height}@${fps}`;
     return requestFrame(c.req.raw, project.id, key, monitor || c.req.query("priority") === "interactive", sameFormat ? "private, no-cache" : "no-store", async signal => {
       const time = frame / fps;
       const targetHeight = Math.min(height, ctx.settings().render.previewHeight, Math.ceil(size * height / Math.max(width, height)));
       const preview = ctx.renders.coveringPreview(project, version, range, targetHeight);
       const file = preview?.path && await fileInDirectoryAsync(ctx.paths.renders(project.id), preview.path);
-      if (file) {
+      if (preview && file) {
         try {
           const local = time - (preview.range?.start ?? 0);
           return await extractFrame(file, Math.max(0, local - 0.1 / fps), {
             width: Math.round(width * Math.min(1, size / Math.max(width, height))), signal,
           });
-        } catch { signal.throwIfAborted(); } // Sample the timeline if the cached file is damaged.
+        } catch {
+          signal.throwIfAborted();
+          retried(`cached-frame/${preview.id}`, `[render] frame_fallback render=${logId(preview.id)} project=${logId(project.id)} version=${version} reason=cached_preview frame=${frame}`);
+        }
       }
       const root = ctx.paths.media(project.id);
       const pictures = previewPictures(root, { signal });
       let usedProxy = false;
-      // An original recording decodes on the GPU when there is one; the CPU retries if the driver can't.
-      const decoder = await pictureDecoder(ctx.settings().render.hwaccel);
+      const accel = ctx.settings().render.hwaccel;
+      const decoder = timelinePreviewDecoder(accel, await pictureDecoder(accel));
       try {
         return await renderTimelineFrame(project, timeline, range, root, signal, size, {
           decoder,
@@ -167,7 +185,7 @@ export function renderRoutes(ctx: Ctx) {
         });
       } catch (error) {
         if ((!usedProxy && !decoder) || signal.aborted) throw error;
-        retried("frame", `[render] reading a frame of ${version} again from the originals on the CPU: ${clip((error as Error).message, 300)}`);
+        retried(`frame/${project.id}`, `[render] frame_fallback project=${logId(project.id)} version=${version} reason=decode_retry frame=${frame}`);
         return renderTimelineFrame(project, timeline, range, root, signal, size);
       }
     }, sameFormat ? `"${key}"` : undefined);
@@ -182,7 +200,7 @@ export function renderRoutes(ctx: Ctx) {
     const file = await waitForPlayback(ctx, render, AbortSignal.any([request.signal, ctx.shutdown]));
     if (!file) return new Response(null, { status: ctx.shutdown.aborted ? 503 : 499 });
     return serveFile(request, file, {
-      cacheControl: request.method === "GET" ? "private, max-age=31536000, immutable" : "private, no-store",
+      cacheControl: request.method === "GET" ? "private, max-age=31536000, immutable" : "private, no-store", renderId: render.id,
     });
   }
 
@@ -200,15 +218,14 @@ export function renderRoutes(ctx: Ctx) {
     const signal = AbortSignal.any([c.req.raw.signal, ctx.mediaSignal(project.id)]);
     const owner = randomUUID();
     await ctx.track((async () => {
-      for (const range of ranges) {
-        if (signal.aborted) break;
-        const current = ctx.repos.projects.header(project.id);
-        if (!current || current.mediaPaused || current.settings.fps !== project.settings.fps || ctx.renders.fullPreview(current, version)) break;
-        const render = ctx.renders.request({ projectId: project.id, version, range, kind: "playback", quality: "preview", speculative: true }, owner);
-        try { await waitForPlayback(ctx, render, signal); }
-        finally { ctx.renders.release(render.id, owner); }
-      }
-    })());
+      if (signal.aborted) return;
+      const current = ctx.repos.projects.header(project.id);
+      if (!current || current.mediaPaused || current.settings.fps !== project.settings.fps || ctx.renders.fullPreview(current, version)) return;
+      // Queue every range at once: the render queue runs them side by side instead of one after another.
+      const renders = [...ranges].map(range => ctx.renders.request({ projectId: project.id, version, range, kind: "playback", quality: "preview", speculative: true }, owner));
+      try { await Promise.all(renders.map(render => waitForPlayback(ctx, render, signal))); }
+      finally { for (const render of renders) ctx.renders.release(render.id, owner); }
+    })(), project.id);
     if (ctx.shutdown.aborted || c.req.raw.signal.aborted) return new Response(null, { status: ctx.shutdown.aborted ? 503 : 499 });
     return c.body(null, 204);
   });
@@ -232,7 +249,7 @@ export function renderRoutes(ctx: Ctx) {
     const render = requestCutPlaybackFile(ctx, project, version, range, owner);
     const signal = AbortSignal.any([c.req.raw.signal, ctx.mediaSignal(project.id)]);
     try {
-      const file = await ctx.track(waitForPlayback(ctx, render, signal));
+      const file = await ctx.track(waitForPlayback(ctx, render, signal), project.id);
       if (!file) return new Response(null, { status: ctx.shutdown.aborted ? 503 : 499 });
       return c.json({ renderId: render.id, ...(render.range ?? { start: 0, end: duration, full: true }) });
     } finally { ctx.renders.release(render.id, owner); }
@@ -244,7 +261,7 @@ export function renderRoutes(ctx: Ctx) {
     const attempt = requestAttempt(c.req.raw);
     const head = project.head && ctx.repos.versions.exists(project.id, project.head) ? project.head : ctx.db.transaction(() => {
       requireProjectEditAttempt(ctx, attempt, project.id);
-      return ensureHead(ctx, project.id).head;
+      return ensureProjectHead(ctx, project.id).head;
     }, "immediate")();
     const version = body.version && body.version !== "head" ? body.version : head;
     if (version !== head && !ctx.repos.versions.exists(project.id, version)) throw notFound(`version ${version}`);
@@ -313,7 +330,9 @@ export function renderRoutes(ctx: Ctx) {
     if (hasAudio) {
       const info = await stat(file);
       try {
-        loudness = await measuredLoudness(ctx, file, [info.size, info.ctimeMs, info.mtimeMs], { stop: ctx.shutdown, signal: c.req.raw.signal });
+        loudness = await measuredLoudness(ctx, file, [info.size, info.ctimeMs, info.mtimeMs], {
+          projectId: render.projectId, stop: ctx.shutdown, signal: c.req.raw.signal,
+        });
       } catch (error) {
         if (c.req.raw.signal.aborted || ctx.shutdown.aborted) throw error;
         loudnessUnavailable = error instanceof Error ? error.message : String(error);

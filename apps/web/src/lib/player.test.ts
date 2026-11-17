@@ -458,13 +458,13 @@ it("logs a play the window refused as a failure, and one a pause cut short as no
     const play = vi.spyOn(video, "play").mockRejectedValue(new DOMException("The request is not allowed by the user agent", "NotAllowedError"));
     player.play();
     await Promise.resolve();
-    expect(lines.at(-1)).toBe('transport play-failed error="NotAllowedError: The request is not allowed by the user agent"');
+    expect(lines.at(-1)).toMatch(/^play-failed el=v\d+ origin=transport name=NotAllowedError /);
     expect(levels.at(-1)).toBe("warn");
     play.mockRejectedValue(new DOMException("The play() request was interrupted by a call to pause()", "AbortError"));
     player.play();
     await Promise.resolve();
     stopAppLog();
-    expect(lines.at(-1)).toMatch(/^transport play-interrupted error="AbortError: /);
+    expect(lines.at(-1)).toMatch(/^play-interrupted el=v\d+ origin=transport name=AbortError /);
     expect(levels.filter(level => level === "warn")).toHaveLength(1);
   } finally {
     stopAppLog();

@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { editorFirst } from "../services/editorFirst.js";
 import { LOCAL_MEDIA_INPUT, SOURCE_AUDIO_CLOCK, mediaToolLaunchError, resolveFfmpeg, resolveFfprobe } from "@scarlet/render";
 
 // Same resolution as the renderer: env override → binary beside the engine → PATH.
@@ -36,6 +37,7 @@ export function run(bin: string, args: string[], opts: RunOptions = {}): Promise
   return new Promise((resolve, reject) => {
     opts.signal?.throwIfAborted();
     const child = spawn(bin, args, { windowsHide: true, stdio: opts.onMessage ? ["ignore", "pipe", "pipe", "ipc"] : ["ignore", "pipe", "pipe"] });
+    editorFirst.adoptChild(child);
     if (opts.onMessage) child.on("message", opts.onMessage);
     const out: Buffer[] = [];
     let outBytes = 0;

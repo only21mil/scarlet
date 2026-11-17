@@ -1,10 +1,10 @@
-import { readSourceEnergy, sourceLabels, transcriptSourceReader } from "../services/transcriptSources.js";
+import { sourceEnergyReader, transcriptSourceReader } from "../services/sourceEnergy.js";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { rm, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { MultipartParseError, parseMultipartRequest } from "@remix-run/multipart-parser/future";
-import { fileInDirectoryAsync, hasIndexedAvc, speechActivity } from "@scarlet/render";
+import { fileInDirectoryAsync, hasIndexedAvc } from "@scarlet/render";
 import { Hono } from "hono";
 import { z } from "zod/v3";
 import { DialogueVoiceRoles, isPlayableMedia, MediaKind, Provenance } from "@scarlet/timeline";
@@ -14,6 +14,7 @@ import type { AppEnv } from "../auth.js";
 import type { Ctx } from "../context.js";
 import { requestAttempt, requireLocalPauseTarget, requireProjectEditAttempt } from "../services/taskAttempt.js";
 import { badRequest, conflict, HttpError, notFound } from "../errors.js";
+import { logId, throttledLog } from "../logText.js";
 import { serveFile, serveOriginal } from "../files.js";
 import { getTranscriptionProvider, importTranscriptionPolicy } from "../transcribe/index.js";
 import { AnalysisCache } from "../services/analysisCache.js";
@@ -24,7 +25,9 @@ import { pictureDecoder, pictureLane } from "../services/pictureWork.js";
 import { previewPictures } from "../services/previewPictures.js";
 import { getWaveform, ingestMedia, readWaveformCache, removeUnreadableMedia, settleAlignment, startTranscription, transcriptionHeld, writeHashedFile } from "../services/ingest.js";
 import { realignTranscript } from "../services/realign.js";
+import { recordingSpeechActivity } from "../services/recordingAudio.js";
 import { jsonBody, numberParam, optionalNumberParam, requireMedia, requireProjectHeader } from "./util.js";
+import { editorFirst } from "../services/editorFirst.js";
 
 const ImportRequest = z
   .object({ path: z.string().optional(), url: z.string().url().optional(), kind: MediaKind.optional(), name: z.string().optional(), importId: z.string().uuid().optional(), deferFormat: z.boolean().optional() })
@@ -41,8 +44,10 @@ export function mediaRoutes(ctx: Ctx) {
   const r = new Hono<AppEnv>();
   // The picture lane alone decides how many frames decode at once, and keeps a slot for the editor's.
   const frames = new AnalysisCache<Buffer>(frame => frame.length, undefined, Infinity);
-  const speech = new AnalysisCache<Awaited<ReturnType<typeof speechActivity>>>(spans => 48 * spans.length, 1024 * 1024);
+  // A window reads the recording's one decode and runs the detector, so a few at once don't contend for ffmpeg.
+  const speech = new AnalysisCache<Awaited<ReturnType<typeof recordingSpeechActivity>>>(spans => 48 * spans.length, 1024 * 1024, 4);
   const imports = new Map<string, ReturnType<typeof ingestMedia>>();
+  const frameFallback = throttledLog(ctx.log);
 
   r.put("/media/:mediaId/voice-roles", async c => {
     const source = requireMedia(ctx, c.req.param("mediaId"));
@@ -52,8 +57,9 @@ export function mediaRoutes(ctx: Ctx) {
     if (to <= from || to - from > 60 || to > (source.duration ?? 0)) throw badRequest("voice_reference", "Choose a reference of up to one minute with both voices.");
     const file = await fileInDirectoryAsync(ctx.paths.media(source.projectId), source.path);
     if (!file) throw notFound("source file");
-    if (!(await ctx.track(sourceLabels(file, ctx.mediaSignal(source.projectId)))).length) throw badRequest("voice_inputs", "Choose a synchronized recording with a mix and two isolated inputs.");
-    const { mix } = await ctx.track(readSourceEnergy(file, from, to, ctx.mediaSignal(source.projectId)));
+    const labels = await ctx.track(sourceEnergyReader(ctx).labels(file, ctx.mediaSignal(source.projectId)), source.projectId);
+    if (!labels.length) throw badRequest("voice_inputs", "Choose a synchronized recording with a mix and two isolated inputs.");
+    const { mix } = await ctx.track(sourceEnergyReader(ctx).energy(file, from, to, ctx.mediaSignal(source.projectId)), source.projectId);
     if (mix === undefined || mix === roles.me - 1 || mix === roles.other - 1) throw badRequest("voice_inputs", "Could not verify two isolated inputs and their mix in this reference.");
     const media = ctx.db.transaction(() => {
       requireLocalPauseTarget(requireProjectEditAttempt(ctx, attempt, source.projectId));
@@ -196,7 +202,7 @@ export function mediaRoutes(ctx: Ctx) {
     const media = requireMedia(ctx, c.req.param("mediaId"), project.id);
     requireProjectEditAttempt(ctx, requestAttempt(c.req.raw), project.id);
     requireAudio(media);
-    return c.json(await ctx.track(realignTranscript(ctx, project.id, media.id, ctx.projectSignal(project.id))));
+    return c.json(await ctx.track(realignTranscript(ctx, project.id, media.id, ctx.projectSignal(project.id)), project.id));
   });
 
   r.post("/projects/:id/media/:mediaId/prepare", async (c) => {
@@ -220,7 +226,7 @@ export function mediaRoutes(ctx: Ctx) {
     if (task.state === "done") return c.json({ state: "ready" });
     if (task.state === "failed" && task.interrupted) throw conflict("transcription_unavailable",
       "The interrupted transcription cannot resume with the current provider. Retry it from Media.");
-    ctx.track(done.catch(() => null));
+    ctx.track(done.catch(() => null), project.id);
     return c.json({ state: "processing", taskId: task.id }, 202);
   });
 
@@ -251,6 +257,8 @@ export function mediaRoutes(ctx: Ctx) {
 
   r.get("/media/:mediaId/preview/:index", async (c) => {
     const media = requireMedia(ctx, c.req.param("mediaId"));
+    // The editor is playing a source: background work yields meanwhile (editorFirst.ts).
+    editorFirst.touch();
     const file = await sourcePreviews.get(ctx, media, Number(c.req.param("index")), c.req.raw.signal);
     return serveFile(c.req.raw, file);
   });
@@ -279,8 +287,14 @@ export function mediaRoutes(ctx: Ctx) {
       const info = await stat(file);
       const key = JSON.stringify(["vad", file, media.hash, info.size, info.ctimeMs, info.mtimeMs, from, to]);
       // Up to a minute, read because someone asked: a running edit checks its joins with it while caching is paused too.
-      const spans = await speech.get(key, () => ctx.track(speechActivity(file, from, to, ctx.projectSignal(media.projectId))));
+      const spans = await speech.get(key, () => ctx.track(recordingSpeechActivity(ctx, file, from, to, ctx.projectSignal(media.projectId)), media.projectId));
       return c.json({ mediaId: media.id, from, to, ...wf, speechActivity: spans });
+    }
+    if (c.req.query("format") === "peaks-f64le") {
+      // Legacy JSON caches may contain more precision than the current float32 cache.
+      const data = new DataView(new ArrayBuffer(wf.peaks.length * 8));
+      for (let i = 0; i < wf.peaks.length; i++) data.setFloat64(i * 8, wf.peaks[i]!, true);
+      return c.body(data.buffer, 200, { "Content-Type": "application/octet-stream" });
     }
     return c.json({ mediaId: media.id, from, to, peaks: wf.peaks, rms: wf.rms });
   });
@@ -299,10 +313,10 @@ export function mediaRoutes(ctx: Ctx) {
     const search = c.req.query("search");
     if (search !== undefined) {
       const contextWords = z.coerce.number().int().min(0).max(30).parse(c.req.query("contextWords") ?? 6);
-      return c.json(transcripts.search(transcript, search, contextWords));
+      return c.json(transcripts.search(transcript, search, contextWords, c.req.query("wordSnapshot")));
     }
     return c.json(c.req.query("audioSources") === "1" && from !== null && to !== null && !omitWords
-      ? await ctx.track(readSources(media.projectId, media, transcript, from, to)) : transcript);
+      ? await ctx.track(readSources(media.projectId, media, transcript, from, to), media.projectId) : transcript);
   });
 
   /**
@@ -314,7 +328,7 @@ export function mediaRoutes(ctx: Ctx) {
     const range = z.tuple([z.number().finite().nonnegative(), z.number().finite().nonnegative()]).refine(([a, b]) => b >= a);
     const { words, gaps } = await jsonBody(c, z.object({ words: z.array(range).max(5000).default([]), gaps: z.array(range).max(2000).default([]) }));
     const toRange = ([start, end]: [number, number]) => ({ start, end });
-    return c.json(await ctx.track(otherInputReader(ctx).classify(media.projectId, media, words.map(toRange), gaps.map(toRange))));
+    return c.json(await ctx.track(otherInputReader(ctx).classify(media.projectId, media, words.map(toRange), gaps.map(toRange)), media.projectId));
   });
 
   /** Attempts at the same line near a source range, for comparing takes in review. Source seconds. */
@@ -338,7 +352,7 @@ export function mediaRoutes(ctx: Ctx) {
     const { status: _s, error: _e, projectId, ...asset } = media;
     // Runs in the background; the task is returned immediately and updated over WS.
     const { task, done } = startTranscription(ctx, projectId, asset, body.provider, "refuse");
-    ctx.track(done.catch(() => null));
+    ctx.track(done.catch(() => null), projectId);
     return c.json({ task }, 202);
   });
 
@@ -352,27 +366,36 @@ export function mediaRoutes(ctx: Ctx) {
     const source = await stat(file).catch(() => null);
     if (!source) throw notFound("source file");
     const preview = c.req.query("preview") === "1";
-    const key = JSON.stringify([file, media.hash, source.size, source.mtimeMs, source.ctimeMs, t, w, preview]);
+    // An agent's closer look: one area of the picture, in percent of it, and lines at round percents to name an area by.
+    const asked = c.req.query("area")?.split(",").map(Number);
+    if (asked && !(asked.length === 4 && asked.every(n => Number.isFinite(n) && n >= 0 && n <= 100) && asked[2]! - asked[0]! >= 1 && asked[3]! - asked[1]! >= 1))
+      throw badRequest("bad_area", "area is left,top,right,bottom in percent of the picture, at least 1 percent each way.");
+    const area = asked?.map(n => n / 100) as [number, number, number, number] | undefined;
+    const grid = c.req.query("grid") === "1" && media.width && media.height ? { width: media.width, height: media.height } : undefined;
+    const key = JSON.stringify([file, media.hash, source.size, source.mtimeMs, source.ctimeMs, t, w, preview, area, !!grid]);
     const frame = async (demand: AbortSignal) => {
       const signal = AbortSignal.any([demand, ctx.projectSignal(media.projectId)]);
-      if (preview && media.fps && media.width && media.height) {
+      if (preview && !area && !grid && media.fps && media.width && media.height) {
         const minimumHeight = Math.ceil(w * media.height / media.width);
         const picture = await previewPictures(ctx.paths.media(media.projectId), { signal })(media, t, t + 1 / media.fps, minimumHeight);
         if (picture) {
           try { return await ctx.render.extractFrame(picture.file, Math.max(0, t - picture.start), { width: w, signal, indexedMp4: true }); }
-          catch { signal.throwIfAborted(); } // An evicted or damaged preview can be sampled from the original.
+          catch {
+            signal.throwIfAborted();
+            frameFallback(media.id, `[media] frame_fallback media=${logId(media.id)} project=${logId(media.projectId)} reason=cached_preview`);
+          }
         }
       }
       // The agent's frames read the movie's index too: the same picture, a third sooner on a long recording.
       const indexedMp4 = !!media.previewClock && hasIndexedAvc(media);
       // The original decodes on an NVIDIA GPU when there is one.
       const decoder = await pictureDecoder(ctx.settings().render.hwaccel) === "cuda" ? "cuda" as const : undefined;
-      return ctx.render.extractFrame(file, t, { width: w, signal, indexedMp4, decoder });
+      return ctx.render.extractFrame(file, t, { width: w, signal, indexedMp4, decoder, area, grid });
     };
     try {
       // Frames share the engine’s picture lane with contact sheets. The editor’s own requests go first.
       const priority = c.req.query("priority") === "interactive";
-      const jpeg = await frames.get(key, signal => ctx.track(pictureLane(ctx).run(() => frame(signal), { priority, signal })), {
+      const jpeg = await frames.get(key, signal => ctx.track(pictureLane(ctx).run(() => frame(signal), { priority, signal }), media.projectId), {
         priority, signal: c.req.raw.signal,
       });
       return new Response(new Uint8Array(jpeg), { headers: { "Content-Type": "image/jpeg", "Cache-Control": "private, max-age=3600" } });

@@ -1,8 +1,9 @@
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, existsSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, expect, it } from "vitest";
-import { createProject, type Project } from "@scarlet/timeline";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { ATTEMPT_HEADER, TASK_HEADER, type Task } from "@scarlet/shared";
+import { createProject, sha256, type Project } from "@scarlet/timeline";
 import { createApp, type ScarletApp } from "../app.js";
 import { accessToken } from "../auth.js";
 import { storeVersion } from "./timeline.js";
@@ -32,16 +33,29 @@ beforeEach(() => {
   long = ctx.repos.projects.update(long.id, { head: head.version });
 });
 afterEach(async () => {
+  vi.restoreAllMocks();
   await workspace.ctx.close();
   rmSync(directory, { recursive: true, force: true });
 });
 
-function api(method: string, path: string, body?: unknown) {
+function api(method: string, path: string, body?: unknown, attempt?: Pick<Task, "id" | "startedAt">) {
   return workspace.app.request("/api" + path, { method, body: JSON.stringify(body),
-    headers: { Authorization: `Bearer ${accessToken(workspace.ctx)}`, ...(body !== undefined && { "Content-Type": "application/json" }) } });
+    headers: { Authorization: `Bearer ${accessToken(workspace.ctx)}`, ...(body !== undefined && { "Content-Type": "application/json" }),
+      ...(attempt?.startedAt && { [TASK_HEADER]: attempt.id, [ATTEMPT_HEADER]: attempt.startedAt }) } });
 }
 
 const form = { count: 3, aspect: "9:16", maxSeconds: 60, captions: true, agent: "claude", model: "claude-opus-5-5" };
+
+async function claim(taskId: string): Promise<Task> {
+  const registered = await api("POST", "/hosts/register", { name: "Shorts host", platform: "test", agents: [{ id: form.agent, installed: true, model: form.model }] });
+  expect(registered.status).toBe(201);
+  const { host } = await registered.json() as { host: { id: string } };
+  const claimed = await api("POST", `/hosts/${host.id}/claim`, { taskId });
+  expect(claimed.status).toBe(200);
+  const { task } = await claimed.json() as { task: Task };
+  expect(task).toMatchObject({ id: taskId, state: "claimed" });
+  return task;
+}
 
 it("makes a project for each short from the long video's finished edit, and starts the first", async () => {
   const { ctx } = workspace;
@@ -79,12 +93,13 @@ it("makes a project for each short from the long video's finished edit, and star
 it("names the shorts for the moments the first run chose, starts the others with theirs, and trashes a short left without one", async () => {
   const { ctx } = workspace;
   const { projects, task } = await (await api("POST", `/projects/${long.id}/shorts`, form)).json() as { projects: Project[]; task: { id: string } };
+  const attempt = await claim(task.id);
   // Overlapping moments would make two shorts of the same thing.
-  const overlap = await api("POST", `/tasks/${task.id}/shorts-plan`, { moments: [{ start: 5, end: 40, title: "A" }, { start: 30, end: 60, title: "B" }] });
+  const overlap = await api("POST", `/tasks/${task.id}/shorts-plan`, { moments: [{ start: 5, end: 40, title: "A" }, { start: 30, end: 60, title: "B" }] }, attempt);
   expect(overlap.status).toBe(400);
 
   const plan = await api("POST", `/tasks/${task.id}/shorts-plan`, { moments: [
-    { start: 5, end: 40, title: "Agents fail without tools" }, { start: 50, end: 80, title: "The wrong flight" }] });
+    { start: 5, end: 40, title: "Agents fail without tools" }, { start: 50, end: 80, title: "The wrong flight" }] }, attempt);
   expect(plan.status).toBe(200);
   expect(ctx.repos.projects.get(projects[0]!.id)!.name).toBe("Agents fail without tools");
   expect(ctx.repos.projects.get(projects[1]!.id)!.name).toBe("The wrong flight");
@@ -93,9 +108,87 @@ it("names the shorts for the moments the first run chose, starts the others with
   expect(second.context.short).toMatchObject({ index: 2, moment: { start: 50, end: 80, title: "The wrong flight" } });
   expect(taskPrompt(ctx, second).systemPrompt).toContain("This short’s moment, chosen by the first short’s run: 50.00–80.00 s on the copied timeline");
   // Once the others have started, the moments stay as they are.
-  expect((await api("POST", `/tasks/${task.id}/shorts-plan`, { moments: [{ start: 5, end: 40, title: "Again" }] })).status).toBe(409);
+  expect((await api("POST", `/tasks/${task.id}/shorts-plan`, { moments: [{ start: 5, end: 40, title: "Again" }] }, attempt)).status).toBe(409);
   // Only the first short's run chooses.
   expect((await api("POST", `/tasks/${second.id}/shorts-plan`, { moments: [{ start: 5, end: 40, title: "Mine" }] })).status).toBe(400);
+});
+
+it("keeps the first short's selected moment when its request resumes", async () => {
+  const { task } = await (await api("POST", `/projects/${long.id}/shorts`, { ...form, count: 2 })).json() as { task: Task };
+  const moments = [{ start: 5, end: 40, title: "First moment" }, { start: 50, end: 80, title: "Second moment" }];
+  expect((await api("POST", `/tasks/${task.id}/shorts-plan`, { moments })).status).toBe(200);
+  expect((await api("POST", `/tasks/${task.id}/cancel`, {})).status).toBe(200);
+  const resumed = await api("POST", `/tasks/${task.id}/retry`, {});
+  expect(resumed.status).toBe(200);
+  const { task: retry } = await resumed.json() as { task: Task };
+  expect(retry.context.short?.moment).toEqual(moments[0]);
+  expect(taskPrompt(workspace.ctx, retry).systemPrompt).toContain("5.00–40.00 s on the copied timeline");
+  expect((await api("POST", `/tasks/${retry.id}/shorts-plan`, { moments })).status).toBe(409);
+});
+
+it.each(["recorded stamp", "legacy hash"] as const)("refuses to make shorts from a file replaced after its cache and transcript were made (%s)", async fingerprint => {
+  const { ctx } = workspace;
+  const media = ctx.repos.projects.getMedia("cam")!;
+  const original = join(ctx.paths.media(long.id), media.path);
+  const { size, mtimeMs, ctimeMs } = statSync(original);
+  ctx.repos.projects.putMedia(long.id, { ...media, hash: sha256(readFileSync(original, "utf8")),
+    fingerprintStamp: fingerprint === "recorded stamp" ? { size, mtimeMs, ctimeMs } : undefined }, "ready");
+  writeFileSync(original, "a different recording");
+  const response = await api("POST", `/projects/${long.id}/shorts`, { ...form, count: 2 });
+  expect(response.status).toBe(409);
+  expect(await response.json()).toMatchObject({ error: { code: "media_changed" } });
+  expect(ctx.repos.projects.summaries().map(project => project.id)).toEqual([long.id]);
+  expect(readdirSync(join(directory, "projects"))).toEqual([long.id]);
+});
+
+it("makes shorts from a file whose times changed but whose content didn't, as after moving the library", async () => {
+  const { ctx } = workspace;
+  const media = ctx.repos.projects.getMedia("cam")!;
+  const original = join(ctx.paths.media(long.id), media.path);
+  const { size, mtimeMs, ctimeMs } = statSync(original);
+  ctx.repos.projects.putMedia(long.id, { ...media, hash: sha256(readFileSync(original, "utf8")), fingerprintStamp: { size, mtimeMs, ctimeMs } }, "ready");
+  utimesSync(original, new Date(mtimeMs + 60_000), new Date(mtimeMs + 60_000));
+  const hash = vi.spyOn(ctx.render, "hashFile");
+  const response = await api("POST", `/projects/${long.id}/shorts`, { ...form, count: 2 });
+  expect(response.status).toBe(201);
+  expect(hash).toHaveBeenCalledTimes(1);
+});
+
+it("reads an older import's file once for all its shorts, to check it against its hash", async () => {
+  const { ctx } = workspace;
+  const media = ctx.repos.projects.getMedia("cam")!;
+  const original = join(ctx.paths.media(long.id), media.path);
+  ctx.repos.projects.putMedia(long.id, { ...media, hash: sha256(readFileSync(original, "utf8")), fingerprintStamp: undefined }, "ready");
+  const hash = vi.spyOn(ctx.render, "hashFile");
+  const response = await api("POST", `/projects/${long.id}/shorts`, { ...form, count: 3 });
+  expect(response.status).toBe(201);
+  expect(hash).toHaveBeenCalledTimes(1);
+  expect(hash.mock.calls[0]![0]).toBe(original);
+  // Each copy is stamped, so it is checked by its stamp from then on.
+  const { projects } = await response.json() as { projects: Project[] };
+  for (const project of projects) {
+    const [copy] = ctx.repos.projects.listMedia(project.id);
+    const { size, mtimeMs, ctimeMs } = statSync(join(ctx.paths.media(project.id), copy!.path));
+    expect(copy!.fingerprintStamp).toEqual({ size, mtimeMs, ctimeMs });
+  }
+});
+
+it("refuses a late shorts plan after Stop without changing the projects or queue", async () => {
+  const { ctx } = workspace;
+  const { projects, task } = await (await api("POST", `/projects/${long.id}/shorts`, form)).json() as { projects: Project[]; task: { id: string } };
+  const attempt = await claim(task.id);
+  expect((await api("POST", `/projects/${attempt.projectId}/stop-editing`)).status).toBe(200);
+
+  const path = `/tasks/${task.id}/shorts-plan`;
+  const plan = { moments: [{ start: 5, end: 40, title: "First" }, { start: 50, end: 80, title: "Second" }] };
+  const late = await api("POST", path, plan, attempt);
+  expect(late.status).toBe(409);
+  expect(await late.json()).toMatchObject({ error: { code: "inactive_task_attempt" } });
+  expect((await api("POST", path, plan)).status).toBe(409);
+  expect(projects.map(p => ctx.repos.projects.header(p.id)?.name)).toEqual(projects.map(p => p.name));
+  expect(ctx.repos.tasks.select("1=1", [], "created_at, rowid")).toMatchObject([
+    { id: task.id, state: "cancelled" }, { resumeRootId: task.id, state: "queued", resumesAfterProjectStop: true },
+  ]);
 });
 
 it("keeps the line about where a short came from until the editor dismisses it, and says when that video is gone", async () => {

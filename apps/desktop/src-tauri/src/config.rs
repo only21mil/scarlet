@@ -103,7 +103,59 @@ pub struct Paths {
     pub home: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditorModelSelection {
+    agent: EditorAgent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum EditorAgent {
+    Claude,
+    Codex,
+    Gemini,
+    Api,
+}
+
 impl Paths {
+    fn editor_model_file(&self) -> PathBuf {
+        self.config_file.with_file_name("editor-model.json")
+    }
+
+    /// Share the editor's selection across renderer origins. Older releases may still write desktop.json.
+    pub fn editor_model(&self) -> Option<EditorModelSelection> {
+        let path = self.editor_model_file();
+        let saved = match std::fs::read(&path) {
+            Ok(saved) => saved,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                log::warn!("could not read editor model preference: {e}");
+                return None;
+            }
+        };
+        serde_json::from_slice(&saved).unwrap_or_else(|e| {
+            log::warn!("invalid editor model preference: {e}");
+            None
+        })
+    }
+
+    pub fn save_editor_model(&self, selection: &EditorModelSelection) -> Result<()> {
+        let path = self.editor_model_file();
+        let dir = path.parent().context("missing desktop config directory")?;
+        std::fs::create_dir_all(dir)?;
+        let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+        serde_json::to_writer(&mut temp, selection)?;
+        temp.persist(path)?;
+        Ok(())
+    }
+
     /// Kept outside desktop.json so older releases can save their settings without dropping this list.
     pub fn custom_openai_models(&self) -> Vec<String> {
         self.custom_models("custom-openai-models.json")
@@ -225,6 +277,32 @@ mod tests {
             resource_dir: None,
             home: root.join("home"),
         }
+    }
+
+    #[test]
+    fn remembers_the_latest_editor_model_across_launches() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = paths(dir.path());
+        assert!(first.editor_model().is_none());
+        let selection = serde_json::json!({"agent": "codex", "model": "example-model", "effort": "high", "serviceTier": "priority"});
+        first.save_editor_model(&serde_json::from_value(selection.clone()).unwrap()).unwrap();
+        AppConfig::default().save(&first.config_file).unwrap();
+
+        let next = paths(dir.path());
+        assert_eq!(serde_json::to_value(next.editor_model()).unwrap(), selection);
+        let replacement = serde_json::json!({"agent": "claude", "model": "opus"});
+        next.save_editor_model(&serde_json::from_value(replacement.clone()).unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(first.editor_model()).unwrap(), replacement);
+    }
+
+    #[test]
+    fn ignores_an_unreadable_editor_model_preference() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        let file = paths.editor_model_file();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, r#"{"agent":"unknown","model":"example-model"}"#).unwrap();
+        assert!(paths.editor_model().is_none());
     }
 
     #[test]

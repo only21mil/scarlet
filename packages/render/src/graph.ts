@@ -35,6 +35,7 @@ import type {
   TimeRange,
   Transform,
   TransformKeyframe,
+  TransitionPlan,
 } from "@scarlet/timeline";
 import { INDEXED_MP4_INPUT, LOCAL_MEDIA_INPUT, SOURCE_AUDIO_CLOCK, ffmpegMajor, fnum } from "./exec.js";
 import { effectFilters, effectKind, escapeFilterPath } from "./effects.js";
@@ -46,6 +47,8 @@ export interface GraphOptions extends FontOptions {
   decoder?: "videotoolbox" | "videotoolbox-hevc" | "cuda";
   /** Look for an original picture the delivery encoder can read directly. */
   directPicture?: boolean;
+  /** When the timeline was sliced after planning, use the original transitions and picture-only layers. */
+  transitions?: Pick<TransitionPlan, "motions" | "layers">;
   /** Reuse probed movie headers for seeks when the caller supports discovery fallback. */
   indexedInputs?: boolean;
   signal?: AbortSignal;
@@ -504,7 +507,7 @@ async function writeFilterGraph(
   const probes = opts.probes ?? new Map<string, ProbeResult>();
   const effectCtx = { mediaRoot: opts.mediaRoot, warn };
   // Transitions add picture-only layers around their joins and move the clips either side.
-  const transitions = planTransitions(timeline, media, fps);
+  const transitions = opts.transitions ? { timeline, ...opts.transitions } : planTransitions(timeline, media, fps);
   timeline = transitions.timeline;
   const motionsOf = (id: string): TransitionMotion[] => motionsIn(transitions.motions.get(id), R0, R1);
 
@@ -670,7 +673,7 @@ async function writeFilterGraph(
     for (const [trackIndex, track] of timeline.tracks.entries()) {
       if (trackIndex === 0 || track.kind !== "video" || track.hidden) continue;
       for (const clip of track.clips) {
-        if (clip.enabled === false) continue;
+        if (clip.enabled === false || motionsOf(clip.id).length) continue;
         const p = clipPlacement(clip, range, 0.5 / fps);
         if (!p) continue;
         const asset = clip.kind === "media" ? media.get(clip.mediaId) : undefined;

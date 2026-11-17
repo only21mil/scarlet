@@ -69,12 +69,20 @@ it("searches across segment boundaries with inherited speaker roles and refreshe
     const expected = { segmentCount: 2, wordCount: 3, matches: [{ start: 1, end: 3, speaker: "me", wordIndex: 0,
       text: "Here’s next", context: "[ Here’s next ] line" }] };
     expect(await find()).toEqual(expected);
-    expect(await find()).toEqual(expected);
+    const search = (known: string) => client.searchTranscript(media.id, "HERES, next", 1, known);
+    const cold = await search("");
+    expect(cold).toEqual({ ...expected, wordSnapshot: { id: expect.any(String), texts: ["Here’s", "next", "line"] } });
+    if (!("wordSnapshot" in cold) || !cold.wordSnapshot) throw new Error("missing word snapshot");
+    const known = cold.wordSnapshot.id;
+    expect(await search(known)).toEqual({ ...expected, wordSnapshot: { id: known } });
     expect((await client.transcript(media.id, { from: 2, to: 3 })).segments.map(s => s.id)).toEqual(["second"]);
     ctx.repos.projects.putMedia(project.id, { ...media, voiceRoles: { me: 3, other: 2 } }, "ready");
     expect(await find()).toMatchObject({ matches: [{ speaker: "other voices · Speaker 1" }] });
     peer.prepare("UPDATE transcripts SET json = json_set(json, '$.segments[1].words[0].text', 'There') WHERE id = ?").run("t");
     expect(await find()).toEqual({ segmentCount: 2, wordCount: 3, matches: [] });
+    const refreshed = await search(known);
+    expect(refreshed).toMatchObject({ matches: [], wordSnapshot: { texts: ["There", "next", "line"] } });
+    expect(refreshed).not.toMatchObject({ wordSnapshot: { id: known } });
     expect((await client.transcript(media.id, { from: 0, to: 2 })).segments[0]!.words[0]!.text).toBe("There");
     // A completed rerun links a new transcript while the old document can still be stored.
     ctx.repos.transcripts.put({ ...transcript, id: "replacement" });
@@ -102,5 +110,22 @@ it("releases an event-based status wait on cancellation and reads peer-owned wor
     saveTask(ctx, { ...task, state: "cancelled" });
     expect(await waiting).toMatchObject({ task: { state: "cancelled" }, waited: true });
     expect(ctx.bus.listenerCount("ws")).toBe(before);
+  } finally { await ctx.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+it("keeps a long recording's transcript read, rather than reading it whole again for every page", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "scarlet-long-transcript-"));
+  const { ctx } = createApp({ dataDir: dir, env: {}, log() {} });
+  try {
+    const project = ctx.repos.projects.insert(createProject("Long"));
+    const media = ctx.repos.projects.putMedia(project.id, { id: "mic", path: "mic.wav", kind: "audio", name: "Mic", transcriptId: "t" }, "ready");
+    // About as long, saved, as the words of two and a half hours of talk.
+    const segments = Array.from({ length: 2000 }, (_, i) => ({ id: `s${i}`, start: i, end: i + 1, text: "word ".repeat(800), words: [] }));
+    ctx.repos.transcripts.put({ id: "t", mediaId: media.id, projectId: project.id, segments });
+    const reader = transcriptReader(ctx);
+    const read = () => reader.read({ ...media, projectId: project.id }, null, null, false);
+    const first = read();
+    expect(first?.segments).toHaveLength(2000);
+    expect(read()).toBe(first);
   } finally { await ctx.close(); await rm(dir, { recursive: true, force: true }); }
 });

@@ -1,6 +1,6 @@
 import { expect, it } from "vitest";
 import type { Change } from "@scarlet/timeline";
-import { queueOrder, queueWait, requestTargetKey, runsBeside } from "./threads.js";
+import { queueOrder, queueWait, queueWaits, requestTargetKey } from "./threads.js";
 import type { Task } from "./api.js";
 
 const task = (id: string, state: Task["state"], minute: number, context: Partial<Task["context"]> = {}): Task => ({
@@ -44,6 +44,17 @@ it("keeps a resumed run's place in line ahead of requests asked while it worked"
   expect(queueWait(revision, all, [review])).toEqual({ kind: "ahead", count: 1 });
 });
 
+it("puts edits interrupted by the project's Stop ahead of ordinary queued work", () => {
+  const waiting = task("waiting", "queued", 0);
+  const first = task("first", "cancelled", 1);
+  const second = task("second", "cancelled", 2);
+  const resumeFirst = { ...task("resume-first", "queued", 4), resumeRootId: first.id, resumesAfterProjectStop: true };
+  const resumeSecond = { ...task("resume-second", "queued", 3), resumeRootId: second.id, resumesAfterProjectStop: true };
+  const all = [waiting, first, second, resumeSecond, resumeFirst];
+  expect(queueOrder(all, []).map(t => t.id)).toEqual([resumeFirst.id, resumeSecond.id, waiting.id]);
+  expect(queueWait(waiting, all, [])).toEqual({ kind: "ahead", count: 2 });
+});
+
 it("keeps a resumed run ahead of a request asked in the same millisecond as the run it continues", () => {
   const interrupted = { ...task("pass", "failed", 0), interrupted: true, retryTaskId: "again" } as Task;
   const follow = task("follow", "queued", 0, { threadId: "pass" });
@@ -52,6 +63,46 @@ it("keeps a resumed run ahead of a request asked in the same millisecond as the 
   const all = [interrupted, follow, again];
   expect(queueWait(again, all, [])).toBeUndefined();
   expect(queueWait(follow, all, [])).toEqual({ kind: "ahead", count: 1 });
+});
+
+it("follows insertion order when a project snapshot lists same-millisecond requests in reverse", () => {
+  const root = { ...task("root", "failed", 0), queueSequence: 40 };
+  const first = { ...task("first", "queued", 0), queueSequence: 41 };
+  const second = { ...task("second", "queued", 0), queueSequence: 42 };
+  const resumed = { ...task("resumed", "queued", 2), resumeRootId: root.id, queueSequence: 43 };
+  const snapshot = [resumed, second, first, root];
+
+  expect(queueOrder(snapshot, []).map(t => t.id)).toEqual([resumed.id, first.id, second.id]);
+  expect(queueWait(resumed, snapshot, [])).toBeUndefined();
+  expect(queueWait(second, snapshot, [])).toEqual({ kind: "ahead", count: 2 });
+});
+
+it("never ranks a request without an engine number by its place in the list", () => {
+  // The window lists a project's requests newest first. One the engine didn't number (as the demo's are) used to be
+  // ranked by its index in that list, a smaller figure than any row number, and so went ahead of requests asked before it.
+  const numbered = { ...task("numbered", "queued", 0), queueSequence: 40 };
+  const unnumbered = task("unnumbered", "queued", 0);
+  const later = task("later", "queued", 1);
+  expect(queueOrder([later, unnumbered, numbered], []).map(t => t.id)).toEqual(["numbered", "unnumbered", "later"]);
+  expect(queueWait(unnumbered, [later, unnumbered, numbered], [])).toEqual({ kind: "ahead", count: 1 });
+  // Requests from different times keep their times, whatever order the list is in.
+  const first = task("first", "queued", 0), second = task("second", "queued", 1), third = task("third", "queued", 2);
+  expect(queueOrder([third, second, first], []).map(t => t.id)).toEqual(["first", "second", "third"]);
+  expect(queueWait(first, [third, second, first], [])).toBeUndefined();
+  expect(queueWait(third, [third, second, first], [])).toEqual({ kind: "ahead", count: 2 });
+});
+
+it("answers why each queued request waits from one reading of the snapshot", () => {
+  const pass = task("pass", "running", 0);
+  const zoom = task("zoom", "queued", 1);
+  const captions = task("captions", "queued", 2);
+  const fix = task("fix", "queued", 3, { threadId: "t", changeId: "A", editIndex: 0 });
+  const all = [pass, zoom, captions, fix];
+  const wait = queueWaits(all, []);
+  for (const t of all) expect(wait(t)).toEqual(queueWait(t, all, []));
+  expect(wait(pass)).toBeUndefined();
+  expect(wait(captions)).toEqual({ kind: "run", task: pass });
+  expect(wait(fix)).toEqual({ kind: "run", task: pass });
 });
 
 it("stops holding the queue for a pass version that a finished revision replaced", () => {
@@ -174,7 +225,7 @@ it("lets requests about different cuts or edits run at once, and keeps every oth
   expect(queueWait(zoomFix, [pass, first, zoomFix], [review])).toEqual({ kind: "review", change: review });
 });
 
-// The engine's claim query keys requests the same way (`beside` in claimNext); tasks.test.ts runs the same cases there.
+// The engine claims through the same rules (queueAdmission in claimNext); tasks.test.ts runs these cases there.
 it.each([
   { name: "two edits of one change in one thread", a: { threadId: "t", changeId: "A", editIndex: 0 }, b: { threadId: "t", changeId: "A", editIndex: 1 }, beside: true },
   { name: "the first edits of two changes in one thread", a: { threadId: "t", changeId: "A", editIndex: 0 }, b: { threadId: "t", changeId: "B", editIndex: 0 }, beside: true },
@@ -190,9 +241,15 @@ it.each([
   const changes = [{ id: "A" }, { id: "A2", timelineEdits: [{ label: "Other", range: { start: 0, end: 1 } }, { label: "Zoom", range: { start: 2, end: 3 }, replaces: { changeId: "A", spot: 0 } }] },
     { id: "A3", timelineEdits: [{ label: "Zoom", range: { start: 2, end: 3 }, replaces: { changeId: "A2", spot: 1 } }] }] as Change[];
   const x = task("x", "queued", 1, a), y = task("y", "running", 0, b);
-  expect(runsBeside(x, y, changes)).toBe(beside);
-  expect(runsBeside(y, x, changes)).toBe(beside);
+  const kx = requestTargetKey(x, changes), ky = requestTargetKey(y, changes);
+  expect(kx !== undefined && ky !== undefined && kx !== ky).toBe(beside);
   expect(queueWait(x, [y, x], changes)).toEqual(beside ? undefined : { kind: "run", task: y });
+  const yx = task("y", "queued", 1, b), xy = task("x", "running", 0, a);
+  expect(queueWait(yx, [xy, yx], changes)).toEqual(beside ? undefined : { kind: "run", task: xy });
+  // Queued together, the later one starts beside the earlier one only when they are about different things.
+  const later = task("later", "queued", 2, b);
+  expect(queueOrder([later, x], changes).map(t => t.id)).toEqual(["x", "later"]);
+  expect(queueWait(later, [later, x], changes)).toEqual(beside ? undefined : { kind: "ahead", count: 1 });
 });
 
 it("names an applied edit by where it was first made, a call by its pass's thread", () => {

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   clampRange, clipDuration, clock, clipEnd, clipRange, clipsAt, emptyTimeline, frameAlignedRemoval, filmstripBatches, FILMSTRIP_SEEK_BATCH, makeMediaClip, planSegments,
   rangesOverlap, mergeRanges, snapToFrame, sourceClockAnchors, sourceToTimeline, carriesAudio, sparseFilmstrip, timelineDuration, timelineToSource, trackDuration, withHandles,
-  MAX_TIMELINE_SECONDS, planPlaybackSegments, WritableTimeline, type ColorClip, type Timeline,
+  MAX_TIMELINE_SECONDS, planPlaybackSegments, spanningSections, WritableTimeline, type ColorClip, type Timeline,
 } from "./index.js";
 
 const settings = { settings: { fps: 30 } } as Parameters<typeof planSegments>[0];
@@ -178,4 +178,15 @@ describe("render sections", () => {
     expect(sourceClockAnchors(sound, 4)).toEqual([2, 6]);
     expect(sourceClockAnchors(emptyTimeline("project"), 4)).toEqual([]);
   });
+});
+
+it("widens a range to the whole playback sections it touches, on their own endpoints", () => {
+  const sections = [{ start: 0, end: 4 }, { start: 4, end: 7.9 }, { start: 7.9, end: 12 }, { start: 12, end: 14 }];
+  expect(spanningSections(sections, { start: 5, end: 9 })).toEqual({ start: 4, end: 12 });
+  expect(spanningSections(sections, { start: 4, end: 7.9 })).toEqual({ start: 4, end: 7.9 });
+  // A range that ends a hair past a section, as frame arithmetic leaves it, doesn't take the next one.
+  expect(spanningSections(sections, { start: 4 - 1e-9, end: 7.9 + 1e-9 })).toEqual({ start: 4, end: 7.9 });
+  expect(spanningSections(sections, { start: 0, end: 14 })).toEqual({ start: 0, end: 14 });
+  expect(spanningSections(sections, { start: 13, end: 15 })).toBeUndefined();
+  expect(spanningSections([], { start: 0, end: 1 })).toBeUndefined();
 });
